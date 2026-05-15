@@ -60,7 +60,7 @@ export function VercelWidget() {
                     {d.state}
                   </span>
                   <a
-                    href={`https://${d.url}`}
+                    href={d.url.startsWith("http") ? d.url : `https://${d.url}`}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="text-text-primary hover:underline flex-1 truncate"

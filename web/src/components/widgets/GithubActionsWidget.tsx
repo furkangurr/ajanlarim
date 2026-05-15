@@ -68,7 +68,7 @@ export function GithubActionsWidget() {
                   >
                     {run.repo.split("/")[1]} · {run.name}
                   </a>
-                  <span className="text-text-muted text-[10px] shrink-0">{run.head_branch}</span>
+                  <span className="text-text-muted text-[10px] shrink-0">{run.head_branch || "—"}</span>
                 </li>
               ))}
             </ul>
