@@ -19,6 +19,12 @@ mod log_level;
 mod projects;
 mod sessions;
 mod system;
+// FUR-3957 Sub-C entegrasyon — Linear + Sentry summary widgets (avk-suite fork).
+#[cfg(feature = "serve")]
+mod widgets;
+
+#[cfg(feature = "serve")]
+pub use widgets::{get_linear_summary, get_sentry_summary, WidgetCache};
 
 #[cfg(feature = "serve")]
 pub use cockpit::{
