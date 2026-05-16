@@ -2,6 +2,7 @@ import { useMemo } from "react";
 import type { SessionResponse } from "../lib/types";
 import { isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
+import { AvkAgentsGrid } from "./AvkAgentsGrid";
 
 interface Props {
   sessions: SessionResponse[];
@@ -179,6 +180,11 @@ export function Dashboard({
           to create a session
         </p>
       )}
+
+      {/* FUR-3957 Adım 8 — AVK workflow ajan grid (13 ajan) */}
+      <div className="mt-12 w-full max-w-4xl">
+        <AvkAgentsGrid />
+      </div>
     </div>
   );
 }
