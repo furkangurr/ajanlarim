@@ -25,7 +25,8 @@
 /// Director-tier ajanları sistemi yönetir (vizyon, dispatch, gateway).
 /// Senior-tier ajanları kıdemli iş yapar (kod, audit, merge, CI fix).
 /// Worker-tier ajanları paralel slot çalışır (research, code, audit).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AvkAgentRole {
     Director,
     Senior,
@@ -48,6 +49,7 @@ impl AvkAgentRole {
 /// embed iframe veya status query buradan açar. Düzeltme: pane index
 /// runtime'da değişebilir (yeni pane ekleme/silme); UI tarafı periyodik
 /// `tmux list-panes` ile re-sync etmeli.
+#[derive(Debug, serde::Serialize)]
 pub struct AvkAgent {
     pub slug: &'static str,
     pub label: &'static str,

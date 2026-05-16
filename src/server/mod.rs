@@ -954,6 +954,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         // Agents
         .route("/api/agents", get(api::list_agents))
+        // AVK workflow agents (FUR-3957 Adım 6 — 13 ajan registry serve)
+        .route("/api/avk/agents", get(api::list_avk_agents))
         // Profiles
         .route(
             "/api/profiles",
