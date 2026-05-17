@@ -247,6 +247,28 @@ export interface AvkAgentInfo {
   tmux_target: string;
 }
 
+/**
+ * AVK memory tier — FUR-4118 server contract mirror.
+ * `core` = always-relevant, `working` = aktif iş, `archival` = referans/eski.
+ */
+export type AvkMemoryTier = "core" | "working" | "archival";
+
+/**
+ * `GET /api/avk/memory-recall[?role=...&hours=...]` JSON shape mirror.
+ *
+ * Mock implementation: server static MOCK_FEED döner. Gerçek agentmemory
+ * MCP proxy implementation eklendiğinde aynı shape — UI değişikliği yok.
+ */
+export interface AvkMemoryEntry {
+  id: string;
+  title: string;
+  tier: AvkMemoryTier;
+  role: string;
+  tags: string[];
+  content_preview: string;
+  created_at: string;
+}
+
 /** Profile info returned by /api/profiles */
 export interface ProfileInfo {
   name: string;

@@ -12,6 +12,8 @@ pub(super) use super::AppState;
 
 // FUR-3957 Adım 6 — AVK workflow ajan registry endpoint (13 ajan serve).
 mod avk_agents;
+// FUR-4118 — AVK memory recall feed endpoint (mock; agentmemory MCP proxy bekleniş).
+mod avk_memory;
 #[cfg(feature = "serve")]
 mod client_log;
 #[cfg(feature = "serve")]
@@ -39,6 +41,7 @@ pub use cockpit::{
 };
 
 pub use avk_agents::list_avk_agents;
+pub use avk_memory::list_avk_memory_recall;
 #[cfg(feature = "serve")]
 pub use client_log::post_client_log;
 pub use git::{clone_repo, list_branches};

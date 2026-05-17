@@ -3,6 +3,7 @@ import type { SessionResponse } from "../lib/types";
 import { isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { AvkAgentsGrid } from "./AvkAgentsGrid";
+import { AvkMemoryFeed } from "./AvkMemoryFeed";
 
 interface Props {
   sessions: SessionResponse[];
@@ -184,6 +185,11 @@ export function Dashboard({
       {/* FUR-3957 Adım 8 — AVK workflow ajan grid (13 ajan) */}
       <div className="mt-12 w-full max-w-4xl">
         <AvkAgentsGrid />
+      </div>
+
+      {/* FUR-4118 — AVK memory recall feed (mock; agentmemory MCP proxy bekleniş) */}
+      <div className="mt-12 w-full max-w-4xl">
+        <AvkMemoryFeed />
       </div>
     </div>
   );
