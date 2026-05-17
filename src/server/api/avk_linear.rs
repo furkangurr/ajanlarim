@@ -28,12 +28,14 @@ const LINEAR_GRAPHQL_URL: &str = "https://api.linear.app/graphql";
 const LINEAR_TIMEOUT: Duration = Duration::from_secs(5);
 const QUEUE_LIMIT: u32 = 30;
 
+// Linear `PaginationOrderBy` enum'u sadece `createdAt` / `updatedAt`
+// kabul eder; priority sıralaması server-side fetch sonrası uygulanır.
 const QUERY: &str = r#"
 query AvkQueue($first: Int!) {
   issues(
     first: $first
     filter: { state: { type: { in: ["started", "unstarted"] } } }
-    orderBy: priority
+    orderBy: updatedAt
   ) {
     nodes {
       id
@@ -155,6 +157,12 @@ async fn fetch_linear(api_key: &str) -> Result<LinearQueueResponse, String> {
             backlog.push(issue.clone());
         }
     }
+    // Linear `orderBy: priority` desteklemiyor (PaginationOrderBy sadece
+    // createdAt/updatedAt); priority sıralamasını client'tan önce burada
+    // uygula. priority=0 (No priority) en alta, 1 (Urgent) en üste.
+    let priority_rank = |p: u8| if p == 0 { u8::MAX } else { p };
+    active.sort_by_key(|i| priority_rank(i.priority));
+    backlog.sort_by_key(|i| priority_rank(i.priority));
     let total = issues.len();
 
     Ok(LinearQueueResponse {
