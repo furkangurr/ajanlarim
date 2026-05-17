@@ -5,6 +5,7 @@ import type {
   AgentInfo,
   AvkAgentInfo,
   AvkAgentRole,
+  AvkMemoryEntry,
   ProfileInfo,
   BrowseResponse,
   GroupInfo,
@@ -380,6 +381,24 @@ export async function fetchAgents(): Promise<AgentInfo[]> {
 export async function fetchAvkAgents(role?: AvkAgentRole): Promise<AvkAgentInfo[]> {
   const url = role ? `/api/avk/agents?role=${role}` : "/api/avk/agents";
   return (await fetchJson<AvkAgentInfo[]>(url)) ?? [];
+}
+
+/**
+ * `GET /api/avk/memory-recall[?role=...&hours=...]` — FUR-4118 endpoint.
+ *
+ * Mock implementation; server static MOCK_FEED döner. Gerçek agentmemory MCP
+ * proxy eklendiğinde aynı shape, UI değişikliği yok.
+ */
+export async function fetchAvkMemoryRecall(
+  role?: string,
+  hours?: number,
+): Promise<AvkMemoryEntry[]> {
+  const params = new URLSearchParams();
+  if (role) params.set("role", role);
+  if (hours) params.set("hours", String(hours));
+  const qs = params.toString();
+  const url = qs ? `/api/avk/memory-recall?${qs}` : "/api/avk/memory-recall";
+  return (await fetchJson<AvkMemoryEntry[]>(url)) ?? [];
 }
 
 export async function fetchProfiles(): Promise<ProfileInfo[]> {

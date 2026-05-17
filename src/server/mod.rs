@@ -956,6 +956,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/agents", get(api::list_agents))
         // AVK workflow agents (FUR-3957 Adım 6 — 13 ajan registry serve)
         .route("/api/avk/agents", get(api::list_avk_agents))
+        // AVK memory recall feed (FUR-4118 — agentmemory MCP proxy mock)
+        .route("/api/avk/memory-recall", get(api::list_avk_memory_recall))
         // Profiles
         .route(
             "/api/profiles",
