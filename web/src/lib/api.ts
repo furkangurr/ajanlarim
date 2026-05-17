@@ -9,6 +9,8 @@ import type {
   AvkBroadcastResponse,
   AvkHealthResponse,
   AvkMemoryEntry,
+  LinearQueueError,
+  LinearQueueResponse,
   ProfileInfo,
   BrowseResponse,
   GroupInfo,
@@ -384,6 +386,30 @@ export async function fetchAgents(): Promise<AgentInfo[]> {
 export async function fetchAvkAgents(role?: AvkAgentRole): Promise<AvkAgentInfo[]> {
   const url = role ? `/api/avk/agents?role=${role}` : "/api/avk/agents";
   return (await fetchJson<AvkAgentInfo[]>(url)) ?? [];
+}
+
+/**
+ * `GET /api/avk/linear-queue` — FUR-4160 Linear kuyruğu endpoint.
+ *
+ * 200 → `LinearQueueResponse`. 503 (`kind: "not_configured"`) veya 502
+ * (`kind: "upstream_error"`) durumunda body error string ile `LinearQueueError`
+ * döner; çağıran union'a göre branch'ler. fetch hatası null döner.
+ */
+export async function fetchAvkLinearQueue(): Promise<
+  LinearQueueResponse | LinearQueueError | null
+> {
+  try {
+    const res = await fetch("/api/avk/linear-queue");
+    if (res.ok) {
+      return (await res.json()) as LinearQueueResponse;
+    }
+    if (res.status === 503 || res.status === 502) {
+      return (await res.json()) as LinearQueueError;
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /**

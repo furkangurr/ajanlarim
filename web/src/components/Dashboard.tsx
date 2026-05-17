@@ -4,6 +4,7 @@ import { isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { AvkAgentsGrid } from "./AvkAgentsGrid";
 import { AvkBroadcastWidget } from "./AvkBroadcastWidget";
+import { AvkLinearQueue } from "./AvkLinearQueue";
 import { AvkMemoryFeed } from "./AvkMemoryFeed";
 import { AvkSystemHealth } from "./AvkSystemHealth";
 
@@ -201,6 +202,10 @@ export function Dashboard({
 
         <div className="rounded-lg border border-surface-700/40 bg-surface-900/40 p-4 sm:p-6">
           <AvkAgentsGrid />
+        </div>
+
+        <div className="rounded-lg border border-surface-700/40 bg-surface-900/40 p-4 sm:p-6">
+          <AvkLinearQueue />
         </div>
 
         <div className="rounded-lg border border-surface-700/40 bg-surface-900/40 p-4 sm:p-6">
