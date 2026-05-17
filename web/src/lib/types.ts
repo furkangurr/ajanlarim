@@ -295,6 +295,39 @@ export interface AvkBroadcastResponse {
 }
 
 /**
+ * `GET /api/avk/linear-queue` JSON shape mirror — FUR-4160.
+ *
+ * Backend Linear GraphQL API'sine `LINEAR_API_KEY` env'i ile sorgu atar;
+ * started + unstarted state.type'lı issue'lar (max 30) priority sırayla.
+ * ENV yoksa 503 + `kind: "not_configured"` döner; widget yapılandırma notu
+ * gösterir.
+ */
+export interface LinearIssue {
+  id: string;
+  identifier: string;
+  title: string;
+  priority: number;
+  priority_label: string;
+  state_name: string;
+  state_type: "started" | "unstarted" | string;
+  assignee: string | null;
+  team_key: string | null;
+  url: string;
+  updated_at: string;
+}
+
+export interface LinearQueueResponse {
+  active: LinearIssue[];
+  backlog: LinearIssue[];
+  total: number;
+}
+
+export interface LinearQueueError {
+  error: string;
+  kind?: "not_configured" | "upstream_error";
+}
+
+/**
  * `GET /api/avk/health` JSON shape mirror — FUR-4157.
  *
  * AoE serve daemon + AVK pane registry kompakt sağlık özeti.
