@@ -295,6 +295,20 @@ export interface AvkBroadcastResponse {
 }
 
 /**
+ * `GET /api/avk/health` JSON shape mirror — FUR-4157.
+ *
+ * AoE serve daemon + AVK pane registry kompakt sağlık özeti.
+ * `uptime_sec` daemon ilk health çağrısından bu yana (proxy).
+ */
+export interface AvkHealthResponse {
+  version: string;
+  uptime_sec: number;
+  tmux_ok: boolean;
+  agent_count: number;
+  agent_alive: number;
+}
+
+/**
  * `GET /api/avk/memory-recall[?role=...&hours=...]` JSON shape mirror.
  *
  * Mock implementation: server static MOCK_FEED döner. Gerçek agentmemory
