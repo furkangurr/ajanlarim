@@ -12,6 +12,7 @@ import type {
   AvkPanePeekResponse,
   FurkanChatRequest,
   FurkanChatResponse,
+  FurkanInboxResponse,
   GitFlowError,
   GitFlowResponse,
   LinearQueueError,
@@ -391,6 +392,23 @@ export async function fetchAgents(): Promise<AgentInfo[]> {
 export async function fetchAvkAgents(role?: AvkAgentRole): Promise<AvkAgentInfo[]> {
   const url = role ? `/api/avk/agents?role=${role}` : "/api/avk/agents";
   return (await fetchJson<AvkAgentInfo[]>(url)) ?? [];
+}
+
+/**
+ * `GET /api/avk/furkan-inbox?limit=N&unread_only=bool` — FUR-4170 inbox.
+ *
+ * Ajan→Furkan signal'leri (memory_signal_read agentId=furkan). Çağrı
+ * delivered mesajları read'e işaretler (server tarafı). Hata null.
+ */
+export async function fetchAvkFurkanInbox(
+  limit = 50,
+  unreadOnly = false,
+): Promise<FurkanInboxResponse | null> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (unreadOnly) params.set("unread_only", "true");
+  return await fetchJson<FurkanInboxResponse>(
+    `/api/avk/furkan-inbox?${params.toString()}`,
+  );
 }
 
 /**

@@ -970,6 +970,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/avk/git-flow", get(api::get_avk_git_flow))
         // Furkan chat (FUR-4164 — memory_signal_send wrapper, agent inbox)
         .route("/api/avk/furkan-chat", post(api::post_avk_furkan_chat))
+        // Furkan inbox (FUR-4170 — memory_signal_read for agentId=furkan)
+        .route("/api/avk/furkan-inbox", get(api::get_avk_furkan_inbox))
         // Profiles
         .route(
             "/api/profiles",
