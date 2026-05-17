@@ -295,6 +295,30 @@ export interface AvkBroadcastResponse {
 }
 
 /**
+ * Furkan inbox signal — FUR-4170.
+ *
+ * `GET /api/avk/furkan-inbox` ile ajan→Furkan mesajları. Backend
+ * `memory_signal_read agentId=furkan` çağırır; signal'ler otomatik
+ * delivered → read state'ine geçer.
+ */
+export interface FurkanInboxSignal {
+  id: string;
+  from: string;
+  to: string;
+  type: string;
+  content: string;
+  thread_id: string;
+  created_at: string;
+  status: string | null;
+}
+
+export interface FurkanInboxResponse {
+  agent_id: "furkan";
+  count: number;
+  signals: FurkanInboxSignal[];
+}
+
+/**
  * Furkan chat — FUR-4164.
  *
  * `POST /api/avk/furkan-chat { to, message, thread_id? }` → agentmemory

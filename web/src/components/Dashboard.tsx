@@ -5,6 +5,7 @@ import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { AvkAgentsGrid } from "./AvkAgentsGrid";
 import { AvkBroadcastWidget } from "./AvkBroadcastWidget";
 import { AvkFurkanChat } from "./AvkFurkanChat";
+import { AvkFurkanInbox } from "./AvkFurkanInbox";
 import { AvkGitFlow } from "./AvkGitFlow";
 import { AvkLinearQueue } from "./AvkLinearQueue";
 import { AvkMemoryFeed } from "./AvkMemoryFeed";
@@ -212,6 +213,10 @@ export function Dashboard({
 
         <div className="rounded-lg border border-surface-700/40 bg-surface-900/40 p-4 sm:p-6">
           <AvkGitFlow />
+        </div>
+
+        <div className="rounded-lg border border-surface-700/40 bg-surface-900/40 p-4 sm:p-6">
+          <AvkFurkanInbox />
         </div>
 
         <div className="rounded-lg border border-surface-700/40 bg-surface-900/40 p-4 sm:p-6">
