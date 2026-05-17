@@ -589,6 +589,19 @@ export interface AvkOfisBaslatResponse {
 }
 
 /**
+ * `POST /api/avk/avf-ofis-baslat` — avfurkangur.com 2-ajan tmux ofisi.
+ * Sabit script `/root/bin/avfurkangur-start` çağırır. Idempotent.
+ */
+export interface AvfOfisBaslatResponse {
+  ok: boolean;
+  script_path: string;
+  elapsed_ms: number;
+  stdout_tail: string;
+  stderr_tail: string;
+  error: string | null;
+}
+
+/**
  * `GET /api/avk/memory-recall[?role=...&hours=...]` JSON shape mirror.
  *
  * Mock implementation: server static MOCK_FEED döner. Gerçek agentmemory

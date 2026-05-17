@@ -38,6 +38,8 @@ mod avk_sentry;
 mod avk_vps_status;
 // AVK ofis başlat (tmux 13 ajan layout rebuild — POST trigger).
 mod avk_ofis_baslat;
+// avfurkangur.com 2-ajan ofisi başlat (Koord + Code Agent).
+mod avf_ofis_baslat;
 #[cfg(feature = "serve")]
 mod client_log;
 #[cfg(feature = "serve")]
@@ -64,6 +66,7 @@ pub use cockpit::{
     set_cockpit_master, shutdown_cockpit, spawn_cockpit,
 };
 
+pub use avf_ofis_baslat::post_avk_avf_ofis_baslat;
 pub use avk_agents::list_avk_agents;
 pub use avk_broadcast::broadcast_avk;
 pub use avk_error_board::get_avk_error_board;

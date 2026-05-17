@@ -985,6 +985,11 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/avk/vps-status", get(api::get_avk_vps_status))
         // AVK ofis başlat (tmux 13 ajan layout rebuild — sabit script çağırır)
         .route("/api/avk/ofis-baslat", post(api::post_avk_ofis_baslat))
+        // avfurkangur.com 2-ajan ofisi başlat (Koord + Code Agent)
+        .route(
+            "/api/avk/avf-ofis-baslat",
+            post(api::post_avk_avf_ofis_baslat),
+        )
         // Profiles
         .route(
             "/api/profiles",

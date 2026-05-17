@@ -10,6 +10,7 @@ import type {
   AvkHealthResponse,
   AvkVpsStatusResponse,
   AvkOfisBaslatResponse,
+  AvfOfisBaslatResponse,
   AvkMemoryEntry,
   AvkPanePeekResponse,
   FurkanChatRequest,
@@ -594,6 +595,16 @@ export async function fetchAvkVpsStatus(): Promise<AvkVpsStatusResponse | null> 
  */
 export async function postAvkOfisBaslat(): Promise<AvkOfisBaslatResponse | null> {
   return fetchJson<AvkOfisBaslatResponse>("/api/avk/ofis-baslat", {
+    method: "POST",
+  });
+}
+
+/**
+ * `POST /api/avk/avf-ofis-baslat` — avfurkangur.com 2-ajan tmux ofisi.
+ * Idempotent (mevcut session varsa atlar).
+ */
+export async function postAvfOfisBaslat(): Promise<AvfOfisBaslatResponse | null> {
+  return fetchJson<AvfOfisBaslatResponse>("/api/avk/avf-ofis-baslat", {
     method: "POST",
   });
 }
