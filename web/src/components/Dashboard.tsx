@@ -3,6 +3,7 @@ import type { SessionResponse } from "../lib/types";
 import { isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { AvkAgentsGrid } from "./AvkAgentsGrid";
+import { AvkBroadcastWidget } from "./AvkBroadcastWidget";
 import { AvkMemoryFeed } from "./AvkMemoryFeed";
 
 interface Props {
@@ -185,6 +186,11 @@ export function Dashboard({
       {/* FUR-3957 Adım 8 — AVK workflow ajan grid (13 ajan) */}
       <div className="mt-12 w-full max-w-4xl">
         <AvkAgentsGrid />
+      </div>
+
+      {/* FUR-4121 — AVK tier broadcast widget (director/senior/worker/all -> tmux) */}
+      <div className="mt-12 w-full max-w-4xl">
+        <AvkBroadcastWidget />
       </div>
 
       {/* FUR-4118 — AVK memory recall feed (mock; agentmemory MCP proxy bekleniş) */}

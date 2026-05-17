@@ -958,6 +958,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/avk/agents", get(api::list_avk_agents))
         // AVK memory recall feed (FUR-4118 — agentmemory MCP proxy mock)
         .route("/api/avk/memory-recall", get(api::list_avk_memory_recall))
+        // AVK tier broadcast (FUR-4121 — POST { tier, message } -> tmux send-keys)
+        .route("/api/avk/broadcast", post(api::broadcast_avk))
         // Profiles
         .route(
             "/api/profiles",

@@ -254,6 +254,35 @@ export interface AvkAgentInfo {
 export type AvkMemoryTier = "core" | "working" | "archival";
 
 /**
+ * AVK broadcast tier keyword — FUR-4121 server contract mirror.
+ * `all` = 13 ajan; tier rolleri `AvkAgentRole` ile aynı (director/senior/worker).
+ */
+export type AvkBroadcastTier = "director" | "senior" | "worker" | "all";
+
+/** `POST /api/avk/broadcast` istek body shape mirror. */
+export interface AvkBroadcastRequest {
+  tier: AvkBroadcastTier;
+  message: string;
+}
+
+/** Tek bir tmux pane gönderim sonucu (slug + target + ok/error). */
+export interface AvkBroadcastResult {
+  slug: string;
+  target: string;
+  ok: boolean;
+  error: string | null;
+}
+
+/** `POST /api/avk/broadcast` response shape mirror. */
+export interface AvkBroadcastResponse {
+  tier: AvkBroadcastTier;
+  total: number;
+  ok: number;
+  failed: number;
+  results: AvkBroadcastResult[];
+}
+
+/**
  * `GET /api/avk/memory-recall[?role=...&hours=...]` JSON shape mirror.
  *
  * Mock implementation: server static MOCK_FEED döner. Gerçek agentmemory

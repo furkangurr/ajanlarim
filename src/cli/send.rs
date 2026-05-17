@@ -8,7 +8,7 @@
 use anyhow::{bail, Result};
 use clap::Args;
 
-use crate::avk_agents::{filter_by_role, AvkAgentRole, AVK_AGENTS};
+use crate::avk_agents::resolve_tier_slugs;
 use crate::session::{EnsureReadyError, EnsureReadyOutcome, Instance, Storage};
 
 #[derive(Args)]
@@ -35,21 +35,7 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     }
 
     // AVK tier/all keyword broadcast vs. tekil session send ayrımı.
-    let avk_targets: Vec<&'static str> = match args.identifier.as_str() {
-        "all" => AVK_AGENTS.iter().map(|a| a.slug).collect(),
-        "director" => filter_by_role(AvkAgentRole::Director)
-            .map(|a| a.slug)
-            .collect(),
-        "senior" => filter_by_role(AvkAgentRole::Senior)
-            .map(|a| a.slug)
-            .collect(),
-        "worker" => filter_by_role(AvkAgentRole::Worker)
-            .map(|a| a.slug)
-            .collect(),
-        _ => Vec::new(),
-    };
-
-    if avk_targets.is_empty() {
+    let Some(avk_targets) = resolve_tier_slugs(args.identifier.as_str()) else {
         // Tekil session send (mevcut davranış)
         send_to_single(
             &mut instances,
@@ -59,7 +45,7 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
         )?;
         storage.save(&instances)?;
         return Ok(());
-    }
+    };
 
     // Broadcast: AVK tier/all üzerinden multiple session send
     let total = avk_targets.len();
@@ -93,7 +79,7 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
 /// Tek bir session'a mesaj gönder. Storage save dış arayan tarafından yapılır
 /// (broadcast loop'unda her iterate save etmemek için ayrıştırıldı).
 fn send_to_single(
-    instances: &mut Vec<Instance>,
+    instances: &mut [Instance],
     identifier: &str,
     message: &str,
     no_revive: bool,

@@ -5,6 +5,8 @@ import type {
   AgentInfo,
   AvkAgentInfo,
   AvkAgentRole,
+  AvkBroadcastRequest,
+  AvkBroadcastResponse,
   AvkMemoryEntry,
   ProfileInfo,
   BrowseResponse,
@@ -399,6 +401,31 @@ export async function fetchAvkMemoryRecall(
   const qs = params.toString();
   const url = qs ? `/api/avk/memory-recall?${qs}` : "/api/avk/memory-recall";
   return (await fetchJson<AvkMemoryEntry[]>(url)) ?? [];
+}
+
+/**
+ * `POST /api/avk/broadcast` — FUR-4121 endpoint.
+ *
+ * Server tier resolver `director`/`senior`/`worker`/`all` keyword'unu
+ * AVK_AGENTS registry'sinden filtreler ve tmux pane'lere bracketed-paste
+ * mesaj yollar. Tek pane fail durumunda yine 200 döner, `results` listesinde
+ * bireysel hata kayıtları olur. 400 (boş mesaj), 404 (bilinmeyen tier),
+ * 413 (8KB üstü mesaj) error response döner.
+ */
+export async function postAvkBroadcast(
+  req: AvkBroadcastRequest,
+): Promise<AvkBroadcastResponse | null> {
+  try {
+    const res = await fetch("/api/avk/broadcast", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as AvkBroadcastResponse;
+  } catch {
+    return null;
+  }
 }
 
 export async function fetchProfiles(): Promise<ProfileInfo[]> {

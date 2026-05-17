@@ -97,8 +97,7 @@ const MOCK_FEED: &[MemoryEntry] = &[
         tier: MemoryTier::Working,
         role: "omni",
         tags: &["seo", "fur-4072", "verify-before-claim"],
-        content_preview:
-            "Furkan 'domaini avukatadanis.com taşıdık' tek cümleyle düzeltti. \
+        content_preview: "Furkan 'domaini avukatadanis.com taşıdık' tek cümleyle düzeltti. \
              Önceki iddia 'ENV eksik, fallback eski domain' YANLIŞ — verify edilmiş \
              değil. Karpathy 51 #31 ders. Doğru tanı: GSC'de yeni .com property \
              eklenmemiş. Linear FUR-4072 P1 handover Furkan Google hesabı.",
