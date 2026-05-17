@@ -250,7 +250,7 @@ Send a message to a running agent session
 
 ###### **Arguments:**
 
-* `<IDENTIFIER>` — Session ID or title
+* `<IDENTIFIER>` — Session ID, title, or AVK tier keyword (director/senior/worker/all)
 * `<MESSAGE>` — Message to send to the agent
 
 ###### **Options:**

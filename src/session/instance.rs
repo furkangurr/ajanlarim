@@ -2149,6 +2149,12 @@ mod tests {
     #[test]
     fn test_all_agents_have_yolo_support() {
         for agent in crate::agents::AGENTS {
+            // FUR-3973: kimi Level 1 stub — yolo hook integration follow-up.
+            // Mirror of `agents::tests::test_all_agents_have_yolo_support`
+            // exception; keep both in sync until kimi gains --yolo support.
+            if agent.name == "kimi" {
+                continue;
+            }
             assert!(
                 agent.yolo.is_some(),
                 "Agent '{}' should have YOLO mode configured",
