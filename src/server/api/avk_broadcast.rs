@@ -201,7 +201,10 @@ fn send_to_pane(target: &str, message: &str, pre_validated: bool) -> Result<(), 
 /// prefix sonrasinda kalan kisim sadece 8-char hash olmali (alphanumeric).
 ///
 /// Bulamazsa None — caller registry sabit `tmux_target`'a fallback yapar.
-fn resolve_runtime_target(slug: &str) -> Option<String> {
+///
+/// FUR-4123: `pub(super)` — `avk_agents.rs` live pane status indicator
+/// endpoint aynı resolver'ı kullanır.
+pub(super) fn resolve_runtime_target(slug: &str) -> Option<String> {
     let output = Command::new("tmux")
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()

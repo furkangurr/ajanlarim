@@ -1,11 +1,13 @@
 /**
- * AVK workflow ajan grid widget — FUR-3957 transplant Adım 7.
+ * AVK workflow ajan grid widget — FUR-3957 transplant Adım 7 + FUR-4123 polish.
  *
  * `GET /api/avk/agents` server endpoint'inden 13 ajan kaydını çeker;
  * Director / Senior / Worker tier sıralı 3 grup card grid render eder.
  *
- * `tmux_target` runtime resync gerektirir (pane index değişir) — bu
- * yüzden komponent mount + 60sn refresh interval ile yeniden fetch eder.
+ * `tmux_target` registry sabit (avk-ofis:...), `runtime_target` AoE
+ * binary'nin gerçek yarattığı session (aoe_<slug>_<hash>:^.0). Server
+ * resolver (FUR-4122) her ajan için canlı pane durumunu döner —
+ * `pane_alive=true` yeşil dot, false gri dot. 30s refresh interval.
  *
  * Slug → label canonical kaynak server `src/avk_agents.rs::AVK_AGENTS`.
  * Tier badge rengi:
@@ -18,7 +20,7 @@ import { useEffect, useState } from "react";
 import { fetchAvkAgents } from "../lib/api";
 import type { AvkAgentInfo, AvkAgentRole } from "../lib/types";
 
-const REFRESH_INTERVAL_MS = 60_000;
+const REFRESH_INTERVAL_MS = 30_000;
 
 const ROLE_ORDER: AvkAgentRole[] = ["director", "senior", "worker"];
 
@@ -94,11 +96,15 @@ export function AvkAgentsGrid() {
   }
 
   const grouped = groupByRole(agents);
+  const aliveCount = agents.filter((a) => a.pane_alive).length;
 
   return (
     <div>
       <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-4">
-        AVK Workflow Agents ({agents.length})
+        AVK Workflow Agents ({agents.length}){" "}
+        <span className="text-status-running normal-case tracking-normal">
+          · {aliveCount}/{agents.length} live
+        </span>
       </h3>
       <div className="space-y-6">
         {ROLE_ORDER.map((role) => {
@@ -110,27 +116,48 @@ export function AvkAgentsGrid() {
                 {ROLE_LABEL[role]} ({tierAgents.length})
               </h4>
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
-                {tierAgents.map((agent) => (
-                  <article
-                    key={agent.slug}
-                    className="rounded border border-surface-700 bg-surface-800 p-3"
-                  >
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="font-body text-[14px] font-medium">
-                        {agent.label}
-                      </span>
-                      <span
-                        className={`font-mono text-[10px] uppercase tracking-wider px-2 py-0.5 rounded ${ROLE_BADGE_CLASS[agent.role]}`}
-                      >
-                        {agent.role}
-                      </span>
-                    </div>
-                    <div className="flex items-center justify-between font-mono text-[11px] text-text-muted">
-                      <span>{agent.slug}</span>
-                      <span title={agent.tmux_target}>{agent.tmux_target}</span>
-                    </div>
-                  </article>
-                ))}
+                {tierAgents.map((agent) => {
+                  const effectiveTarget = agent.runtime_target ?? agent.tmux_target;
+                  const dotClass = agent.pane_alive
+                    ? "bg-status-running"
+                    : "bg-surface-600";
+                  const dotTitle = agent.pane_alive
+                    ? `live · ${effectiveTarget}`
+                    : `pane yok · registry: ${agent.tmux_target}`;
+                  return (
+                    <article
+                      key={agent.slug}
+                      className="rounded border border-surface-700 bg-surface-800 p-3"
+                    >
+                      <div className="flex items-center justify-between mb-1">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span
+                            className={`inline-block w-2 h-2 rounded-full shrink-0 ${dotClass}`}
+                            title={dotTitle}
+                            aria-label={dotTitle}
+                          />
+                          <span className="font-body text-[14px] font-medium truncate">
+                            {agent.label}
+                          </span>
+                        </div>
+                        <span
+                          className={`font-mono text-[10px] uppercase tracking-wider px-2 py-0.5 rounded shrink-0 ${ROLE_BADGE_CLASS[agent.role]}`}
+                        >
+                          {agent.role}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between font-mono text-[11px] text-text-muted gap-2">
+                        <span className="shrink-0">{agent.slug}</span>
+                        <span
+                          className="truncate"
+                          title={`registry: ${agent.tmux_target}${agent.runtime_target ? ` · runtime: ${agent.runtime_target}` : ""}`}
+                        >
+                          {effectiveTarget}
+                        </span>
+                      </div>
+                    </article>
+                  );
+                })}
               </div>
             </section>
           );
