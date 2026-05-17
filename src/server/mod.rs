@@ -976,6 +976,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/avk/roadmap", get(api::get_avk_roadmap))
         // AVK Hata Ajanı panosu (FUR-4169 — Linear bug label active + resolved)
         .route("/api/avk/error-board", get(api::get_avk_error_board))
+        // AVK Sentry alerts (FUR-4167 — Sentry REST API unresolved 24h)
+        .route("/api/avk/sentry-alerts", get(api::get_avk_sentry_alerts))
         // Profiles
         .route(
             "/api/profiles",

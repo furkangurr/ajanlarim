@@ -385,6 +385,40 @@ export interface AvkPanePeekResponse {
 }
 
 /**
+ * `GET /api/avk/sentry-alerts` JSON shape mirror — FUR-4167.
+ *
+ * Sentry REST API son 24 saat unresolved issue'lar. ENV yoksa 503
+ * + kind=`not_configured` → UI yapılandırma notu.
+ */
+export interface SentryIssue {
+  id: string;
+  short_id: string;
+  title: string;
+  culprit: string | null;
+  level: string;
+  status: string;
+  project: string | null;
+  count: string;
+  user_count: number;
+  first_seen: string;
+  last_seen: string;
+  permalink: string;
+}
+
+export interface SentryAlertsResponse {
+  org: string;
+  project: string | null;
+  period: string;
+  total: number;
+  issues: SentryIssue[];
+}
+
+export interface SentryAlertsError {
+  error: string;
+  kind?: "not_configured" | "upstream_error";
+}
+
+/**
  * `GET /api/avk/error-board` JSON shape mirror — FUR-4169.
  *
  * Linear `Hata` label'lı issue'lar. `state_type` ile aktif (started/unstarted/triage)
