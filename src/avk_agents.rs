@@ -160,6 +160,33 @@ pub fn filter_by_role(role: AvkAgentRole) -> impl Iterator<Item = &'static AvkAg
     AVK_AGENTS.iter().filter(move |a| a.role == role)
 }
 
+/// Tier keyword (director/senior/worker/all) AVK ajan slug listesine çevir.
+///
+/// CLI `aoe send <tier> "<msg>"` (FUR-4120) ve server POST
+/// `/api/avk/broadcast` (FUR-4121) ortak kullanır. Bilinmeyen keyword için
+/// `None` döner (tekil session send fallback'i çağıran tarafta yapılır).
+pub fn resolve_tier_slugs(tier: &str) -> Option<Vec<&'static str>> {
+    match tier {
+        "all" => Some(AVK_AGENTS.iter().map(|a| a.slug).collect()),
+        "director" => Some(
+            filter_by_role(AvkAgentRole::Director)
+                .map(|a| a.slug)
+                .collect(),
+        ),
+        "senior" => Some(
+            filter_by_role(AvkAgentRole::Senior)
+                .map(|a| a.slug)
+                .collect(),
+        ),
+        "worker" => Some(
+            filter_by_role(AvkAgentRole::Worker)
+                .map(|a| a.slug)
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +254,17 @@ mod tests {
         assert_eq!(AvkAgentRole::Director.as_str(), "director");
         assert_eq!(AvkAgentRole::Senior.as_str(), "senior");
         assert_eq!(AvkAgentRole::Worker.as_str(), "worker");
+    }
+
+    #[test]
+    fn resolve_tier_slugs_matches_filter() {
+        // FUR-4121: tier resolver CLI + server ortak kullanır, distribution
+        // testiyle aynı sayılar dönmeli.
+        assert_eq!(resolve_tier_slugs("director").unwrap().len(), 3);
+        assert_eq!(resolve_tier_slugs("senior").unwrap().len(), 4);
+        assert_eq!(resolve_tier_slugs("worker").unwrap().len(), 6);
+        assert_eq!(resolve_tier_slugs("all").unwrap().len(), 13);
+        assert!(resolve_tier_slugs("koord").is_none());
+        assert!(resolve_tier_slugs("bilinmeyen").is_none());
     }
 }
