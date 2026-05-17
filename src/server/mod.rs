@@ -972,6 +972,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/avk/furkan-chat", post(api::post_avk_furkan_chat))
         // Furkan inbox (FUR-4170 — memory_signal_read for agentId=furkan)
         .route("/api/avk/furkan-inbox", get(api::get_avk_furkan_inbox))
+        // AVK roadmap (FUR-4165 — Linear initiatives + projects progress)
+        .route("/api/avk/roadmap", get(api::get_avk_roadmap))
         // Profiles
         .route(
             "/api/profiles",

@@ -28,6 +28,8 @@ mod avk_linear;
 mod avk_memory;
 // FUR-4161 — AVK pane peek (tmux capture-pane preview, GET /api/avk/pane-peek).
 mod avk_pane_peek;
+// FUR-4165 — AVK roadmap (Linear initiatives + projects progress).
+mod avk_roadmap;
 #[cfg(feature = "serve")]
 mod client_log;
 #[cfg(feature = "serve")]
@@ -63,6 +65,7 @@ pub use avk_health::get_avk_health;
 pub use avk_linear::get_avk_linear_queue;
 pub use avk_memory::list_avk_memory_recall;
 pub use avk_pane_peek::get_avk_pane_peek;
+pub use avk_roadmap::get_avk_roadmap;
 #[cfg(feature = "serve")]
 pub use client_log::post_client_log;
 pub use git::{clone_repo, list_branches};
