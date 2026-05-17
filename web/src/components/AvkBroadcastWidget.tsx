@@ -1,5 +1,5 @@
 /**
- * AVK broadcast widget — FUR-4121 + FUR-4155 + FUR-4156.
+ * AVK broadcast widget — FUR-4121 + FUR-4155 + FUR-4156 + FUR-4158.
  *
  * 4 tier butonu (director/senior/worker/all) **VEYA** tekil ajan slug
  * dropdown ile mesaj gönder. `POST /api/avk/broadcast` ile tmux pane'lere
@@ -11,6 +11,11 @@
  * FUR-4156 (B): "Tek Ajan" modu ile 13 slug'dan birine doğrudan mesaj
  * (sunucu `tier="slug:<slug>"` prefix'ini tekil hedef olarak çözer).
  *
+ * FUR-4158 (D): Klavye kısayolları:
+ *   - Cmd/Ctrl + Enter (textarea içinde) → mesajı gönder
+ *   - Alt + T → Tier moduna geç
+ *   - Alt + S → Tek Ajan moduna geç (slug dropdown'a odaklan)
+ *
  * Tasarım:
  *   - director badge yeşil (status-running) — yönetim
  *   - senior badge sarı (status-waiting) — kıdemli iş
@@ -19,7 +24,7 @@
  *   - slug badge brand-500 (tek ajan) — tek pane gönderim
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { fetchAvkAgents, postAvkBroadcast } from "../lib/api";
 import type {
   AvkAgentInfo,
@@ -179,6 +184,9 @@ export function AvkBroadcastWidget() {
   const [error, setError] = useState<string | null>(null);
   const [history, setHistory] = useState<BroadcastHistoryEntry[]>(() => loadHistory());
 
+  const slugSelectRef = useRef<HTMLSelectElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
   useEffect(() => {
     let cancelled = false;
     async function load() {
@@ -193,6 +201,31 @@ export function AvkBroadcastWidget() {
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  // FUR-4158: Alt+T / Alt+S global mod kısayolu — input/textarea aktifken
+  // skip et (kullanıcı yazıyor, focus çalmasın).
+  useEffect(() => {
+    function handler(e: KeyboardEvent) {
+      if (!e.altKey || e.ctrlKey || e.metaKey) return;
+      const target = e.target as HTMLElement | null;
+      if (target) {
+        const tag = target.tagName;
+        if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+        if (target.isContentEditable) return;
+      }
+      if (e.key === "t" || e.key === "T") {
+        e.preventDefault();
+        setTargetMode("tier");
+      } else if (e.key === "s" || e.key === "S") {
+        e.preventDefault();
+        setTargetMode("slug");
+        // Slug dropdown henüz render olmadıysa effect döngüsünde ele alınır.
+        setTimeout(() => slugSelectRef.current?.focus(), 0);
+      }
+    }
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
   }, []);
 
   const activeTarget: AvkBroadcastTarget =
@@ -264,37 +297,51 @@ export function AvkBroadcastWidget() {
 
       <div className="rounded border border-surface-700 bg-surface-800 p-4 space-y-4">
         {/* Mod seçici — tier / slug */}
-        <div
-          role="tablist"
-          aria-label="Hedef modu"
-          className="inline-flex rounded border border-surface-700 bg-surface-900 p-0.5"
-        >
-          <button
-            type="button"
-            role="tab"
-            aria-selected={targetMode === "tier"}
-            onClick={() => setTargetMode("tier")}
-            className={`rounded px-3 py-1 font-mono text-[11px] uppercase tracking-wider transition-colors ${
-              targetMode === "tier"
-                ? "bg-surface-700 text-text-primary"
-                : "text-text-muted hover:text-text-secondary"
-            }`}
+        <div className="flex items-center gap-3 flex-wrap">
+          <div
+            role="tablist"
+            aria-label="Hedef modu"
+            className="inline-flex rounded border border-surface-700 bg-surface-900 p-0.5"
           >
-            Tier
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={targetMode === "slug"}
-            onClick={() => setTargetMode("slug")}
-            className={`rounded px-3 py-1 font-mono text-[11px] uppercase tracking-wider transition-colors ${
-              targetMode === "slug"
-                ? "bg-surface-700 text-text-primary"
-                : "text-text-muted hover:text-text-secondary"
-            }`}
-          >
-            Tek Ajan
-          </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={targetMode === "tier"}
+              onClick={() => setTargetMode("tier")}
+              title="Alt+T"
+              className={`rounded px-3 py-1 font-mono text-[11px] uppercase tracking-wider transition-colors ${
+                targetMode === "tier"
+                  ? "bg-surface-700 text-text-primary"
+                  : "text-text-muted hover:text-text-secondary"
+              }`}
+            >
+              Tier
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={targetMode === "slug"}
+              onClick={() => setTargetMode("slug")}
+              title="Alt+S"
+              className={`rounded px-3 py-1 font-mono text-[11px] uppercase tracking-wider transition-colors ${
+                targetMode === "slug"
+                  ? "bg-surface-700 text-text-primary"
+                  : "text-text-muted hover:text-text-secondary"
+              }`}
+            >
+              Tek Ajan
+            </button>
+          </div>
+          <span className="font-mono text-[10px] text-text-muted hidden sm:inline">
+            kısayol:{" "}
+            <kbd className="px-1 py-0.5 rounded bg-surface-700 border border-surface-600 text-[9px]">
+              Alt+T
+            </kbd>
+            /
+            <kbd className="px-1 py-0.5 rounded bg-surface-700 border border-surface-600 text-[9px]">
+              Alt+S
+            </kbd>
+          </span>
         </div>
 
         {targetMode === "tier" ? (
@@ -332,6 +379,7 @@ export function AvkBroadcastWidget() {
               </p>
             ) : (
               <select
+                ref={slugSelectRef}
                 id="avk-broadcast-slug"
                 value={selectedSlug}
                 onChange={(e) => setSelectedSlug(e.target.value)}
@@ -357,9 +405,16 @@ export function AvkBroadcastWidget() {
             Mesaj
           </label>
           <textarea
+            ref={textareaRef}
             id="avk-broadcast-message"
             value={message}
             onChange={(e) => setMessage(e.target.value)}
+            onKeyDown={(e) => {
+              if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                e.preventDefault();
+                if (canSend) void handleSend();
+              }
+            }}
             disabled={sending}
             rows={3}
             placeholder="Örn: patrol özet ver (Linear In Progress + son birleştirilen PR)"
@@ -368,7 +423,14 @@ export function AvkBroadcastWidget() {
           />
           <div className="flex items-center justify-between mt-1">
             <span className="font-mono text-[10px] text-text-muted">
-              {message.length}/8192 karakter
+              {message.length}/8192 karakter · gönder için{" "}
+              <kbd className="px-1 py-0.5 rounded bg-surface-700 border border-surface-600 text-[9px]">
+                ⌘↵
+              </kbd>{" "}
+              /{" "}
+              <kbd className="px-1 py-0.5 rounded bg-surface-700 border border-surface-600 text-[9px]">
+                Ctrl↵
+              </kbd>
             </span>
             {message.length > 2048 && (
               <span className="font-mono text-[10px] text-status-waiting">
