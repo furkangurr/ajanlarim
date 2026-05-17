@@ -385,6 +385,42 @@ export interface AvkPanePeekResponse {
 }
 
 /**
+ * `GET /api/avk/roadmap` JSON shape mirror — FUR-4165.
+ *
+ * Linear initiatives + projects. `avg_progress` initiative içindeki proje
+ * progress'lerinin aritmetik ortalaması (0.0-1.0).
+ */
+export interface RoadmapProject {
+  id: string;
+  name: string;
+  progress: number;
+  state: "backlog" | "planned" | "started" | "paused" | "completed" | "canceled" | string;
+  target_date: string | null;
+  url: string;
+}
+
+export interface RoadmapInitiative {
+  id: string;
+  name: string;
+  status: string;
+  target_date: string | null;
+  updated_at: string;
+  projects: RoadmapProject[];
+  avg_progress: number;
+}
+
+export interface RoadmapResponse {
+  initiatives: RoadmapInitiative[];
+  total_initiatives: number;
+  total_projects: number;
+}
+
+export interface RoadmapError {
+  error: string;
+  kind?: "not_configured" | "upstream_error";
+}
+
+/**
  * `GET /api/avk/linear-queue` JSON shape mirror — FUR-4160.
  *
  * Backend Linear GraphQL API'sine `LINEAR_API_KEY` env'i ile sorgu atar;

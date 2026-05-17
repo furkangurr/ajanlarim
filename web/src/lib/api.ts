@@ -17,6 +17,8 @@ import type {
   GitFlowResponse,
   LinearQueueError,
   LinearQueueResponse,
+  RoadmapError,
+  RoadmapResponse,
   ProfileInfo,
   BrowseResponse,
   GroupInfo,
@@ -469,6 +471,28 @@ export async function fetchAvkPanePeek(
   return await fetchJson<AvkPanePeekResponse>(
     `/api/avk/pane-peek?slug=${encodeURIComponent(slug)}&lines=${lines}`,
   );
+}
+
+/**
+ * `GET /api/avk/roadmap` — FUR-4165 Linear initiatives + projects.
+ *
+ * 200 → `RoadmapResponse`. 503/502 → `RoadmapError`. Fetch hata null.
+ */
+export async function fetchAvkRoadmap(): Promise<
+  RoadmapResponse | RoadmapError | null
+> {
+  try {
+    const res = await fetch("/api/avk/roadmap");
+    if (res.ok) {
+      return (await res.json()) as RoadmapResponse;
+    }
+    if (res.status === 503 || res.status === 502) {
+      return (await res.json()) as RoadmapError;
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /**
