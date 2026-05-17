@@ -7,6 +7,7 @@ import type {
   AvkAgentRole,
   AvkBroadcastRequest,
   AvkBroadcastResponse,
+  AvkHealthResponse,
   AvkMemoryEntry,
   ProfileInfo,
   BrowseResponse,
@@ -383,6 +384,16 @@ export async function fetchAgents(): Promise<AgentInfo[]> {
 export async function fetchAvkAgents(role?: AvkAgentRole): Promise<AvkAgentInfo[]> {
   const url = role ? `/api/avk/agents?role=${role}` : "/api/avk/agents";
   return (await fetchJson<AvkAgentInfo[]>(url)) ?? [];
+}
+
+/**
+ * `GET /api/avk/health` — FUR-4157 sistem sağlık endpoint.
+ *
+ * AoE daemon version + uptime + tmux durumu + canlı ajan oranı.
+ * Hata durumunda null döner (UI fallback "bilinmiyor" gösterir).
+ */
+export async function fetchAvkHealth(): Promise<AvkHealthResponse | null> {
+  return await fetchJson<AvkHealthResponse>("/api/avk/health");
 }
 
 /**

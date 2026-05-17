@@ -5,6 +5,7 @@ import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { AvkAgentsGrid } from "./AvkAgentsGrid";
 import { AvkBroadcastWidget } from "./AvkBroadcastWidget";
 import { AvkMemoryFeed } from "./AvkMemoryFeed";
+import { AvkSystemHealth } from "./AvkSystemHealth";
 
 interface Props {
   sessions: SessionResponse[];
@@ -193,6 +194,10 @@ export function Dashboard({
             13 ajan orkestrasyonu · canlı durum · tier yayını · son 24 saat hafıza
           </p>
         </header>
+
+        <div className="rounded-lg border border-surface-700/40 bg-surface-900/40 p-4 sm:p-6">
+          <AvkSystemHealth />
+        </div>
 
         <div className="rounded-lg border border-surface-700/40 bg-surface-900/40 p-4 sm:p-6">
           <AvkAgentsGrid />

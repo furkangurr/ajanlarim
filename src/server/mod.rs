@@ -960,6 +960,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/avk/memory-recall", get(api::list_avk_memory_recall))
         // AVK tier broadcast (FUR-4121 — POST { tier, message } -> tmux send-keys)
         .route("/api/avk/broadcast", post(api::broadcast_avk))
+        // AVK sistem sağlık (FUR-4157 — version + uptime + tmux + alive count)
+        .route("/api/avk/health", get(api::get_avk_health))
         // Profiles
         .route(
             "/api/profiles",
