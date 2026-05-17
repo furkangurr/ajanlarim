@@ -21,6 +21,8 @@ import type {
   LinearQueueResponse,
   RoadmapError,
   RoadmapResponse,
+  SentryAlertsError,
+  SentryAlertsResponse,
   ProfileInfo,
   BrowseResponse,
   GroupInfo,
@@ -473,6 +475,28 @@ export async function fetchAvkPanePeek(
   return await fetchJson<AvkPanePeekResponse>(
     `/api/avk/pane-peek?slug=${encodeURIComponent(slug)}&lines=${lines}`,
   );
+}
+
+/**
+ * `GET /api/avk/sentry-alerts` — FUR-4167 Sentry unresolved 24h.
+ *
+ * 200 → `SentryAlertsResponse`. 503/502 → `SentryAlertsError`. Fetch null.
+ */
+export async function fetchAvkSentryAlerts(): Promise<
+  SentryAlertsResponse | SentryAlertsError | null
+> {
+  try {
+    const res = await fetch("/api/avk/sentry-alerts");
+    if (res.ok) {
+      return (await res.json()) as SentryAlertsResponse;
+    }
+    if (res.status === 503 || res.status === 502) {
+      return (await res.json()) as SentryAlertsError;
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /**

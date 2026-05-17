@@ -32,6 +32,8 @@ mod avk_memory;
 mod avk_pane_peek;
 // FUR-4165 — AVK roadmap (Linear initiatives + projects progress).
 mod avk_roadmap;
+// FUR-4167 — AVK Sentry alerts (REST API SENTRY_AUTH_TOKEN).
+mod avk_sentry;
 #[cfg(feature = "serve")]
 mod client_log;
 #[cfg(feature = "serve")]
@@ -69,6 +71,7 @@ pub use avk_linear::get_avk_linear_queue;
 pub use avk_memory::list_avk_memory_recall;
 pub use avk_pane_peek::get_avk_pane_peek;
 pub use avk_roadmap::get_avk_roadmap;
+pub use avk_sentry::get_avk_sentry_alerts;
 #[cfg(feature = "serve")]
 pub use client_log::post_client_log;
 pub use git::{clone_repo, list_branches};

@@ -11,6 +11,7 @@ import { AvkGitFlow } from "./AvkGitFlow";
 import { AvkLinearQueue } from "./AvkLinearQueue";
 import { AvkMemoryFeed } from "./AvkMemoryFeed";
 import { AvkRoadmap } from "./AvkRoadmap";
+import { AvkSentryAlerts } from "./AvkSentryAlerts";
 import { AvkSystemHealth } from "./AvkSystemHealth";
 
 interface Props {
@@ -223,6 +224,10 @@ export function Dashboard({
 
         <div className="rounded-lg border border-surface-700/40 bg-surface-900/40 p-4 sm:p-6">
           <AvkErrorBoard />
+        </div>
+
+        <div className="rounded-lg border border-surface-700/40 bg-surface-900/40 p-4 sm:p-6">
+          <AvkSentryAlerts />
         </div>
 
         <div className="rounded-lg border border-surface-700/40 bg-surface-900/40 p-4 sm:p-6">
