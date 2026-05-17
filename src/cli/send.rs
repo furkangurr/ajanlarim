@@ -1,13 +1,19 @@
 //! `agent-of-empires send` subcommand implementation
+//!
+//! AVK extension (FUR-4120): identifier `director`/`senior`/`worker`/`all`
+//! keyword'leri AVK_AGENTS registry'sinden tier-filtered broadcast yapar.
+//! Tier keyword AVK slug listesi ile çakışmaz (slug seti: koord/komuta/
+//! mudur/code-1/code-2/merge/hata/codex/gemini-1/2/kimi-1/2/3).
 
 use anyhow::{bail, Result};
 use clap::Args;
 
-use crate::session::{EnsureReadyError, EnsureReadyOutcome, Storage};
+use crate::avk_agents::{filter_by_role, AvkAgentRole, AVK_AGENTS};
+use crate::session::{EnsureReadyError, EnsureReadyOutcome, Instance, Storage};
 
 #[derive(Args)]
 pub struct SendArgs {
-    /// Session ID or title
+    /// Session ID, title, or AVK tier keyword (director/senior/worker/all)
     identifier: String,
 
     /// Message to send to the agent
@@ -28,15 +34,76 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
         bail!("Message cannot be empty");
     }
 
-    let inst = super::resolve_session(&args.identifier, &instances)?;
+    // AVK tier/all keyword broadcast vs. tekil session send ayrımı.
+    let avk_targets: Vec<&'static str> = match args.identifier.as_str() {
+        "all" => AVK_AGENTS.iter().map(|a| a.slug).collect(),
+        "director" => filter_by_role(AvkAgentRole::Director)
+            .map(|a| a.slug)
+            .collect(),
+        "senior" => filter_by_role(AvkAgentRole::Senior)
+            .map(|a| a.slug)
+            .collect(),
+        "worker" => filter_by_role(AvkAgentRole::Worker)
+            .map(|a| a.slug)
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    if avk_targets.is_empty() {
+        // Tekil session send (mevcut davranış)
+        send_to_single(
+            &mut instances,
+            &args.identifier,
+            &args.message,
+            args.no_revive,
+        )?;
+        storage.save(&instances)?;
+        return Ok(());
+    }
+
+    // Broadcast: AVK tier/all üzerinden multiple session send
+    let total = avk_targets.len();
+    let mut ok = 0usize;
+    let mut failed: Vec<(String, String)> = Vec::new();
+
+    println!(
+        "Broadcasting to '{}' ({} sessions)...",
+        args.identifier, total
+    );
+    for slug in &avk_targets {
+        match send_to_single(&mut instances, slug, &args.message, args.no_revive) {
+            Ok(()) => {
+                ok += 1;
+            }
+            Err(e) => {
+                eprintln!("  ✗ {slug}: {e}");
+                failed.push(((*slug).to_string(), e.to_string()));
+            }
+        }
+    }
+    storage.save(&instances)?;
+
+    println!("Broadcast complete: {ok}/{total} succeeded");
+    if !failed.is_empty() {
+        bail!("{} session(s) failed", failed.len());
+    }
+    Ok(())
+}
+
+/// Tek bir session'a mesaj gönder. Storage save dış arayan tarafından yapılır
+/// (broadcast loop'unda her iterate save etmemek için ayrıştırıldı).
+fn send_to_single(
+    instances: &mut Vec<Instance>,
+    identifier: &str,
+    message: &str,
+    no_revive: bool,
+) -> Result<()> {
+    let inst = super::resolve_session(identifier, instances)?;
     let session_id = inst.id.clone();
     let session_title = inst.title.clone();
     let tool = inst.tool.clone();
 
-    // Revive the pane if needed before delivering keystrokes. Without this,
-    // a send to a dead pane silently writes to a corpse with no agent to
-    // respond to it.
-    if !args.no_revive {
+    if !no_revive {
         if let Some(target) = instances.iter_mut().find(|i| i.id == session_id) {
             match target.ensure_pane_ready() {
                 Ok(EnsureReadyOutcome::Respawned) => {
@@ -61,18 +128,16 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     if !tmux_session.exists() {
         bail!(
             "Session is not running. Start it first with: aoe session start {}",
-            args.identifier
+            identifier
         );
     }
 
     let delay = crate::agents::send_keys_enter_delay(&tool);
-    tmux_session.send_keys_with_delay(&args.message, delay)?;
+    tmux_session.send_keys_with_delay(message, delay)?;
 
-    // Stamp last_accessed_at so the "last activity" column reflects user interaction
     if let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) {
         inst.touch_last_accessed();
     }
-    storage.save(&instances)?;
 
     println!("Sent message to '{}'", session_title);
     Ok(())
