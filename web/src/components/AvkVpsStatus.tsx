@@ -1,15 +1,15 @@
 /**
- * AVK VPS sistem durum widget.
+ * AVK VPS filo durum widget.
  *
- * `GET /api/avk/vps-status` → daemon host metrikleri (hostname + kernel +
- * uptime + load avg + memory % + disk %). 30s refresh interval —
- * AvkSystemHealth ile aynı kadans. Birden fazla VPS gelecekte
- * eklenebilsin diye liste-tabanlı render (şimdilik 1 host).
+ * `GET /api/avk/vps-status` → `{ hosts: AvkVpsHostEntry[] }` döner. Local
+ * (primary) ilk, AOE_FLEET ile tanımlı uzak host'lar (runner vb.) peşinden.
+ * Her host için ayrı kart: hostname/OS satırı + 6 metrik badge. Ulaşılamayan
+ * host'ta error mesajı gösterilir. 30s refresh.
  */
 
 import { useEffect, useState } from "react";
 import { fetchAvkVpsStatus } from "../lib/api";
-import type { AvkVpsStatusResponse } from "../lib/types";
+import type { AvkVpsHostEntry, AvkVpsStatusResponse } from "../lib/types";
 
 const REFRESH_INTERVAL_MS = 30_000;
 
@@ -48,8 +48,19 @@ function loadAccent(load: number, cpu: number | null): string {
   return "text-status-running";
 }
 
+function roleLabel(role: string): string {
+  switch (role) {
+    case "primary":
+      return "ana";
+    case "runner":
+      return "runner";
+    default:
+      return role;
+  }
+}
+
 export function AvkVpsStatus() {
-  const [vps, setVps] = useState<AvkVpsStatusResponse | null>(null);
+  const [fleet, setFleet] = useState<AvkVpsStatusResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [stale, setStale] = useState(false);
 
@@ -59,7 +70,7 @@ export function AvkVpsStatus() {
       const result = await fetchAvkVpsStatus();
       if (cancelled) return;
       if (result) {
-        setVps(result);
+        setFleet(result);
         setStale(false);
       } else {
         setStale(true);
@@ -85,7 +96,7 @@ export function AvkVpsStatus() {
     );
   }
 
-  if (!vps) {
+  if (!fleet || fleet.hosts.length === 0) {
     return (
       <div>
         <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-3">
@@ -98,13 +109,9 @@ export function AvkVpsStatus() {
     );
   }
 
-  const load1 = vps.load_avg?.[0];
-  const load5 = vps.load_avg?.[1];
-  const load15 = vps.load_avg?.[2];
-
   return (
     <div>
-      <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-1">
+      <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-3">
         VPS Durum
         {stale && (
           <span className="ml-2 normal-case tracking-normal text-status-waiting text-[11px]">
@@ -112,56 +119,92 @@ export function AvkVpsStatus() {
           </span>
         )}
       </h3>
-      <p className="font-mono text-[11px] text-text-dim mb-3 truncate">
-        <span className="text-text-secondary">{vps.hostname}</span>
-        {vps.os && <span> · {vps.os}</span>}
-        {vps.kernel && <span> · {vps.kernel}</span>}
-      </p>
-
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
-        <StatusBadge
-          label="Süre"
-          value={formatUptime(vps.uptime_sec)}
-          accent="text-text-secondary"
-        />
-        <StatusBadge
-          label="CPU"
-          value={vps.cpu_count != null ? `${vps.cpu_count} çekirdek` : "—"}
-          accent="text-text-secondary"
-        />
-        <StatusBadge
-          label="Yük 1dk"
-          value={load1 != null ? load1.toFixed(2) : "—"}
-          accent={load1 != null ? loadAccent(load1, vps.cpu_count) : "text-text-secondary"}
-        />
-        <StatusBadge
-          label="Yük 5/15dk"
-          value={
-            load5 != null && load15 != null
-              ? `${load5.toFixed(2)} / ${load15.toFixed(2)}`
-              : "—"
-          }
-          accent="text-text-secondary"
-        />
-        <StatusBadge
-          label="Bellek"
-          value={
-            vps.memory
-              ? `%${vps.memory.used_pct} · ${formatKb(vps.memory.used_kb)}/${formatKb(vps.memory.total_kb)}`
-              : "—"
-          }
-          accent={vps.memory ? pctAccent(vps.memory.used_pct) : "text-text-secondary"}
-        />
-        <StatusBadge
-          label={`Disk ${vps.disk?.mount ?? ""}`.trim()}
-          value={
-            vps.disk
-              ? `%${vps.disk.used_pct} · ${formatKb(vps.disk.used_kb)}/${formatKb(vps.disk.total_kb)}`
-              : "—"
-          }
-          accent={vps.disk ? pctAccent(vps.disk.used_pct) : "text-text-secondary"}
-        />
+      <div className="space-y-4">
+        {fleet.hosts.map((host, idx) => (
+          <HostCard key={`${host.name}-${idx}`} host={host} />
+        ))}
       </div>
+    </div>
+  );
+}
+
+function HostCard({ host }: { host: AvkVpsHostEntry }) {
+  const load1 = host.load_avg?.[0];
+  const load5 = host.load_avg?.[1];
+  const load15 = host.load_avg?.[2];
+
+  return (
+    <div className="rounded border border-surface-700/60 bg-surface-900/40 p-3">
+      <div className="flex items-center gap-2 mb-2">
+        <span className="font-mono text-[12px] font-medium text-text-primary">
+          {host.hostname ?? host.name}
+        </span>
+        <span className="font-mono text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-surface-800 text-text-muted">
+          {roleLabel(host.role)}
+        </span>
+        {host.ok ? (
+          <span className="font-mono text-[10px] text-status-running">●</span>
+        ) : (
+          <span className="font-mono text-[10px] text-status-error">●</span>
+        )}
+      </div>
+
+      {host.os || host.kernel ? (
+        <p className="font-mono text-[11px] text-text-dim mb-2 truncate">
+          {[host.os, host.kernel].filter(Boolean).join(" · ")}
+        </p>
+      ) : null}
+
+      {!host.ok && host.error ? (
+        <p className="font-body text-[12px] text-status-error">
+          ulaşılamadı: {host.error}
+        </p>
+      ) : (
+        <div className="grid grid-cols-2 lg:grid-cols-3 gap-2">
+          <StatusBadge
+            label="Süre"
+            value={formatUptime(host.uptime_sec)}
+            accent="text-text-secondary"
+          />
+          <StatusBadge
+            label="CPU"
+            value={host.cpu_count != null ? `${host.cpu_count} çekirdek` : "—"}
+            accent="text-text-secondary"
+          />
+          <StatusBadge
+            label="Yük 1dk"
+            value={load1 != null ? load1.toFixed(2) : "—"}
+            accent={load1 != null ? loadAccent(load1, host.cpu_count) : "text-text-secondary"}
+          />
+          <StatusBadge
+            label="Yük 5/15dk"
+            value={
+              load5 != null && load15 != null
+                ? `${load5.toFixed(2)} / ${load15.toFixed(2)}`
+                : "—"
+            }
+            accent="text-text-secondary"
+          />
+          <StatusBadge
+            label="Bellek"
+            value={
+              host.memory
+                ? `%${host.memory.used_pct} · ${formatKb(host.memory.used_kb)}/${formatKb(host.memory.total_kb)}`
+                : "—"
+            }
+            accent={host.memory ? pctAccent(host.memory.used_pct) : "text-text-secondary"}
+          />
+          <StatusBadge
+            label={`Disk ${host.disk?.mount ?? ""}`.trim()}
+            value={
+              host.disk
+                ? `%${host.disk.used_pct} · ${formatKb(host.disk.used_kb)}/${formatKb(host.disk.total_kb)}`
+                : "—"
+            }
+            accent={host.disk ? pctAccent(host.disk.used_pct) : "text-text-secondary"}
+          />
+        </div>
+      )}
     </div>
   );
 }

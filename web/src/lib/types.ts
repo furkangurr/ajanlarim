@@ -538,14 +538,18 @@ export interface AvkHealthResponse {
 }
 
 /**
- * `GET /api/avk/vps-status` JSON shape mirror.
+ * `GET /api/avk/vps-status` JSON shape mirror — VPS filosu.
  *
- * Daemon host (VPS) sistem metrikleri: hostname + kernel + uptime +
- * load avg + memory % + disk %. Linux dışı host'larda `load_avg` /
- * `memory` / `disk` alanları `null` olabilir.
+ * Local host (primary) her zaman ilk eleman. `AOE_FLEET` env'le tanımlı
+ * uzak host'lar (runner vb.) sırayla peşine eklenir; ulaşılamayan
+ * host'ta `ok=false` + `error` doldurulur, metrik alanları null kalır.
  */
-export interface AvkVpsStatusResponse {
-  hostname: string;
+export interface AvkVpsHostEntry {
+  name: string;
+  role: string;
+  ok: boolean;
+  error: string | null;
+  hostname: string | null;
   kernel: string | null;
   os: string | null;
   uptime_sec: number | null;
@@ -562,6 +566,10 @@ export interface AvkVpsStatusResponse {
     used_kb: number;
     used_pct: number;
   } | null;
+}
+
+export interface AvkVpsStatusResponse {
+  hosts: AvkVpsHostEntry[];
 }
 
 /**
