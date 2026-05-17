@@ -10,6 +10,8 @@
 
 pub(super) use super::AppState;
 
+// FUR-3957 Adım 6 — AVK workflow ajan registry endpoint (13 ajan serve).
+mod avk_agents;
 #[cfg(feature = "serve")]
 mod client_log;
 #[cfg(feature = "serve")]
@@ -19,6 +21,15 @@ mod log_level;
 mod projects;
 mod sessions;
 mod system;
+// FUR-3957 Sub-C entegrasyon — Linear + Sentry summary widgets (avk-suite fork).
+#[cfg(feature = "serve")]
+mod widgets;
+
+#[cfg(feature = "serve")]
+pub use widgets::{
+    get_github_actions_summary, get_linear_summary, get_netdata_summary, get_sentry_summary,
+    get_vercel_summary, WidgetCache,
+};
 
 #[cfg(feature = "serve")]
 pub use cockpit::{
@@ -27,6 +38,7 @@ pub use cockpit::{
     set_cockpit_master, shutdown_cockpit, spawn_cockpit,
 };
 
+pub use avk_agents::list_avk_agents;
 #[cfg(feature = "serve")]
 pub use client_log::post_client_log;
 pub use git::{clone_repo, list_branches};

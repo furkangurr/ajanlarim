@@ -274,6 +274,12 @@ pub struct AppState {
     /// checks this to suppress notifications when someone is actively using
     /// the web dashboard (on any device).
     pub last_web_activity: std::sync::atomic::AtomicI64,
+    /// avk-suite custom widget cache (Linear + Sentry summary, 60s TTL).
+    /// FUR-3957 Sub-C entegrasyon — Sub-C PR ajan-sistemi#521 Next.js
+    /// route'larının Rust port'u. Tek paylaşımlı cache, dashboard refresh
+    /// burst'ünü Linear/Sentry rate limit'inden korur.
+    #[cfg(feature = "serve")]
+    pub widget_cache: Arc<crate::server::api::WidgetCache>,
 }
 
 impl AppState {
@@ -551,6 +557,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         push_enabled,
         web_config: config.web.clone(),
         last_web_activity: std::sync::atomic::AtomicI64::new(0),
+        #[cfg(feature = "serve")]
+        widget_cache: Arc::new(crate::server::api::WidgetCache::new()),
     });
 
     let app = build_router(state.clone());
@@ -946,6 +954,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         // Agents
         .route("/api/agents", get(api::list_agents))
+        // AVK workflow agents (FUR-3957 Adım 6 — 13 ajan registry serve)
+        .route("/api/avk/agents", get(api::list_avk_agents))
         // Profiles
         .route(
             "/api/profiles",
@@ -976,6 +986,19 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/themes", get(api::list_themes))
         .route("/api/sounds", get(api::list_sounds))
+        // FUR-3957 transplant — avk-suite custom widgets (5 endpoint).
+        // Contract: docs/aoe-transplant/02-widget-api-contract.md (Code-1 dondurucu).
+        .route("/api/widgets/linear/summary", get(api::get_linear_summary))
+        .route("/api/widgets/sentry/summary", get(api::get_sentry_summary))
+        .route(
+            "/api/widgets/github-actions/summary",
+            get(api::get_github_actions_summary),
+        )
+        .route("/api/widgets/vercel/summary", get(api::get_vercel_summary))
+        .route(
+            "/api/widgets/netdata/summary",
+            get(api::get_netdata_summary),
+        )
         // Push notifications
         .route("/api/push/status", get(push::get_status))
         .route(
