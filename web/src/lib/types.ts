@@ -237,14 +237,18 @@ export type AvkAgentRole = "director" | "senior" | "worker";
 /**
  * `GET /api/avk/agents[?role=...]` JSON shape mirror.
  *
- * `tmux_target` runtime'da değişebilir (pane index resync) — UI tarafı
- * cache yapmamalı, her render fetch'i fresh sonuç kullanmalı.
+ * `tmux_target` registry sabit (örn `avk-ofis:idare.1`). `runtime_target`
+ * AoE binary'nin gerçek yarattığı session adı (örn `aoe_koord_e91e6bb4:^.0`)
+ * — bulunamazsa null. `pane_alive` resolver başarılıysa true, UI live dot
+ * indicator (yeşil/gri). FUR-4123 polish.
  */
 export interface AvkAgentInfo {
   slug: string;
   label: string;
   role: AvkAgentRole;
   tmux_target: string;
+  runtime_target: string | null;
+  pane_alive: boolean;
 }
 
 /**

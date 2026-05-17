@@ -13,9 +13,10 @@
 //! (avukatadanis-online src/app/api/*) sustained.
 
 use axum::{extract::Query, http::StatusCode, response::IntoResponse, Json};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use super::avk_broadcast::resolve_runtime_target;
 use crate::avk_agents::{filter_by_role, AvkAgent, AvkAgentRole, AVK_AGENTS};
 
 #[derive(Deserialize)]
@@ -23,14 +24,50 @@ pub struct AvkAgentsQuery {
     pub role: Option<String>,
 }
 
+/// FUR-4123: registry kayıt + runtime tmux pane durumu serialize wrapper.
+///
+/// `runtime_target` AoE binary'nin yarattigi gercek tmux session adi
+/// (örn `aoe_koord_e91e6bb4:^.0`) — bulunamazsa None, UI registry sabit
+/// `tmux_target`'i kullanir. `pane_alive` runtime resolver basariliysa
+/// true (session live), false ise UI gri dot gosterir.
+#[derive(Serialize)]
+struct AvkAgentWithStatus {
+    slug: &'static str,
+    label: &'static str,
+    role: AvkAgentRole,
+    tmux_target: &'static str,
+    runtime_target: Option<String>,
+    pane_alive: bool,
+}
+
+impl AvkAgentWithStatus {
+    fn from_agent(agent: &'static AvkAgent) -> Self {
+        let runtime = resolve_runtime_target(agent.slug);
+        Self {
+            slug: agent.slug,
+            label: agent.label,
+            role: agent.role,
+            tmux_target: agent.tmux_target,
+            pane_alive: runtime.is_some(),
+            runtime_target: runtime,
+        }
+    }
+}
+
 /// GET `/api/avk/agents[?role=director|senior|worker]`
 ///
 /// 13 AVK workflow ajan kayıt listesini JSON serve eder. `role` query
 /// belirtilirse o tier filtrelenir; bilinmeyen değer 400 döner.
+///
+/// FUR-4123: response artık her ajan için runtime tmux pane durumu da
+/// içerir (`runtime_target` + `pane_alive`). UI live dot indicator.
 pub async fn list_avk_agents(Query(query): Query<AvkAgentsQuery>) -> impl IntoResponse {
     match query.role.as_deref() {
         None => {
-            let agents: Vec<&AvkAgent> = AVK_AGENTS.iter().collect();
+            let agents: Vec<AvkAgentWithStatus> = AVK_AGENTS
+                .iter()
+                .map(AvkAgentWithStatus::from_agent)
+                .collect();
             Json(agents).into_response()
         }
         Some(raw) => {
@@ -51,7 +88,9 @@ pub async fn list_avk_agents(Query(query): Query<AvkAgentsQuery>) -> impl IntoRe
                         .into_response();
                 }
             };
-            let agents: Vec<&AvkAgent> = filter_by_role(role).collect();
+            let agents: Vec<AvkAgentWithStatus> = filter_by_role(role)
+                .map(AvkAgentWithStatus::from_agent)
+                .collect();
             Json(agents).into_response()
         }
     }
