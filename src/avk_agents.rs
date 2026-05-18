@@ -81,14 +81,14 @@ pub const AVK_AGENTS: &[AvkAgent] = &[
         tmux_target: "avk-ofis:idare.2",
     },
     AvkAgent {
-        slug: "merge",
-        label: "Birleştirme Ajanı (PR Bekçi)",
+        slug: "hata",
+        label: "Hata Ajanı (CI Triyaj)",
         role: AvkAgentRole::Senior,
         tmux_target: "avk-ofis:idare.3",
     },
     AvkAgent {
-        slug: "hata",
-        label: "Hata Ajanı (CI Triyaj)",
+        slug: "merge",
+        label: "Birleştirme Ajanı (PR Bekçi)",
         role: AvkAgentRole::Senior,
         tmux_target: "avk-ofis:idare.4",
     },

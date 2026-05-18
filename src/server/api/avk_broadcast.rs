@@ -206,25 +206,33 @@ fn send_to_pane(target: &str, message: &str, pre_validated: bool) -> Result<(), 
 /// FUR-4123: `pub(super)` — `avk_agents.rs` live pane status indicator
 /// endpoint aynı resolver'ı kullanır.
 pub(super) fn resolve_runtime_target(slug: &str) -> Option<String> {
-    let output = Command::new("tmux")
+    if let Ok(output) = Command::new("tmux")
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let prefix = format!("aoe_{slug}_");
-    let matched = stdout.lines().map(str::trim).find(|name| {
-        if !name.starts_with(&prefix) {
-            return false;
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let prefix = format!("aoe_{slug}_");
+            if let Some(matched) = stdout.lines().map(str::trim).find(|name| {
+                if !name.starts_with(&prefix) {
+                    return false;
+                }
+                let rest = &name[prefix.len()..];
+                !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric())
+            }) {
+                return Some(format!("{matched}:^.0"));
+            }
         }
-        let rest = &name[prefix.len()..];
-        // 8-char hash + sadece alphanumeric — fuzzy match koruma.
-        !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric())
-    })?;
-    // `:^.0` = ilk window + ilk pane (AoE default layout, tek pane).
-    Some(format!("{matched}:^.0"))
+    }
+    let registry_target = crate::avk_agents::AVK_AGENTS
+        .iter()
+        .find(|a| a.slug == slug)
+        .map(|a| a.tmux_target.to_string())?;
+    if pane_exists(&registry_target).unwrap_or(false) {
+        Some(registry_target)
+    } else {
+        None
+    }
 }
 
 fn pane_exists(target: &str) -> Result<bool, String> {
