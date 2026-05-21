@@ -474,14 +474,38 @@ function PeekPanel({
         )}
       </div>
       {trimmed.length > 0 && (
-        <pre className={`font-mono leading-snug text-text-secondary bg-surface-900 border border-surface-700 rounded whitespace-pre-wrap break-words ${
-            fullScreen
-              ? "text-[12px] p-3 flex-1 overflow-auto min-h-0"
-              : "text-[11px] p-2 max-h-72 overflow-auto"
-          }`}>
-          {trimmed}
-        </pre>
+        <PeekPre content={trimmed} fullScreen={fullScreen} />
       )}
     </div>
+  );
+}
+
+function PeekPre({
+  content,
+  fullScreen,
+}: {
+  content: string;
+  fullScreen: boolean;
+}) {
+  const preRef = useRef<HTMLPreElement | null>(null);
+  // Furkan canon 2026-05-21: pane peek default scroll en alt — son satır
+  // (en yeni durum) hemen görünür. İçerik güncellendiğinde de scroll-to-bottom.
+  useEffect(() => {
+    const el = preRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [content]);
+  return (
+    <pre
+      ref={preRef}
+      className={`font-mono leading-snug text-text-secondary bg-surface-900 border border-surface-700 rounded whitespace-pre-wrap break-words ${
+        fullScreen
+          ? "text-[12px] p-3 flex-1 overflow-auto min-h-0"
+          : "text-[11px] p-2 max-h-72 overflow-auto"
+      }`}
+    >
+      {content}
+    </pre>
   );
 }
