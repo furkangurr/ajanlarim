@@ -216,6 +216,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.repo-appearance",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/sidebar-multi-session.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sidebar.workspace-ordering",
       "kind": "live-playwright",
       "risk": "medium",

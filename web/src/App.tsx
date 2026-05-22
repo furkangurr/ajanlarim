@@ -222,7 +222,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     sweepOrphanDrafts(new Set(sessions.map((s) => s.id)));
   }, [sessionsLoaded, sessions]);
 
-  const { groups, toggleRepoCollapsed } = useRepoGroups(
+  const { groups, toggleRepoCollapsed, updateRepoAppearance } = useRepoGroups(
     workspaces,
     workspaceOrdering,
   );
@@ -873,6 +873,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             onToggle={() => setSidebarOpen(false)}
             onSelect={handleSelectWorkspace}
             onToggleRepo={toggleRepoCollapsed}
+            onUpdateRepoAppearance={updateRepoAppearance}
             onNew={() => { setWizardPrefill(undefined); setShowSessionWizard(true); }}
             onCreateSession={handleCreateSession}
             onSettings={handleOpenSettings}

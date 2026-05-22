@@ -36,6 +36,11 @@ import type {
 import { MULTI_REPO_GROUP_ID } from "../hooks/useRepoGroups";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import {
+  REPO_COLOR_OPTIONS,
+  type RepoAppearanceUpdate,
+  type RepoColor,
+} from "../lib/repoAppearance";
+import {
   STATUS_DOT_CLASS,
   getStatusTextClass,
   isSessionActive,
@@ -71,6 +76,7 @@ interface Props {
   onToggle: () => void;
   onSelect: (workspaceId: string) => void;
   onToggleRepo: (repoId: string) => void;
+  onUpdateRepoAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   onNew: () => void;
   onCreateSession: (repoPath: string) => void;
   onSettings: () => void;
@@ -242,6 +248,27 @@ function useDragSuppressRef(): MutableRefObject<number> {
     throw new Error("DragSuppressContext used outside provider");
   }
   return ref;
+}
+
+const REPO_COLOR_TOKENS: Record<RepoColor, string> = {
+  amber: "--color-status-waiting",
+  teal: "--color-terminal-active",
+  sky: "--color-sandbox",
+  violet: "--color-diff-header",
+  rose: "--color-status-error",
+  slate: "--color-surface-700",
+};
+
+function repoColorStyle(color: RepoColor | null): React.CSSProperties | undefined {
+  if (!color) return undefined;
+  const token = REPO_COLOR_TOKENS[color];
+  return {
+    backgroundColor: `color-mix(in srgb, var(${token}) 14%, transparent)`,
+  };
+}
+
+function repoSwatchStyle(color: RepoColor): React.CSSProperties {
+  return { backgroundColor: `var(${REPO_COLOR_TOKENS[color]})` };
 }
 
 function useSuppressClickAfterDrag(ref: MutableRefObject<number>) {
@@ -730,63 +757,227 @@ const RepoGroupHeader = memo(function RepoGroupHeader({
   hasActiveChild,
   onClick,
   onNewSession,
+  onUpdateAppearance,
   offline,
 }: {
   group: RepoGroup;
   hasActiveChild: boolean;
   onClick: () => void;
   onNewSession: () => void;
+  onUpdateAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   offline: boolean;
 }) {
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const [renaming, setRenaming] = useState(false);
+  const [renameValue, setRenameValue] = useState(group.alias ?? group.displayName);
+  const renameRef = useRef<HTMLInputElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const dotClass =
     STATUS_DOT_CLASS[
       group.status === "active" ? "Running" : "Idle"
     ] ?? "bg-status-idle";
+  const headerStyle = repoColorStyle(group.color);
+  const headerHoverClass = group.color ? "" : "hover:bg-surface-800/50";
+
+  const openMenuAt = useCallback((x: number, y: number) => {
+    closeOtherContextMenus();
+    setContextMenu({ x, y });
+  }, []);
+
+  const handleHeaderKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.target !== e.currentTarget) return;
+    if (
+      e.key !== "Enter" &&
+      e.key !== " " &&
+      e.key !== "ContextMenu" &&
+      !(e.shiftKey && e.key === "F10")
+    ) {
+      return;
+    }
+    e.preventDefault();
+    const rect = e.currentTarget.getBoundingClientRect();
+    openMenuAt(rect.left + 12, rect.bottom + 4);
+  };
+
+  useEffect(() => {
+    if (renaming) renameRef.current?.select();
+  }, [renaming]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    const onDocClick = (e: MouseEvent) => {
+      if (menuRef.current?.contains(e.target as Node)) return;
+      close();
+    };
+    const id = requestAnimationFrame(() => {
+      document.addEventListener("click", onDocClick);
+      document.addEventListener("contextmenu", close);
+    });
+    menuBus.addEventListener("close", close);
+    return () => {
+      cancelAnimationFrame(id);
+      document.removeEventListener("click", onDocClick);
+      document.removeEventListener("contextmenu", close);
+      menuBus.removeEventListener("close", close);
+    };
+  }, [contextMenu]);
+
+  const commitRename = () => {
+    setRenaming(false);
+    const trimmed = renameValue.trim();
+    onUpdateAppearance(group.id, { alias: trimmed || null });
+  };
+
+  if (renaming) {
+    return (
+      <div
+        data-testid="sidebar-group-header"
+        data-group-id={group.id}
+        className={`flex items-center gap-2 px-3 py-2 transition-colors duration-75 text-text-secondary ${headerHoverClass} ${
+          hasActiveChild ? "border-l-2 border-brand-600" : ""
+        }`}
+        style={headerStyle}
+      >
+        <span className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`} />
+        <input
+          ref={renameRef}
+          type="text"
+          value={renameValue}
+          onChange={(e) => setRenameValue(e.target.value)}
+          onBlur={commitRename}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commitRename();
+            if (e.key === "Escape") setRenaming(false);
+          }}
+          data-testid="sidebar-group-rename-input"
+          className="min-w-0 flex-1 rounded border border-brand-600 bg-surface-900 px-2 py-1 text-[13px] md:text-[14px] font-mono text-text-primary focus:outline-none"
+        />
+      </div>
+    );
+  }
 
   return (
-    <div
-      data-testid="sidebar-group-header"
-      data-group-id={group.id}
-      className={`flex items-center gap-2 px-3 py-2 transition-colors duration-75 text-text-secondary hover:bg-surface-800/50 ${
-        hasActiveChild ? "border-l-2 border-brand-600" : ""
-      }`}
-    >
-      <span className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`} />
-      <button
-        onClick={onClick}
-        aria-expanded={!group.collapsed}
-        className="flex items-center gap-2 flex-1 min-w-0 text-left cursor-pointer"
+    <>
+      <div
+        data-testid="sidebar-group-header"
+        data-group-id={group.id}
+        tabIndex={0}
+        aria-haspopup="menu"
+        aria-label={`Project actions for ${group.displayName}`}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          openMenuAt(e.clientX, e.clientY);
+        }}
+        onKeyDown={handleHeaderKeyDown}
+        className={`flex items-center gap-2 px-3 py-2 transition-colors duration-75 text-text-secondary focus:outline-none focus:ring-2 focus:ring-brand-600 ${headerHoverClass} ${
+          hasActiveChild ? "border-l-2 border-brand-600" : ""
+        }`}
+        style={headerStyle}
       >
-        <svg
-          width="10"
-          height="10"
-          viewBox="0 0 10 10"
-          fill="currentColor"
-          className={`shrink-0 text-text-dim transition-transform duration-75 ${
-            group.collapsed ? "-rotate-90" : ""
-          }`}
-        >
-          <path d="M2 3 L5 6.5 L8 3" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-        </svg>
-        <OwnerAvatar owner={group.remoteOwner} size={16} />
-        <span className="text-[13px] md:text-[14px] font-medium truncate flex-1" title={group.repoPath}>
-          {group.displayName}
-        </span>
-      </button>
-      <Tooltip text={offline ? OFFLINE_TITLE : "New session"}>
+        <span className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`} />
         <button
-          onClick={onNewSession}
-          disabled={offline}
-          className="w-8 h-8 flex items-center justify-center shrink-0 rounded-md transition-colors text-text-muted hover:text-text-secondary hover:bg-surface-700/50 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-text-muted disabled:hover:bg-transparent"
-          aria-label={`New session in ${group.displayName}`}
+          onClick={onClick}
+          aria-expanded={!group.collapsed}
+          className="flex items-center gap-2 flex-1 min-w-0 text-left cursor-pointer"
         >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
-            <line x1="12" y1="5" x2="12" y2="19" />
-            <line x1="5" y1="12" x2="19" y2="12" />
+          <svg
+            width="10"
+            height="10"
+            viewBox="0 0 10 10"
+            fill="currentColor"
+            className={`shrink-0 text-text-dim transition-transform duration-75 ${
+              group.collapsed ? "-rotate-90" : ""
+            }`}
+          >
+            <path d="M2 3 L5 6.5 L8 3" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
+          <OwnerAvatar owner={group.remoteOwner} size={16} />
+          <span className="text-[13px] md:text-[14px] font-medium truncate flex-1" title={group.repoPath}>
+            {group.displayName}
+          </span>
         </button>
-      </Tooltip>
-    </div>
+        <Tooltip text={offline ? OFFLINE_TITLE : "New session"}>
+          <button
+            onClick={onNewSession}
+            disabled={offline}
+            className="w-8 h-8 flex items-center justify-center shrink-0 rounded-md transition-colors text-text-muted hover:text-text-secondary hover:bg-surface-700/50 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-text-muted disabled:hover:bg-transparent"
+            aria-label={`New session in ${group.displayName}`}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+              <line x1="12" y1="5" x2="12" y2="19" />
+              <line x1="5" y1="12" x2="19" y2="12" />
+            </svg>
+          </button>
+        </Tooltip>
+      </div>
+      {contextMenu && createPortal(
+        <div
+          ref={menuRef}
+          data-testid="sidebar-group-context-menu"
+          className="fixed z-50 bg-surface-800 border border-surface-700 rounded-lg shadow-lg py-1 min-w-[190px]"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+        >
+          <button
+            onClick={() => {
+              setContextMenu(null);
+              setRenameValue(group.alias ?? group.defaultDisplayName);
+              setRenaming(true);
+            }}
+            data-testid="sidebar-group-context-menu-rename"
+            className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+          >
+            Rename
+          </button>
+          {group.alias && (
+            <button
+              onClick={() => {
+                setContextMenu(null);
+                onUpdateAppearance(group.id, { alias: null });
+              }}
+              className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+            >
+              Clear alias
+            </button>
+          )}
+          <div className="border-t border-surface-700/20 my-1" />
+          <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
+            Background
+          </div>
+          <div className="grid grid-cols-4 gap-1 px-3 py-1.5">
+            {REPO_COLOR_OPTIONS.map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                onClick={() => {
+                  setContextMenu(null);
+                  onUpdateAppearance(group.id, { color: option.id });
+                }}
+                data-testid={`sidebar-group-color-${option.id}`}
+                aria-label={`Set ${option.label} background`}
+                className={`h-8 rounded-md border cursor-pointer transition-colors ${
+                  group.color === option.id ? "border-text-primary" : "border-surface-700"
+                }`}
+                style={repoSwatchStyle(option.id)}
+              />
+            ))}
+            <button
+              type="button"
+              onClick={() => {
+                setContextMenu(null);
+                onUpdateAppearance(group.id, { color: null });
+              }}
+              data-testid="sidebar-group-color-clear"
+              aria-label="Clear background"
+              className="h-8 rounded-md border border-surface-700 bg-surface-900 text-[10px] font-mono text-text-dim cursor-pointer hover:bg-surface-700/40"
+            >
+              None
+            </button>
+          </div>
+        </div>,
+        document.body,
+      )}
+    </>
   );
 });
 
@@ -819,6 +1010,7 @@ export function WorkspaceSidebar({
   onToggle,
   onSelect,
   onToggleRepo,
+  onUpdateRepoAppearance,
   onNew,
   onCreateSession,
   onSettings,
@@ -1057,6 +1249,7 @@ export function WorkspaceSidebar({
                     group={{ ...group, collapsed: !showExpanded }}
                     hasActiveChild={!showExpanded && hasActiveChild}
                     onClick={() => !q && onToggleRepo(group.id)}
+                    onUpdateAppearance={onUpdateRepoAppearance}
                     onNewSession={() =>
                       group.id === MULTI_REPO_GROUP_ID
                         ? onNew()
