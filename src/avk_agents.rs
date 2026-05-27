@@ -113,7 +113,8 @@ pub const AVK_AGENTS: &[AvkAgent] = &[
     },
     // yardimcilar window (paralel slot, 6 ajan)
     // UI gösterim sırası: Gemini'ler birlikte, sonra Kimi'ler, sonra Codex
-    // (Furkan canon 2026-05-17). tmux_target değişmedi — pane index VPS layout.
+    // (Furkan canon 2026-05-17). tmux_target = FUR-7050 sıralı layout (avk-ofis-baslat):
+    // .1=G1 .2=G2 .3=K1 .4=K2 .5=K3 .6=Codex — gerçek pane sırasıyla hizalı.
     AvkAgent {
         slug: "gemini-1",
         label: "Gemini-1 (Araştırmacı)",
@@ -124,31 +125,43 @@ pub const AVK_AGENTS: &[AvkAgent] = &[
         slug: "gemini-2",
         label: "Gemini-2 (Araştırmacı)",
         role: AvkAgentRole::Worker,
-        tmux_target: "avk-ofis:yardimcilar.6",
+        tmux_target: "avk-ofis:yardimcilar.2",
     },
     AvkAgent {
         slug: "kimi-1",
         label: "Kimi-1 (Çoklu Sağlayıcı)",
         role: AvkAgentRole::Worker,
-        tmux_target: "avk-ofis:yardimcilar.2",
+        tmux_target: "avk-ofis:yardimcilar.3",
     },
     AvkAgent {
         slug: "kimi-2",
         label: "Kimi-2 (Çoklu Sağlayıcı)",
         role: AvkAgentRole::Worker,
-        tmux_target: "avk-ofis:yardimcilar.3",
+        tmux_target: "avk-ofis:yardimcilar.4",
     },
     AvkAgent {
         slug: "kimi-3",
         label: "Kimi-3 (Çoklu Sağlayıcı)",
         role: AvkAgentRole::Worker,
-        tmux_target: "avk-ofis:yardimcilar.4",
+        tmux_target: "avk-ofis:yardimcilar.5",
     },
     AvkAgent {
         slug: "codex",
         label: "Codex (Bağımsız Denetçi)",
         role: AvkAgentRole::Worker,
-        tmux_target: "avk-ofis:yardimcilar.5",
+        tmux_target: "avk-ofis:yardimcilar.6",
+    },
+    AvkAgent {
+        slug: "avf-koord",
+        label: "AVF Koord (avfurkangur.com)",
+        role: AvkAgentRole::Director,
+        tmux_target: "avfurkangur:main.1",
+    },
+    AvkAgent {
+        slug: "avf-code",
+        label: "AVF Code (avfurkangur.com)",
+        role: AvkAgentRole::Senior,
+        tmux_target: "avfurkangur:main.2",
     },
 ];
 
@@ -202,9 +215,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn agent_count_is_thirteen() {
-        // tmux 13 pane LIVE ack (2026-05-16T02:25Z TRT).
-        assert_eq!(AVK_AGENTS.len(), 13);
+    fn agent_count_is_fifteen() {
+        assert_eq!(AVK_AGENTS.len(), 15);
     }
 
     #[test]
@@ -218,20 +230,16 @@ mod tests {
 
     #[test]
     fn role_distribution() {
-        // Director: Koord + Komuta + Müdür
         let directors: Vec<_> = filter_by_role(AvkAgentRole::Director).collect();
-        assert_eq!(directors.len(), 3);
+        assert_eq!(directors.len(), 4);
 
-        // Senior: Code-1 + Code-2 + Merge + Hata
         let seniors: Vec<_> = filter_by_role(AvkAgentRole::Senior).collect();
-        assert_eq!(seniors.len(), 4);
+        assert_eq!(seniors.len(), 5);
 
-        // Worker: Gemini-1/2 + Kimi-1/2/3 + Codex
         let workers: Vec<_> = filter_by_role(AvkAgentRole::Worker).collect();
         assert_eq!(workers.len(), 6);
 
-        // Toplam = 13
-        assert_eq!(directors.len() + seniors.len() + workers.len(), 13);
+        assert_eq!(directors.len() + seniors.len() + workers.len(), 15);
     }
 
     #[test]
@@ -239,22 +247,22 @@ mod tests {
         assert_eq!(find_by_slug("koord").unwrap().role, AvkAgentRole::Director);
         assert_eq!(find_by_slug("code-2").unwrap().role, AvkAgentRole::Senior);
         assert_eq!(find_by_slug("gemini-1").unwrap().role, AvkAgentRole::Worker);
+        assert_eq!(
+            find_by_slug("avf-koord").unwrap().role,
+            AvkAgentRole::Director
+        );
+        assert_eq!(find_by_slug("avf-code").unwrap().role, AvkAgentRole::Senior);
         assert!(find_by_slug("bilinmeyen").is_none());
     }
 
     #[test]
     fn tmux_target_format_valid() {
-        // Format: avk-ofis:<window>.<pane>
         for agent in AVK_AGENTS {
             assert!(
-                agent.tmux_target.starts_with("avk-ofis:"),
-                "{}: tmux_target invalid prefix",
-                agent.slug
-            );
-            assert!(
-                agent.tmux_target.contains('.'),
-                "{}: tmux_target missing pane index",
-                agent.slug
+                agent.tmux_target.contains(':') && agent.tmux_target.contains('.'),
+                "{}: tmux_target format must be <session>:<window>.<pane> (got '{}')",
+                agent.slug,
+                agent.tmux_target
             );
         }
     }
@@ -270,12 +278,10 @@ mod tests {
     fn resolve_tier_slugs_matches_filter() {
         // FUR-4121: tier resolver CLI + server ortak kullanır, distribution
         // testiyle aynı sayılar dönmeli.
-        assert_eq!(resolve_tier_slugs("director").unwrap().len(), 3);
-        assert_eq!(resolve_tier_slugs("senior").unwrap().len(), 4);
+        assert_eq!(resolve_tier_slugs("director").unwrap().len(), 4);
+        assert_eq!(resolve_tier_slugs("senior").unwrap().len(), 5);
         assert_eq!(resolve_tier_slugs("worker").unwrap().len(), 6);
-        assert_eq!(resolve_tier_slugs("all").unwrap().len(), 13);
-        // Bare slug bilinen ajan olsa bile tier resolver olarak geçersiz —
-        // slug seçimi `slug:<slug>` prefix gerektirir.
+        assert_eq!(resolve_tier_slugs("all").unwrap().len(), 15);
         assert!(resolve_tier_slugs("koord").is_none());
         assert!(resolve_tier_slugs("bilinmeyen").is_none());
     }

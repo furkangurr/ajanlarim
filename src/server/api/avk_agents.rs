@@ -103,13 +103,13 @@ mod tests {
     use axum::extract::Query;
 
     #[tokio::test]
-    async fn list_returns_all_thirteen_when_no_filter() {
+    async fn list_returns_all_fifteen_when_no_filter() {
         let q = Query(AvkAgentsQuery { role: None });
         let response = list_avk_agents(q).await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let parsed: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed.len(), 13);
+        assert_eq!(parsed.len(), 15);
     }
 
     #[tokio::test]
@@ -121,7 +121,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let parsed: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed.len(), 4);
         for agent in &parsed {
             assert_eq!(agent["role"], "director");
         }
@@ -135,7 +135,7 @@ mod tests {
         let response = list_avk_agents(q).await.into_response();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let parsed: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed.len(), 4);
+        assert_eq!(parsed.len(), 5);
     }
 
     #[tokio::test]

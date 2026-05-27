@@ -63,6 +63,7 @@ export function AvkVpsStatus() {
   const [fleet, setFleet] = useState<AvkVpsStatusResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [stale, setStale] = useState(false);
+  const [selectedIdx, setSelectedIdx] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -109,6 +110,9 @@ export function AvkVpsStatus() {
     );
   }
 
+  const activeIdx = Math.min(selectedIdx, fleet.hosts.length - 1);
+  const activeHost = fleet.hosts[activeIdx];
+
   return (
     <div>
       <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-3">
@@ -119,11 +123,43 @@ export function AvkVpsStatus() {
           </span>
         )}
       </h3>
-      <div className="space-y-4">
-        {fleet.hosts.map((host, idx) => (
-          <HostCard key={`${host.name}-${idx}`} host={host} />
-        ))}
-      </div>
+      {fleet.hosts.length > 1 && (
+        <div
+          role="tablist"
+          aria-label="VPS host sekmeleri"
+          className="flex gap-1 mb-3 border-b border-surface-700/60 overflow-x-auto"
+        >
+          {fleet.hosts.map((host, idx) => {
+            const isActive = idx === activeIdx;
+            return (
+              <button
+                key={`tab-${host.name}-${idx}`}
+                role="tab"
+                aria-selected={isActive}
+                onClick={() => setSelectedIdx(idx)}
+                className={`flex items-center gap-1.5 px-3 py-2 font-mono text-[12px] border-b-2 transition-colors whitespace-nowrap ${
+                  isActive
+                    ? "border-status-running text-text-primary bg-surface-800/40"
+                    : "border-transparent text-text-secondary hover:text-text-primary hover:bg-surface-800/20"
+                }`}
+              >
+                <span
+                  className={`text-[10px] ${
+                    host.ok ? "text-status-running" : "text-status-error"
+                  }`}
+                >
+                  ●
+                </span>
+                <span>{host.hostname ?? host.name}</span>
+                <span className="text-[10px] uppercase tracking-wider text-text-muted">
+                  {roleLabel(host.role)}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+      {activeHost && <HostCard host={activeHost} />}
     </div>
   );
 }
