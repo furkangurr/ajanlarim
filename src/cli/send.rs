@@ -10,7 +10,7 @@ use clap::Args;
 
 use crate::avk_agents::resolve_tier_slugs;
 use crate::cli::session::stale_history_suffix;
-use crate::session::{EnsureReadyError, EnsureReadyOutcome, Instance, Storage};
+use crate::session::{EnsureReadyError, EnsureReadyOutcome, Storage};
 
 #[derive(Args)]
 pub struct SendArgs {
@@ -30,7 +30,6 @@ pub struct SendArgs {
 #[tracing::instrument(target = "cli.send", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     let storage = Storage::new(profile)?;
-    let (mut instances, _) = storage.load_with_groups()?;
 
     if args.message.trim().is_empty() {
         bail!("Message cannot be empty");
@@ -39,13 +38,7 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     // AVK tier/all keyword broadcast vs. tekil session send ayrımı.
     let Some(avk_targets) = resolve_tier_slugs(args.identifier.as_str()) else {
         // Tekil session send (mevcut davranış)
-        send_to_single(
-            &mut instances,
-            &args.identifier,
-            &args.message,
-            args.no_revive,
-        )?;
-        storage.save(&instances)?;
+        send_to_single(&storage, &args.identifier, &args.message, args.no_revive)?;
         return Ok(());
     };
 
@@ -59,7 +52,7 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
         args.identifier, total
     );
     for slug in &avk_targets {
-        match send_to_single(&mut instances, slug, &args.message, args.no_revive) {
+        match send_to_single(&storage, slug, &args.message, args.no_revive) {
             Ok(()) => {
                 ok += 1;
             }
@@ -69,7 +62,6 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
             }
         }
     }
-    storage.save(&instances)?;
 
     println!("Broadcast complete: {ok}/{total} succeeded");
     if !failed.is_empty() {
@@ -78,19 +70,26 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     Ok(())
 }
 
-/// Tek bir session'a mesaj gönder. Storage save dış arayan tarafından yapılır
-/// (broadcast loop'unda her iterate save etmemek için ayrıştırıldı).
+/// Tek bir session'a mesaj gönder. Persist (last_accessed + status remap)
+/// upstream'in atomic `storage.update` API'si ile yapılır; broadcast loop'unda
+/// her hedef kendi load + update'ini çalıştırır, böylece flock korumalı yazım
+/// hedef başına atomic kalır.
 fn send_to_single(
-    instances: &mut [Instance],
+    storage: &Storage,
     identifier: &str,
     message: &str,
     no_revive: bool,
 ) -> Result<()> {
-    let inst = super::resolve_session(identifier, instances)?;
+    let (mut instances, _) = storage.load_with_groups()?;
+
+    let inst = super::resolve_session(identifier, &instances)?;
     let session_id = inst.id.clone();
     let session_title = inst.title.clone();
     let tool = inst.tool.clone();
 
+    // Revive the pane if needed before delivering keystrokes. Without this,
+    // a send to a dead pane silently writes to a corpse with no agent to
+    // respond to it.
     if !no_revive {
         if let Some(target) = instances.iter_mut().find(|i| i.id == session_id) {
             match target.ensure_pane_ready() {
@@ -139,17 +138,31 @@ fn send_to_single(
     let delay = crate::agents::send_keys_enter_delay(&tool);
     tmux_session.send_keys_with_delay(message, delay)?;
 
-    if let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) {
-        // Stamp last_accessed_at so the "last activity" column reflects user
-        // interaction, and remap the status to Running. The agent has just been
-        // given fresh input; the next status poll will reconcile the real state,
-        // but flipping to Running immediately keeps the row from sticking on a
-        // stale Idle/Waiting label during the gap between send and poll.
-        // touch_last_accessed also auto-clears archived_at and snoozed_until
-        // (see Instance::touch_last_accessed), so a user can wake any sunk row
-        // by sending to it.
-        inst.touch_last_accessed();
-        inst.status = crate::session::Status::Running;
+    // Stamp last_accessed_at so the "last activity" column reflects user
+    // interaction, and remap the status to Running. The agent has just been
+    // given fresh input; the next status poll will reconcile the real state,
+    // but flipping to Running immediately keeps the row from sticking on a
+    // stale Idle/Waiting label during the gap between send and poll.
+    // touch_last_accessed also auto-clears archived_at and snoozed_until
+    // (see Instance::touch_last_accessed), so a user can wake any sunk row by
+    // sending to it.
+    let id_for_save = session_id.clone();
+    if let Err(err) = storage.update(|instances, _groups| {
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_save) {
+            inst.touch_last_accessed();
+            inst.status = crate::session::Status::Running;
+        }
+        Ok(())
+    }) {
+        // The tmux send succeeded; the storage write is best-effort
+        // bookkeeping (status remap + auto-unarchive). Surfacing this as a
+        // hard error would tell the user "send failed" when the message
+        // actually reached the agent, so log a warning and keep the success
+        // line. The next status poll will reconcile the row anyway.
+        tracing::warn!(
+            ?err,
+            "send: failed to persist status remap after successful send"
+        );
     }
 
     println!("Sent message to '{}'", session_title);
