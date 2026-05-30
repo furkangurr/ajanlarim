@@ -680,7 +680,8 @@ mod tests {
         assert_eq!(settings_index_from_name(Some("hermes")), 11);
         assert_eq!(settings_index_from_name(Some("kiro")), 12);
         assert_eq!(settings_index_from_name(Some("qwen")), 13);
-        assert_eq!(settings_index_from_name(Some("antigravity")), 14);
+        assert_eq!(settings_index_from_name(Some("kimi")), 14);
+        assert_eq!(settings_index_from_name(Some("antigravity")), 15);
 
         assert_eq!(name_from_settings_index(0), None);
         assert_eq!(name_from_settings_index(1), Some("claude"));
@@ -693,7 +694,8 @@ mod tests {
         assert_eq!(name_from_settings_index(11), Some("hermes"));
         assert_eq!(name_from_settings_index(12), Some("kiro"));
         assert_eq!(name_from_settings_index(13), Some("qwen"));
-        assert_eq!(name_from_settings_index(14), Some("antigravity"));
+        assert_eq!(name_from_settings_index(14), Some("kimi"));
+        assert_eq!(name_from_settings_index(15), Some("antigravity"));
         assert_eq!(name_from_settings_index(99), None);
     }
 
