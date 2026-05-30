@@ -18,7 +18,7 @@ pub(crate) fn resilient_read_dir(
 ) -> Result<impl Iterator<Item = std::fs::DirEntry> + '_> {
     Ok(std::fs::read_dir(dir)?.filter_map(move |entry| {
         entry
-            .map_err(|e| tracing::debug!("Skipping unreadable entry in {}: {}", dir.display(), e))
+            .map_err(|e| tracing::debug!(target: "session.capture", "Skipping unreadable entry in {}: {}", dir.display(), e))
             .ok()
     }))
 }
@@ -47,7 +47,7 @@ pub(crate) fn validated_session_id(id: String) -> Option<String> {
     if is_valid_session_id(&id) {
         Some(id)
     } else {
-        tracing::warn!("Captured session ID failed validation: {:?}", id);
+        tracing::warn!(target: "session.capture", "Captured session ID failed validation: {:?}", id);
         None
     }
 }
@@ -79,12 +79,18 @@ fn encode_claude_project_path(project_path: &str) -> String {
 /// falling back to `~/.claude.json` if the dir scan result is stale.
 ///
 /// Used as a fallback when hooks don't fire (e.g. after `/clear` or `/new`).
-pub(crate) fn capture_claude_session_id(project_path: &str) -> Result<String> {
+pub(crate) fn capture_claude_session_id(
+    project_path: &str,
+    known_session_id: Option<&str>,
+) -> Result<String> {
     let claude_home = resolve_agent_home(Some("CLAUDE_CONFIG_DIR"), ".claude")?;
     let canonical = canonicalize_or_raw(project_path);
 
-    // Source 1: most recently modified .jsonl in the project dir
-    if let Some((id, modified)) = scan_claude_project_dir(&claude_home, &canonical)? {
+    // Source 1: this poller's own known session if its .jsonl is still fresh,
+    // otherwise the most recently modified .jsonl in the project dir.
+    if let Some((id, modified)) =
+        scan_claude_project_dir(&claude_home, &canonical, known_session_id)?
+    {
         let age = modified.elapsed().unwrap_or(Duration::from_secs(u64::MAX));
         if age <= Duration::from_secs(5 * 60) {
             return Ok(id);
@@ -108,11 +114,24 @@ pub(crate) fn capture_claude_session_id(project_path: &str) -> Result<String> {
     anyhow::bail!("No active Claude session found for {}", project_path)
 }
 
-/// Scan `~/.claude/projects/{encoded-path}/` for the most recently modified
-/// UUID-named `.jsonl` file.
+/// Scan `~/.claude/projects/{encoded-path}/` for the session this poller should
+/// report.
+///
+/// When several AoE sessions share one `project_path` (a fleet rooted at a
+/// single repo), the bare "most recently modified `.jsonl`" heuristic makes
+/// every session's poller report whichever session most recently wrote — so
+/// they all steal one another's session ids and resume the same conversation
+/// (issue #1522). To prevent that, if the caller's own `known` session still
+/// has a fresh `.jsonl` here, return it: each session sticks to its own
+/// transcript rather than racing for the global most-recent.
+///
+/// Falls back to the most-recent file when `known` is `None`, absent, or stale
+/// (e.g. the session genuinely moved to a new conversation), preserving the
+/// original behaviour for the single-session-per-repo case.
 fn scan_claude_project_dir(
     claude_home: &Path,
     project_path: &Path,
+    known: Option<&str>,
 ) -> Result<Option<(String, std::time::SystemTime)>> {
     let dir_name = encode_claude_project_path(&project_path.to_string_lossy());
     let project_dir = claude_home.join("projects").join(&dir_name);
@@ -122,6 +141,7 @@ fn scan_claude_project_dir(
     }
 
     let mut best: Option<(String, std::time::SystemTime)> = None;
+    let mut known_hit: Option<(String, std::time::SystemTime)> = None;
 
     for entry in resilient_read_dir(&project_dir)? {
         let path = entry.path();
@@ -143,6 +163,22 @@ fn scan_claude_project_dir(
 
         if best.as_ref().is_none_or(|(_, t)| modified > *t) {
             best = Some((stem.to_string(), modified));
+        }
+        if known == Some(stem) {
+            known_hit = Some((stem.to_string(), modified));
+        }
+    }
+
+    // issue #1522: anchor to our own session while its file is fresh, so
+    // sessions sharing a project_path don't cross-assign. The freshness bound
+    // mirrors the caller's staleness gate in `capture_claude_session_id`.
+    if let Some((kid, kmt)) = known_hit {
+        let fresh = kmt
+            .elapsed()
+            .map(|age| age <= Duration::from_secs(5 * 60))
+            .unwrap_or(false);
+        if fresh {
+            return Ok(Some((kid, kmt)));
         }
     }
 
@@ -171,12 +207,64 @@ fn read_claude_json_session_id(project_path: &Path) -> Option<String> {
 }
 
 /// Polling closure for Claude Code session tracking on the host filesystem.
-pub(crate) fn claude_poll_fn(project_path: String) -> impl Fn() -> Option<String> + Send + 'static {
+///
+/// Unlike other agents' poll factories, this closure does not take an
+/// `extra_excludes` set. Claude is protected from re-importing the sid
+/// `start_with_resume_fallback` just cleared by a layered chain:
+///
+/// 1. `acquire_session_id` mints a fresh UUID for Claude and assigns it
+///    to `agent_session_id` BEFORE `maybe_start_poller` runs, so the
+///    poller's `initial_known` is the new UUID, not the stale one.
+/// 2. The poller's `last_known` dedupes once Claude writes
+///    `<new_uuid>.jsonl` and the disk scan returns it.
+/// 3. The defense-in-depth guard in `apply_session_id_updates`
+///    (`tui/home/mod.rs`) drops any poller report whose sid is in
+///    `retroactive_capture_excludes`. The cascade pre-loads that set
+///    before respawning, so a race where the immediate first poll fires
+///    before Claude writes the new `.jsonl` (and therefore returns the
+///    still-fresh stale `<stale_sid>.jsonl`) is caught here.
+///
+/// The 5-minute mtime check inside `capture_claude_session_id` is an
+/// upper bound on staleness, not a stale-sid filter; a just-crashed
+/// `<stale_sid>.jsonl` has a fresh mtime and passes that check.
+///
+/// Serve-only mode never drains `result_rx` (the only consumer of
+/// `try_recv_session_update` is the TUI tick path), so the stale sid
+/// cannot reach in-memory `agent_session_id` or `sessions.json` via the
+/// poller in that mode either. The only residual effect is that
+/// `on_change` may briefly write the stale sid into the tmux env's
+/// `AOE_CAPTURED_SESSION_ID_KEY`; the next poll cycle overwrites it.
+///
+/// If you ever add a second consumer of the poller channel that
+/// bypasses `apply_session_id_updates`, replicate the
+/// `retroactive_capture_excludes` filter at the consumer or thread an
+/// `extra_excludes` set into this closure mirroring the other agents.
+pub(crate) fn claude_poll_fn(
+    project_path: String,
+    known_session_id: Option<String>,
+) -> impl Fn() -> Option<String> + Send + 'static {
+    // issue #1522: promote the last successfully captured sid to the anchor
+    // for subsequent polls. Without this, the closure keeps the startup
+    // `known_session_id` forever; once that file goes stale the scan drops
+    // back to global-most-recent and shared-repo fleets can resume
+    // cross-assigning on the next /clear or fork.
+    let last_known = std::sync::Mutex::new(known_session_id);
     move || {
-        capture_claude_session_id(&project_path)
-            .map_err(|e| tracing::debug!("Claude disk scan failed: {}", e))
+        let current_known = last_known.lock().ok().and_then(|g| g.clone());
+        let captured = capture_claude_session_id(&project_path, current_known.as_deref())
+            .map_err(
+                |e| tracing::debug!(target: "session.capture", "Claude disk scan failed: {}", e),
+            )
             .ok()
-            .and_then(validated_session_id)
+            .and_then(validated_session_id);
+
+        if let Some(id) = captured.as_ref() {
+            if let Ok(mut guard) = last_known.lock() {
+                *guard = Some(id.clone());
+            }
+        }
+
+        captured
     }
 }
 
@@ -244,7 +332,7 @@ pub(crate) fn claude_poll_fn_sandboxed(
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         capture_claude_session_id_in_container(&container_name, &container_cwd)
-            .map_err(|e| tracing::debug!("Claude container scan failed: {}", e))
+            .map_err(|e| tracing::debug!(target: "session.capture", "Claude container scan failed: {}", e))
             .ok()
             .and_then(validated_session_id)
     }
@@ -450,11 +538,14 @@ pub(crate) fn capture_pi_session_id(
 pub(crate) fn pi_poll_fn(
     project_path: String,
     instance_id: String,
+    extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = build_exclusion_set(&instance_id);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         capture_pi_session_id(&project_path, &exclusion)
-            .map_err(|e| tracing::debug!("Pi poll capture failed: {}", e))
+            .map_err(
+                |e| tracing::debug!(target: "session.capture", "Pi poll capture failed: {}", e),
+            )
             .ok()
             .and_then(validated_session_id)
     }
@@ -553,11 +644,12 @@ pub(crate) fn pi_poll_fn_sandboxed(
     container_name: String,
     container_cwd: String,
     instance_id: String,
+    extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = build_exclusion_set(&instance_id);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         try_capture_pi_session_id_in_container(&container_name, &container_cwd, &exclusion)
-            .map_err(|e| tracing::debug!("Pi container poll capture failed: {}", e))
+            .map_err(|e| tracing::debug!(target: "session.capture", "Pi container poll capture failed: {}", e))
             .ok()
             .and_then(validated_session_id)
     }
@@ -571,12 +663,36 @@ pub(crate) fn is_valid_session_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
 }
 
-/// Build a set of session IDs already claimed by other AoE instances.
+/// Compose [`build_exclusion_set`] (cross-instance live tmux scan) with a
+/// per-instance set of IDs the cascade has explicitly cleared but which
+/// may still live on disk for several minutes.
 ///
-/// Lists all tmux sessions with the AoE prefix, reads each one's hidden env vars
-/// to find its instance ID and captured session ID, and collects all captured IDs
-/// from instances other than `current_instance_id`.
-pub(crate) fn build_exclusion_set(current_instance_id: &str) -> HashSet<String> {
+/// Both `Instance::retroactive_capture_exclusion_set` and the post-launch
+/// `*_poll_fn` closures route through this helper so the resume-fallback
+/// cascade's just-crashed sid is filtered identically on the synchronous
+/// pre-launch path and on the asynchronous polling path.
+pub(crate) fn compose_exclusion(
+    current_instance_id: &str,
+    extra: &HashSet<String>,
+) -> HashSet<String> {
+    let mut set = build_exclusion_set(current_instance_id);
+    set.extend(extra.iter().cloned());
+    set
+}
+
+/// Build the set of session IDs already claimed by other live AoE instances.
+///
+/// Reads every other AoE-prefixed tmux session's hidden env to find which
+/// session IDs are currently bound to which instance, and returns the set
+/// of captured IDs that belong to instances OTHER than `current_instance_id`.
+/// Used by post-launch poll closures to avoid re-importing another
+/// instance's session via filesystem scan.
+///
+/// Callers that also need to exclude IDs not yet visible in tmux env (e.g.
+/// the resume-fallback cascade's just-crashed sid) should use
+/// [`compose_exclusion`] instead, which composes this function with the
+/// per-instance exclusion list.
+fn build_exclusion_set(current_instance_id: &str) -> HashSet<String> {
     let output = match std::process::Command::new("tmux")
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()
@@ -718,11 +834,14 @@ fn parse_vibe_meta_json(content: &str) -> Option<(String, Option<String>)> {
 pub(crate) fn vibe_poll_fn(
     project_path: String,
     instance_id: String,
+    extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = build_exclusion_set(&instance_id);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         capture_vibe_session_id(&project_path, &exclusion)
-            .map_err(|e| tracing::debug!("Vibe poll capture failed: {}", e))
+            .map_err(
+                |e| tracing::debug!(target: "session.capture", "Vibe poll capture failed: {}", e),
+            )
             .ok()
             .and_then(validated_session_id)
     }
@@ -821,11 +940,12 @@ pub(crate) fn vibe_poll_fn_sandboxed(
     container_name: String,
     container_cwd: String,
     instance_id: String,
+    extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = build_exclusion_set(&instance_id);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         try_capture_vibe_session_id_in_container(&container_name, &container_cwd, &exclusion)
-            .map_err(|e| tracing::debug!("Vibe container poll capture failed: {}", e))
+            .map_err(|e| tracing::debug!(target: "session.capture", "Vibe container poll capture failed: {}", e))
             .ok()
             .and_then(validated_session_id)
     }
@@ -1102,7 +1222,7 @@ fn log_opencode_sqlite_fallback_once(err: &anyhow::Error) {
     use std::sync::Once;
     static LOG_ONCE: Once = Once::new();
     LOG_ONCE.call_once(|| {
-        tracing::warn!(
+        tracing::warn!(target: "session.capture", 
             "opencode SQLite read failed ({}); falling back to `opencode session list`. \
              That subprocess leaks /tmp/.<hash>.so files via bun:ffi (see anomalyco/opencode#6523).",
             err
@@ -1194,11 +1314,12 @@ pub(crate) fn opencode_poll_fn(
     project_path: String,
     instance_id: String,
     launch_time_ms: f64,
+    extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = build_exclusion_set(&instance_id);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         try_capture_opencode_session_id(&project_path, &exclusion, Some(launch_time_ms))
-            .map_err(|e| tracing::debug!("OpenCode poll capture failed: {}", e))
+            .map_err(|e| tracing::debug!(target: "session.capture", "OpenCode poll capture failed: {}", e))
             .ok()
             .and_then(validated_session_id)
     }
@@ -1210,16 +1331,17 @@ pub(crate) fn opencode_poll_fn_sandboxed(
     container_cwd: String,
     instance_id: String,
     launch_time_ms: f64,
+    extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = build_exclusion_set(&instance_id);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         try_capture_opencode_session_id_in_container(
             &container_name,
             &container_cwd,
             &exclusion,
             Some(launch_time_ms),
         )
-        .map_err(|e| tracing::debug!("OpenCode container poll capture failed: {}", e))
+        .map_err(|e| tracing::debug!(target: "session.capture", "OpenCode container poll capture failed: {}", e))
         .ok()
         .and_then(validated_session_id)
     }
@@ -1432,11 +1554,14 @@ fn select_codex_session_in_container(
 pub(crate) fn codex_poll_fn(
     project_path: String,
     instance_id: String,
+    extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = build_exclusion_set(&instance_id);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         capture_codex_session_id(&project_path, &exclusion)
-            .map_err(|e| tracing::debug!("Codex poll capture failed: {}", e))
+            .map_err(
+                |e| tracing::debug!(target: "session.capture", "Codex poll capture failed: {}", e),
+            )
             .ok()
             .and_then(validated_session_id)
     }
@@ -1447,11 +1572,12 @@ pub(crate) fn codex_poll_fn_sandboxed(
     container_name: String,
     container_cwd: String,
     instance_id: String,
+    extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = build_exclusion_set(&instance_id);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         try_capture_codex_session_id_in_container(&container_name, &container_cwd, &exclusion)
-            .map_err(|e| tracing::debug!("Codex container poll capture failed: {}", e))
+            .map_err(|e| tracing::debug!(target: "session.capture", "Codex container poll capture failed: {}", e))
             .ok()
             .and_then(validated_session_id)
     }
@@ -1463,11 +1589,14 @@ pub(crate) fn codex_poll_fn_sandboxed(
 pub(crate) fn gemini_poll_fn(
     project_path: String,
     instance_id: String,
+    extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = build_exclusion_set(&instance_id);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         capture_gemini_session_id(&project_path, &exclusion)
-            .map_err(|e| tracing::debug!("Gemini poll capture failed: {}", e))
+            .map_err(
+                |e| tracing::debug!(target: "session.capture", "Gemini poll capture failed: {}", e),
+            )
             .ok()
             .and_then(validated_session_id)
     }
@@ -1571,11 +1700,12 @@ pub(crate) fn gemini_poll_fn_sandboxed(
     container_name: String,
     container_cwd: String,
     instance_id: String,
+    extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = build_exclusion_set(&instance_id);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         try_capture_gemini_session_id_in_container(&container_name, &container_cwd, &exclusion)
-            .map_err(|e| tracing::debug!("Gemini container poll capture failed: {}", e))
+            .map_err(|e| tracing::debug!(target: "session.capture", "Gemini container poll capture failed: {}", e))
             .ok()
             .and_then(validated_session_id)
     }
@@ -1855,11 +1985,14 @@ pub(crate) fn try_capture_hermes_session_id_in_container(
 pub(crate) fn hermes_poll_fn(
     project_path: String,
     instance_id: String,
+    extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = build_exclusion_set(&instance_id);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         capture_hermes_session_id(&project_path, &exclusion)
-            .map_err(|e| tracing::debug!("Hermes poll capture failed: {}", e))
+            .map_err(
+                |e| tracing::debug!(target: "session.capture", "Hermes poll capture failed: {}", e),
+            )
             .ok()
             .and_then(validated_session_id)
     }
@@ -1870,11 +2003,12 @@ pub(crate) fn hermes_poll_fn_sandboxed(
     container_name: String,
     container_cwd: String,
     instance_id: String,
+    extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = build_exclusion_set(&instance_id);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         try_capture_hermes_session_id_in_container(&container_name, &container_cwd, &exclusion)
-            .map_err(|e| tracing::debug!("Hermes container poll capture failed: {}", e))
+            .map_err(|e| tracing::debug!(target: "session.capture", "Hermes container poll capture failed: {}", e))
             .ok()
             .and_then(validated_session_id)
     }
@@ -1967,8 +2101,147 @@ mod tests {
         let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
-        let result = capture_claude_session_id("/tmp/myproject");
+        let result = capture_claude_session_id("/tmp/myproject", None);
         assert_eq!(result.unwrap(), uuid_new);
+
+        match old_val {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_claude_session_prefers_known_when_shared() {
+        // issue #1522: two sessions share a project_path and both .jsonl files
+        // are fresh. Without an anchor the poller returns the most-recent for
+        // BOTH, cross-assigning ids. With `known`, each sticks to its own file.
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("projects").join("-tmp-myproject");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let uuid_a = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let uuid_b = "11111111-2222-3333-4444-555555555555";
+        std::fs::write(project_dir.join(format!("{uuid_a}.jsonl")), "a\n").unwrap();
+        // Nudge A 30s into the past so B is unambiguously the most-recent.
+        let a_time = std::time::SystemTime::now() - Duration::from_secs(30);
+        std::fs::File::options()
+            .write(true)
+            .open(project_dir.join(format!("{uuid_a}.jsonl")))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(a_time))
+            .unwrap();
+        std::fs::write(project_dir.join(format!("{uuid_b}.jsonl")), "b\n").unwrap();
+
+        let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
+
+        // No anchor -> most recent (B): original behaviour preserved.
+        assert_eq!(
+            capture_claude_session_id("/tmp/myproject", None).unwrap(),
+            uuid_b
+        );
+        // Anchor to A (fresh) -> stays on A despite B being newer.
+        assert_eq!(
+            capture_claude_session_id("/tmp/myproject", Some(uuid_a)).unwrap(),
+            uuid_a
+        );
+        // Anchor to B -> B.
+        assert_eq!(
+            capture_claude_session_id("/tmp/myproject", Some(uuid_b)).unwrap(),
+            uuid_b
+        );
+        // Anchor to an id with no file here -> fall back to most-recent (B).
+        let absent = "99999999-9999-9999-9999-999999999999";
+        assert_eq!(
+            capture_claude_session_id("/tmp/myproject", Some(absent)).unwrap(),
+            uuid_b
+        );
+
+        match old_val {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_claude_session_known_but_stale_falls_back() {
+        // If our own session's file went stale (>5min), adopt the fresh
+        // most-recent rather than clinging to a dead anchor.
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("projects").join("-tmp-myproject");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let uuid_known = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let uuid_fresh = "11111111-2222-3333-4444-555555555555";
+        std::fs::write(project_dir.join(format!("{uuid_known}.jsonl")), "k\n").unwrap();
+        let stale = std::time::SystemTime::now() - Duration::from_secs(600);
+        std::fs::File::options()
+            .write(true)
+            .open(project_dir.join(format!("{uuid_known}.jsonl")))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stale))
+            .unwrap();
+        std::fs::write(project_dir.join(format!("{uuid_fresh}.jsonl")), "f\n").unwrap();
+
+        let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
+
+        assert_eq!(
+            capture_claude_session_id("/tmp/myproject", Some(uuid_known)).unwrap(),
+            uuid_fresh
+        );
+
+        match old_val {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_claude_poll_fn_promotes_last_known_across_polls() {
+        // issue #1522: once a stale anchor falls back to the disk's most-recent,
+        // the closure must adopt that sid as its new anchor so a later sibling
+        // write (think: another session in the same fleet) cannot steal it
+        // back on the next poll. Without promotion, the closure stays anchored
+        // to its startup sid forever, and shared-repo cross-assignment returns
+        // the moment a session forks (/clear, /new, --fork-session).
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("projects").join("-tmp-myproject");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let uuid_startup = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let uuid_post_fork = "11111111-2222-3333-4444-555555555555";
+        let uuid_sibling = "99999999-8888-7777-6666-555555555555";
+
+        // Startup anchor's file is stale; the post-fork file is fresh.
+        std::fs::write(project_dir.join(format!("{uuid_startup}.jsonl")), "s\n").unwrap();
+        let stale = std::time::SystemTime::now() - Duration::from_secs(600);
+        std::fs::File::options()
+            .write(true)
+            .open(project_dir.join(format!("{uuid_startup}.jsonl")))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stale))
+            .unwrap();
+        std::fs::write(project_dir.join(format!("{uuid_post_fork}.jsonl")), "f\n").unwrap();
+
+        let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
+
+        let poll = claude_poll_fn("/tmp/myproject".to_string(), Some(uuid_startup.to_string()));
+
+        // First poll: anchor is stale, fall back to most-recent (post-fork).
+        assert_eq!(poll().as_deref(), Some(uuid_post_fork));
+
+        // A sibling session in the same dir writes its transcript with a newer
+        // mtime than the post-fork file.
+        std::fs::write(project_dir.join(format!("{uuid_sibling}.jsonl")), "x\n").unwrap();
+
+        // Second poll: closure must now anchor to the post-fork sid (still
+        // fresh) and refuse to drift onto the sibling's newer file.
+        assert_eq!(poll().as_deref(), Some(uuid_post_fork));
 
         match old_val {
             Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
@@ -1992,7 +2265,7 @@ mod tests {
         let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
-        let result = capture_claude_session_id("/tmp/myproject");
+        let result = capture_claude_session_id("/tmp/myproject", None);
         assert!(result.is_err(), "Agent files should not be picked up");
 
         match old_val {
@@ -2024,7 +2297,7 @@ mod tests {
         let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
-        let result = capture_claude_session_id("/tmp/myproject");
+        let result = capture_claude_session_id("/tmp/myproject", None);
         assert!(result.is_err(), "Stale session file should be rejected");
         assert!(
             result
@@ -2050,7 +2323,7 @@ mod tests {
         let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
-        let result = capture_claude_session_id("/tmp/myproject");
+        let result = capture_claude_session_id("/tmp/myproject", None);
         assert!(result.is_err(), "Empty dir should return error");
 
         match old_val {
@@ -2600,6 +2873,55 @@ mod tests {
         assert!(
             result.is_err(),
             "Session with non-matching CWD should not be returned"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_vibe_poll_fn_honors_extra_excludes() {
+        // Regression for the resume-fallback cascade: after the cascade
+        // clears a bad sid, the freshly-spawned poll closure must NOT
+        // re-discover it via filesystem scan (the on-disk meta.json still
+        // references the bad sid for several minutes). Without this,
+        // `apply_session_id_updates` re-imports the cleared sid and the
+        // cascade's work is undone within ~2s.
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("myproject");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let sessions_dir = tmp.path().join("logs").join("session");
+        let s1_dir = sessions_dir.join("session-stale-on-disk");
+        std::fs::create_dir_all(&s1_dir).unwrap();
+        let s1_meta = serde_json::json!({
+            "session_id": "stale-sid-cleared-by-cascade",
+            "environment": {"working_directory": project_dir.to_str().unwrap()},
+        });
+        std::fs::write(s1_dir.join("meta.json"), s1_meta.to_string()).unwrap();
+
+        let _guard = VibeHomeGuard::set(tmp.path());
+
+        let mut extra = HashSet::new();
+        extra.insert("stale-sid-cleared-by-cascade".to_string());
+        let poll = vibe_poll_fn(
+            project_dir.to_string_lossy().into_owned(),
+            "test-instance".to_string(),
+            extra,
+        );
+        assert_eq!(
+            poll(),
+            None,
+            "poller must not re-import a sid present in extra_excludes",
+        );
+
+        let poll_no_excludes = vibe_poll_fn(
+            project_dir.to_string_lossy().into_owned(),
+            "test-instance".to_string(),
+            HashSet::new(),
+        );
+        assert_eq!(
+            poll_no_excludes(),
+            Some("stale-sid-cleared-by-cascade".to_string()),
+            "negative control: without the exclude, the poller surfaces the on-disk sid",
         );
     }
 

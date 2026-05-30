@@ -47,8 +47,26 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T | null> 
 
 // --- Sessions ---
 
-export function fetchSessions(): Promise<SessionResponse[] | null> {
-  return fetchJson<SessionResponse[]>("/api/sessions");
+export interface SessionsEnvelope {
+  sessions: SessionResponse[];
+  workspace_ordering: string[];
+}
+
+export function fetchSessions(): Promise<SessionsEnvelope | null> {
+  return fetchJson<SessionsEnvelope>("/api/sessions");
+}
+
+export async function updateWorkspaceOrdering(order: string[]): Promise<boolean> {
+  try {
+    const res = await fetch("/api/workspace-ordering", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ order }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 export interface EnsureSessionResult {
@@ -242,12 +260,47 @@ export async function updateProfileSettings(
 
 // --- Themes & Sounds ---
 
+import type { ResolvedTheme } from "./theme";
+
 export async function fetchThemes(): Promise<string[]> {
   return (await fetchJson<string[]>("/api/themes")) ?? [];
 }
 
+/** Fetch the resolved theme projection (web CSS vars, terminal CSS
+ *  vars, syntax highlighter selection) for a named theme. The server
+ *  falls back to Empire for unknown names; check `source` to detect. */
+export function fetchResolvedTheme(
+  name: string,
+): Promise<ResolvedTheme | null> {
+  return fetchJson<ResolvedTheme>(
+    `/api/themes/${encodeURIComponent(name)}`,
+  );
+}
+
+/** Fetch the resolved theme for the active profile's current
+ *  selection. Server reads from profile_config so per-profile overrides
+ *  land in the right place. */
+export function fetchCurrentTheme(): Promise<ResolvedTheme | null> {
+  return fetchJson<ResolvedTheme>("/api/theme/current");
+}
+
 export async function fetchSounds(): Promise<string[]> {
   return (await fetchJson<string[]>("/api/sounds")) ?? [];
+}
+
+/** Fetch a sound file as a Blob so the cockpit's browser-side approval
+ *  player can hand a blob URL to `new Audio(...)`. The fetch path runs
+ *  through `fetchInterceptor.ts`, which injects `Authorization: Bearer`
+ *  on every request; an `<audio src="...">` element does not, so a
+ *  blob round-trip is necessary in PWA mode. See #1038. */
+export async function fetchSoundBlob(name: string): Promise<Blob | null> {
+  try {
+    const res = await fetch(`/api/sounds/file/${encodeURIComponent(name)}`);
+    if (!res.ok) return null;
+    return await res.blob();
+  } catch {
+    return null;
+  }
 }
 
 // --- About / server info ---
@@ -256,6 +309,12 @@ export interface ServerAbout {
   version: string;
   auth_required: boolean;
   passphrase_enabled: boolean;
+  /** Resolved `--auth` mode. `"token"` means the URL token gates
+   *  requests; `"passphrase"` means the passphrase login wall is the
+   *  only human gate; `"none"` means no authentication at all. The
+   *  Security panel renders an accurate label off this instead of
+   *  guessing "--no-auth" from `auth_required === false`. */
+  auth_mode: "token" | "passphrase" | "none";
   read_only: boolean;
   behind_tunnel: boolean;
   profile: string;
@@ -289,6 +348,7 @@ export interface ServerAbout {
    *  so the rendered transcript matches the user's chosen ceiling
    *  instead of clipping at a hard-coded frontend constant. See #1111. */
   cockpit_replay_events: number;
+  build_flavor: "debug" | "release"; // `"debug"` => debug_assertions; drives topbar DEV badge. See #1055.
 }
 
 export async function setCockpitMaster(
@@ -311,8 +371,15 @@ export function fetchAbout(): Promise<ServerAbout | null> {
   return fetchJson<ServerAbout>("/api/about");
 }
 
+/** Runtime helper around `ServerAbout.build_flavor`. See #1055. */
+export function isDebugBuild(about: ServerAbout | null | undefined): boolean {
+  if (!about) return false;
+  return about.build_flavor === "debug";
+}
+export type UpdateCheckMode = "auto" | "notify" | "off";
+
 export interface UpdateStatus {
-  check_enabled: boolean;
+  update_check_mode: UpdateCheckMode;
   current_version: string;
   latest_version: string | null;
   update_available: boolean;
@@ -354,6 +421,66 @@ export interface ContextPrimerResponse {
   included_turn_count: number;
   truncated: boolean;
   max_chars: number;
+  /** When the recap was built from a session that ended in a non-
+   *  success terminal (rate-limit park or AgentStartupError), the
+   *  user's most recent UserPromptSent never reached the agent. The
+   *  backend pops it from the primer body and surfaces it here so the
+   *  recovery UI can drop it back into the composer as the user's
+   *  pending request. See #1281 / #1282. */
+  unprocessed_prompt?: string | null;
+}
+
+// --- Cockpit ACP registry ---
+
+export interface CockpitAgentInfo {
+  name: string;
+  description: string;
+  command: string;
+}
+
+/** List ACP registry entries the cockpit supervisor knows about.
+ *  Distinct from `/api/agents` (session-tool agents for the wizard);
+ *  this is the *cockpit* registry used by the rate-limit recovery
+ *  modal to populate the handoff target list. See #1282. */
+export async function fetchCockpitAgents(): Promise<CockpitAgentInfo[]> {
+  return (await fetchJson<CockpitAgentInfo[]>("/api/cockpit/agents")) ?? [];
+}
+
+// --- Cockpit switch agent ---
+
+export interface SwitchAgentResponse {
+  session_id: string;
+  agent: string;
+  /** Highest seq BEFORE AgentSwitched was emitted. Pass to
+   *  fetchContextPrimer so the recap excludes the handoff event. */
+  before_seq: number;
+  /** Seq assigned to the AgentSwitched event. The frontend awaits the
+   *  reducer reaching this seq before prefilling so the divider and
+   *  composer prefill arrive in order. */
+  switch_seq: number;
+  status: string;
+}
+
+/** Hand off a cockpit session from its current ACP backend to
+ *  `target` (registry key, e.g. "codex"). Backend stops the old
+ *  worker, spawns the new one, persists the agent change, and emits
+ *  an AgentSwitched event. On failure (unknown target, spawn error)
+ *  the instance is left untouched. See #1282. */
+export async function switchCockpitAgent(
+  sessionId: string,
+  target: string,
+  model?: string | null,
+): Promise<SwitchAgentResponse | null> {
+  const body: { target: string; model?: string } = { target };
+  if (model) body.model = model;
+  return fetchJson<SwitchAgentResponse>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/cockpit/switch-agent`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
 }
 
 /** Fetch a markdown primer built from events `seq < beforeSeq`. Used
@@ -664,9 +791,11 @@ export async function getHomePath(): Promise<string | null> {
 export async function browseFilesystem(
   path: string,
   limit?: number,
+  filter?: string,
 ): Promise<BrowseResponse & { ok: boolean }> {
   const params = new URLSearchParams({ path });
   if (limit != null) params.set("limit", String(limit));
+  if (filter) params.set("filter", filter);
   const data = await fetchJson<BrowseResponse>(`/api/filesystem/browse?${params}`);
   if (!data) return { entries: [], has_more: false, ok: false };
   return { ...data, ok: true };
@@ -809,14 +938,27 @@ export async function cloneRepo(
 
 // --- Login ---
 
-export async function loginStatus(): Promise<{
+export interface LoginStatus {
   required: boolean;
   authenticated: boolean;
-}> {
+  /** Whether the session currently sits inside the 15-minute step-up
+   *  window. Sensitive routes (terminal attach, cockpit prompt /
+   *  approval / file mutations) only execute while this is true.
+   *  See #1131. */
+  elevated: boolean;
+  /** Seconds remaining on the current elevation window, or null when
+   *  not elevated. */
+  elevated_until_secs: number | null;
+}
+
+export async function loginStatus(): Promise<LoginStatus> {
   return (
-    (await fetchJson<{ required: boolean; authenticated: boolean }>(
-      "/api/login/status",
-    )) ?? { required: false, authenticated: true }
+    (await fetchJson<LoginStatus>("/api/login/status")) ?? {
+      required: false,
+      authenticated: true,
+      elevated: true,
+      elevated_until_secs: null,
+    }
   );
 }
 
@@ -837,11 +979,31 @@ export async function verifyToken(): Promise<boolean> {
 export async function login(
   passphrase: string,
 ): Promise<{ ok: boolean; error?: string }> {
+  let deviceBindingSecret: string;
+  try {
+    // Imported lazily to keep this module's load cost small; the
+    // helper itself is sync. Generates on first call.
+    const { getOrCreateDeviceBindingSecret } = await import(
+      "./deviceBinding"
+    );
+    deviceBindingSecret = getOrCreateDeviceBindingSecret();
+  } catch (err) {
+    return {
+      ok: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : "Could not create device binding for this browser",
+    };
+  }
   try {
     const res = await fetch("/api/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ passphrase }),
+      body: JSON.stringify({
+        passphrase,
+        device_binding_secret: deviceBindingSecret,
+      }),
     });
     if (res.ok) return { ok: true };
     const data = await res.json().catch(() => null);
@@ -854,11 +1016,90 @@ export async function login(
   }
 }
 
+/**
+ * Re-verify the passphrase to open a fresh 15-minute elevation
+ * window. Required before the cockpit/terminal can perform
+ * SSH-equivalent actions when the prior window has lapsed. See
+ * #1131.
+ *
+ * Attaches the device-binding header explicitly rather than relying
+ * on the global fetch interceptor; auth-sensitive endpoints should
+ * not depend on monkey-patching to carry their second factor.
+ */
+export async function elevateLogin(
+  passphrase: string,
+): Promise<{ ok: boolean; error?: string; elevated_until_secs?: number }> {
+  let bindingSecret: string;
+  try {
+    const { getOrCreateDeviceBindingSecret } = await import(
+      "./deviceBinding"
+    );
+    bindingSecret = getOrCreateDeviceBindingSecret();
+  } catch (err) {
+    return {
+      ok: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : "Could not access device binding for this browser",
+    };
+  }
+  try {
+    const res = await fetch("/api/login/elevate", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Aoe-Device-Binding": bindingSecret,
+      },
+      body: JSON.stringify({ passphrase }),
+    });
+    if (res.ok) {
+      const data = (await res.json().catch(() => null)) as {
+        elevated_until_secs?: number;
+      } | null;
+      return {
+        ok: true,
+        elevated_until_secs: data?.elevated_until_secs,
+      };
+    }
+    const data = await res.json().catch(() => null);
+    return {
+      ok: false,
+      error: data?.message ?? `Elevation failed (${res.status})`,
+    };
+  } catch {
+    return { ok: false, error: "Network error" };
+  }
+}
+
 export async function logout(): Promise<void> {
   try {
     await fetch("/api/logout", { method: "POST" });
   } catch {
     // Best effort
+  } finally {
+    // Drop the per-device binding secret so a future login generates
+    // a fresh one alongside the new session cookie. Without this, an
+    // attacker who later obtains a stale localStorage snapshot still
+    // holds a valid binding for the next session created on this
+    // browser. See #1131.
+    try {
+      const { clearDeviceBindingSecret } = await import("./deviceBinding");
+      clearDeviceBindingSecret();
+    } catch {
+      // ignore
+    }
+    // Drop the in-memory approval-sound caches so a future user on the
+    // same tab does not see the previous user's settings snapshot or
+    // hear their cached blob.
+    try {
+      const { clearApprovalSoundCache } = await import(
+        "../hooks/useApprovalSound"
+      );
+      clearApprovalSoundCache();
+    } catch {
+      // ignore
+    }
   }
 }
 
@@ -905,16 +1146,108 @@ export async function setSessionNotifications(
   }
 }
 
+/** Set the per-session diff-base override. Pass `null` to clear the
+ *  override and fall back to the profile default / auto-detection.
+ *  See #970. */
+export async function setSessionDiffBase(
+  id: string,
+  baseBranch: string | null,
+): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/diff-base`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ base_branch: baseBranch }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
+/** Toggle the web-only "pin" marker on a session. Pinned workspaces sink
+ *  to the top of the sidebar in all sort modes (manual and lastActivity).
+ *  Distinct from the TUI favorite signal. See #1581. */
+export async function setSessionPin(
+  id: string,
+  pinned: boolean,
+): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/pin`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pinned }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
+/** Archive or unarchive a session. On archive, the server kills the tmux
+ *  pane (when `killPane` is true or omitted, matching TUI/CLI semantics)
+ *  and shuts down the cockpit worker for cockpit-mode sessions; the
+ *  reconciler will not respawn it because archived sessions are excluded
+ *  from the resume target list. Sending a message via the dashboard
+ *  auto-unarchives via the existing `touch_last_accessed` invariant in
+ *  the send handler. See #1581. */
+export async function setSessionArchive(
+  id: string,
+  archived: boolean,
+  killPane = true,
+): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/archive`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ archived, kill_pane: killPane }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
+/** Snooze or unsnooze a session. Pass `null` to unsnooze, or a positive
+ *  number of minutes between 1 and 43200 (30 days) to snooze. The server
+ *  validates against the shared `validate_snooze_duration` so the bounds
+ *  match the TUI dialog presets and the CLI's `aoe session snooze`. See
+ *  #1581. */
+export async function setSessionSnooze(
+  id: string,
+  minutes: number | null,
+): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/snooze`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ minutes }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
 export interface DeleteSessionOptions {
   delete_worktree?: boolean;
   delete_branch?: boolean;
   delete_sandbox?: boolean;
   force_delete?: boolean;
+  /** For scratch sessions, keep the scratch directory on disk instead of
+   *  removing it. The session record is still deleted. No effect on
+   *  non-scratch sessions. */
+  keep_scratch?: boolean;
 }
 
 export interface DeleteSessionResult {
   ok: boolean;
   error?: string;
+  messages?: string[];
 }
 
 export async function deleteSession(
@@ -934,7 +1267,8 @@ export async function deleteSession(
         error: data.message || `Server error (${res.status})`,
       };
     }
-    return { ok: true };
+    const data = (await res.json().catch(() => ({}))) as { messages?: string[] };
+    return { ok: true, messages: data.messages };
   } catch (e) {
     return {
       ok: false,

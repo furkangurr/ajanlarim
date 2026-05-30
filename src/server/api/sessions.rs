@@ -39,7 +39,46 @@ pub struct SessionResponse {
     /// or those that took the repo's default branch. See #948.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_branch: Option<String>,
+    /// Per-session override for the diff base, set via the web "vs &lt;ref&gt;"
+    /// picker, the TUI diff view's `b` keybind, or
+    /// `aoe session set-base`. Wins over `base_branch`, the profile
+    /// default, and auto-detection. See #970.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_branch_override: Option<String>,
     pub is_sandboxed: bool,
+    /// True when the session was created with `--scratch`; the
+    /// `project_path` points at an auto-provisioned directory under
+    /// `<app_dir>/scratch/<id>/` that the deletion path removes. The web
+    /// wizard filters these out of the Recent-projects list.
+    pub scratch: bool,
+    /// True when the session is marked as a user favorite. Mirrors
+    /// `Instance::is_favorited()`; surfaced so the web sidebar can pin
+    /// favorited rows and render the `*` marker without re-implementing
+    /// the predicate. Cross-feature parity with the TUI's `f`/`F` keybind.
+    pub favorited: bool,
+    /// RFC3339 timestamp at which the session was web-pinned, or omitted
+    /// when not pinned. Distinct from `favorited`: favorite is the TUI
+    /// within-tier attention-sort signal, while pin is the hard
+    /// top-of-sort surfacing primitive used by the web sidebar. The
+    /// client derives a "pinned" boolean as `pinned_at != null`; no
+    /// separate boolean field is exposed (the timestamp itself is the
+    /// source of truth, matching `archived_at` and `snoozed_until`). See
+    /// #1581.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned_at: Option<String>,
+    /// RFC3339 timestamp at which the session was archived, or omitted
+    /// when not archived. The web sidebar sinks archived workspaces into
+    /// the "Snoozed & archived" collapsible section. See #1581.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<String>,
+    /// RFC3339 timestamp at which a snooze expires, or omitted when not
+    /// snoozed. The web sidebar treats a non-null future timestamp the
+    /// same as archived (sinks the workspace) and renders the remaining
+    /// duration. Expired timestamps are stale-but-harmless: the
+    /// `Instance::is_snoozed()` predicate returns false past the deadline,
+    /// and the response simply omits the field. See #1581.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snoozed_until: Option<String>,
     pub has_managed_worktree: bool,
     pub has_terminal: bool,
     pub profile: String,
@@ -178,7 +217,24 @@ impl SessionResponse {
                 .worktree_info
                 .as_ref()
                 .and_then(|w| w.base_branch.clone()),
+            base_branch_override: inst.base_branch_override.clone(),
             is_sandboxed: inst.is_sandboxed(),
+            scratch: inst.scratch,
+            favorited: inst.is_favorited(),
+            pinned_at: inst.pinned_at.map(|t| t.to_rfc3339()),
+            archived_at: inst.archived_at.map(|t| t.to_rfc3339()),
+            // Surface `snoozed_until` only when the snooze is still
+            // active. `is_snoozed()` returns false once the timestamp
+            // has expired, even though the persisted field stays set
+            // until the next mutation rewrites it. Mirroring that
+            // semantics on the wire prevents the web sidebar from
+            // showing a "snoozed 0m" chip on rows that have already
+            // woken on disk.
+            snoozed_until: if inst.is_snoozed() {
+                inst.snoozed_until.map(|t| t.to_rfc3339())
+            } else {
+                None
+            },
             has_managed_worktree: inst
                 .worktree_info
                 .as_ref()
@@ -253,7 +309,18 @@ fn truncate_title(s: &str, max: usize) -> String {
     out
 }
 
-pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<SessionResponse>> {
+// Envelope for `GET /api/sessions`. Wraps the sessions list with the
+// user's persisted workspace ordering so the client can render the
+// sidebar in the requested order on the first paint, with no extra
+// round-trip. The order is a list of workspace ids; ids not present
+// fall back to the client's default newest-first ordering. See #1169.
+#[derive(serde::Serialize)]
+pub struct SessionsEnvelope {
+    pub sessions: Vec<SessionResponse>,
+    pub workspace_ordering: Vec<String>,
+}
+
+pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsEnvelope> {
     let instances = state.instances.read().await;
     let claude_fullscreen = crate::claude_settings::read_tui_fullscreen();
     // Snapshot the supervisor's worker lifecycle map once per request
@@ -379,7 +446,162 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<Sessi
         }
     }
 
-    Json(sessions)
+    let workspace_ordering =
+        merge_workspace_ordering(&sessions, state.read_only).unwrap_or_else(|e| {
+            tracing::error!(target: "http.api.sessions", "Failed to merge workspace ordering: {e}");
+            Vec::new()
+        });
+
+    Json(SessionsEnvelope {
+        sessions,
+        workspace_ordering,
+    })
+}
+
+// Workspace id derivation. Mirrors the client logic in `useWorkspaces.ts`:
+// a session with a branch collapses to `${repoPath}::${branch}`; a
+// branchless session gets its own workspace at `${repoPath}::__session__::${id}`.
+// `repoPath` strips trailing slashes so the server and client compute the
+// same string for the same session row.
+fn workspace_id_for_session(s: &SessionResponse) -> String {
+    let raw = s.main_repo_path.as_deref().unwrap_or(&s.project_path);
+    let repo_path = raw.trim_end_matches('/');
+    match &s.branch {
+        Some(branch) => format!("{repo_path}::{branch}"),
+        None => format!("{repo_path}::__session__::{}", s.id),
+    }
+}
+
+// Prepend any workspace id we haven't seen before to the persisted
+// ordering and return the merged list. Done server-side so concurrent
+// clients (multiple tabs, multiple devices) converge on a single
+// ordering without each racing to PUT their own prepend. In read-only
+// mode we still compute the merge for the response, but we skip the
+// disk write.
+// Pure helper: merges newly observed workspace ids on top of the
+// existing ordering, deduplicating and putting unknowns first
+// (newest-first). Extracted so the merge math can run from both the
+// read-only path (no lock) and the locked closure (where it operates
+// on `ord.order` directly to avoid the read-modify-write race that
+// `merge_workspace_ordering` originally had on a pre-lock snapshot).
+fn compute_merged_ordering(sessions: &[SessionResponse], current_order: &[String]) -> Vec<String> {
+    let known: std::collections::HashSet<&str> = current_order.iter().map(String::as_str).collect();
+    let mut seen_unknown: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut new_ids: Vec<String> = Vec::new();
+    for s in sessions {
+        let id = workspace_id_for_session(s);
+        if known.contains(id.as_str()) {
+            continue;
+        }
+        if seen_unknown.insert(id.clone()) {
+            new_ids.push(id);
+        }
+    }
+    if new_ids.is_empty() {
+        return current_order.to_vec();
+    }
+    new_ids.reverse();
+    new_ids.extend_from_slice(current_order);
+    new_ids
+}
+
+fn merge_workspace_ordering(
+    sessions: &[SessionResponse],
+    read_only: bool,
+) -> anyhow::Result<Vec<String>> {
+    if read_only {
+        let current = crate::session::load_workspace_ordering()
+            .map(|w| w.order)
+            .unwrap_or_default();
+        return Ok(compute_merged_ordering(sessions, &current));
+    }
+    crate::session::update_workspace_ordering(|ord| {
+        let merged = compute_merged_ordering(sessions, &ord.order);
+        ord.order = merged.clone();
+        Ok(merged)
+    })
+}
+
+// --- Workspace ordering ---
+//
+// `PUT /api/workspace-ordering` overwrites the persisted workspace order
+// with a fresh client-supplied list. Workspaces are a client construct
+// (a group of sessions keyed on `repoPath::branch`), so the server
+// treats the entries as opaque strings. New workspaces are folded in
+// server-side by `merge_workspace_ordering` on every `GET /api/sessions`,
+// so the file always covers every observed workspace; this PUT just
+// reorders existing entries. Persisted globally (not per-profile)
+// because the sidebar shows sessions across all profiles. See #1169.
+
+// Caps on the inbound body. The order list is one entry per workspace
+// row and workspaces map 1:1 to sessions in the worst case, so 4096 is
+// comfortably above any realistic ceiling. Per-entry cap covers a
+// long repo path plus a long branch name; ids longer than this can't
+// come from the client's workspace id derivation in any sane setup.
+const MAX_ORDER_ENTRIES: usize = 4096;
+const MAX_ORDER_ENTRY_LEN: usize = 1024;
+
+#[derive(Deserialize)]
+pub struct UpdateWorkspaceOrderingBody {
+    pub order: Vec<String>,
+}
+
+pub async fn update_workspace_ordering(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<UpdateWorkspaceOrderingBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "read_only",
+                "message": "Server is in read-only mode"
+            })),
+        )
+            .into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+
+    if body.order.len() > MAX_ORDER_ENTRIES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "message": format!("order has {} entries, max is {}", body.order.len(), MAX_ORDER_ENTRIES)
+            })),
+        )
+            .into_response();
+    }
+    if let Some(bad) = body.order.iter().find(|e| e.len() > MAX_ORDER_ENTRY_LEN) {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "message": format!("order entry is {} bytes, max is {}", bad.len(), MAX_ORDER_ENTRY_LEN)
+            })),
+        )
+            .into_response();
+    }
+
+    let new_order = body.order;
+    let result = crate::session::update_workspace_ordering(|ord| {
+        ord.order = new_order.clone();
+        Ok(())
+    });
+    if let Err(e) = result {
+        tracing::error!(target: "http.api.sessions", "Failed to persist workspace ordering: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "message": "Failed to persist ordering" })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "order": new_order })),
+    )
+        .into_response()
 }
 
 // --- Rename session ---
@@ -396,20 +618,35 @@ fn apply_session_title_rename(inst: &mut Instance, title: String) {
 pub async fn rename_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(body): Json<RenameSessionBody>,
+    body: Result<Json<RenameSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
     let title = body.title.trim().to_string();
     if title.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "message": "Title cannot be empty" })),
-        );
+        )
+            .into_response();
     }
     if let Err(msg) = validate_no_shell_injection(&title, "title") {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "message": msg })),
-        );
+        )
+            .into_response();
     }
 
     let mut instances = state.instances.write().await;
@@ -417,7 +654,8 @@ pub async fn rename_session(
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "message": "Session not found" })),
-        );
+        )
+            .into_response();
     };
 
     apply_session_title_rename(inst, title.clone());
@@ -425,19 +663,32 @@ pub async fn rename_session(
     let response =
         SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
     let profile = inst.source_profile.clone();
+    drop(instances);
 
     if let Ok(storage) = Storage::new(&profile) {
-        let profile_instances: Vec<_> = instances
-            .iter()
-            .filter(|i| i.source_profile == profile)
-            .cloned()
-            .collect();
-        if let Err(e) = storage.save(&profile_instances) {
-            tracing::error!("Failed to save after rename: {e}");
+        let title_clone = title.clone();
+        let id_clone = id.clone();
+        match tokio::task::spawn_blocking(move || {
+            storage.update(|instances, _groups| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
+                    apply_session_title_rename(inst, title_clone);
+                }
+                Ok(())
+            })
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::error!(target: "http.api.sessions", "Failed to save after rename: {e}")
+            }
+            Err(e) => {
+                tracing::error!(target: "http.api.sessions", "Rename persist join failed: {e}")
+            }
         }
     }
 
-    (StatusCode::OK, Json(serde_json::json!(response)))
+    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
 // --- Update session notification preferences ---
@@ -462,7 +713,7 @@ pub struct UpdateNotificationsBody {
 /// - Unset: leave the current session value untouched.
 /// - Clear: set to None (inherit the server default).
 /// - Set(v): explicit user override.
-#[derive(Default)]
+#[derive(Default, Copy, Clone)]
 pub enum Tristate {
     #[default]
     Unset,
@@ -486,14 +737,28 @@ where
 pub async fn update_session_notifications(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(body): Json<UpdateNotificationsBody>,
+    body: Result<Json<UpdateNotificationsBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
     let mut instances = state.instances.write().await;
     let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "message": "Session not found" })),
-        );
+        )
+            .into_response();
     };
 
     // Apply each field independently. `Unset` leaves the stored value
@@ -513,19 +778,548 @@ pub async fn update_session_notifications(
     let response =
         SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
     let profile = inst.source_profile.clone();
+    drop(instances);
 
     if let Ok(storage) = Storage::new(&profile) {
-        let profile_instances: Vec<_> = instances
-            .iter()
-            .filter(|i| i.source_profile == profile)
-            .cloned()
-            .collect();
-        if let Err(e) = storage.save(&profile_instances) {
-            tracing::error!("Failed to save after notification update: {e}");
+        let id_clone = id.clone();
+        let waiting = body.notify_on_waiting;
+        let idle = body.notify_on_idle;
+        let error = body.notify_on_error;
+        match tokio::task::spawn_blocking(move || {
+            storage.update(|instances, _groups| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
+                    apply(&mut inst.notify_on_waiting, waiting);
+                    apply(&mut inst.notify_on_idle, idle);
+                    apply(&mut inst.notify_on_error, error);
+                }
+                Ok(())
+            })
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!(
+                target: "http.api.sessions",
+                "Failed to save after notification update: {e}"
+            ),
+            Err(e) => tracing::error!(
+                target: "http.api.sessions",
+                "Notification persist join failed: {e}"
+            ),
         }
     }
 
-    (StatusCode::OK, Json(serde_json::json!(response)))
+    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
+// --- Diff base override ---
+//
+// `PATCH /api/sessions/{id}/diff-base` sets / clears the per-session
+// override for the diff base ref. The web `vs <ref>` chip popover, the
+// TUI diff view's `b` keybind, and `aoe session set-base` all funnel
+// through this endpoint so the override is persisted alongside the
+// session record and survives restart. See #970.
+
+#[derive(Deserialize)]
+pub struct UpdateDiffBaseBody {
+    /// New override. `Some(non-empty)` sets the override; `Some("")` or
+    /// `None` clears it (the diff then falls back to the profile default
+    /// and then auto-detection).
+    #[serde(default)]
+    pub base_branch: Option<String>,
+}
+
+pub async fn update_session_diff_base(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateDiffBaseBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "read_only",
+                "message": "Server is in read-only mode"
+            })),
+        )
+            .into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+
+    let mut instances = state.instances.write().await;
+    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "message": "Session not found" })),
+        )
+            .into_response();
+    };
+
+    inst.base_branch_override = body
+        .base_branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+
+    let response =
+        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
+    let profile = inst.source_profile.clone();
+    drop(instances);
+
+    if let Ok(storage) = Storage::new(&profile) {
+        let id_clone = id.clone();
+        let new_override = body
+            .base_branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+        match tokio::task::spawn_blocking(move || {
+            storage.update(|instances, _groups| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
+                    inst.base_branch_override = new_override;
+                }
+                Ok(())
+            })
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!(
+                target: "http.api.sessions",
+                "Failed to save after diff-base update: {e}"
+            ),
+            Err(e) => tracing::error!(
+                target: "http.api.sessions",
+                "Diff-base persist join failed: {e}"
+            ),
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
+// --- Triage: pin / archive / snooze ---
+//
+// Three sibling endpoints surface the existing `Instance::pin`, `archive`,
+// and `snooze` mutators to the web dashboard. They all follow the same
+// shape: read-only 403, in-memory write under `state.instance_lock`,
+// persist via `Storage::update` matching the notifications and diff-base
+// precedent above. Archive additionally tears down the tmux pane and (for
+// cockpit sessions) the supervisor's worker so the row is genuinely
+// parked. Mutual-exclusion invariants (e.g. archive clears pin/favorite,
+// pin clears archive+snooze) live in the `Instance` methods, so the
+// handlers never set fields directly. See #1581.
+
+#[derive(Deserialize)]
+pub struct UpdatePinBody {
+    pub pinned: bool,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateArchiveBody {
+    pub archived: bool,
+    /// When `archived = true`, kill the tmux pane (parity with the TUI's
+    /// `z` keybind and the CLI's `aoe session archive` default). Omitted
+    /// or `true` means kill; `false` keeps the pane alive while still
+    /// marking the session archived. Ignored when `archived = false`.
+    #[serde(default = "default_kill_pane")]
+    pub kill_pane: bool,
+}
+
+fn default_kill_pane() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+pub struct UpdateSnoozeBody {
+    /// `Some(positive minutes)` snoozes for that duration. `None` (or a
+    /// missing field) unsnoozes. Validated against
+    /// `crate::session::validate_snooze_duration` so the same bounds the
+    /// TUI dialog and CLI use also apply here.
+    #[serde(default)]
+    pub minutes: Option<u32>,
+}
+
+pub async fn update_session_pin(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdatePinBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "read_only",
+                "message": "Server is in read-only mode"
+            })),
+        )
+            .into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let mut instances = state.instances.write().await;
+    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "message": "Session not found" })),
+        )
+            .into_response();
+    };
+
+    if body.pinned {
+        inst.pin();
+    } else {
+        inst.unpin();
+    }
+
+    let response =
+        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
+    let profile = inst.source_profile.clone();
+    let pinned = body.pinned;
+    drop(instances);
+
+    if let Ok(storage) = Storage::new(&profile) {
+        let id_clone = id.clone();
+        match tokio::task::spawn_blocking(move || {
+            storage.update(|instances, _groups| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
+                    if pinned {
+                        inst.pin();
+                    } else {
+                        inst.unpin();
+                    }
+                }
+                Ok(())
+            })
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!(
+                target: "http.api.sessions",
+                "Failed to save after pin update: {e}"
+            ),
+            Err(e) => tracing::error!(
+                target: "http.api.sessions",
+                "Pin persist join failed: {e}"
+            ),
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
+pub async fn update_session_archive(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateArchiveBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "read_only",
+                "message": "Server is in read-only mode"
+            })),
+        )
+            .into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    // Snapshot what we need for side effects (kill pane / cockpit
+    // shutdown) before we drop the write lock. Clone the instance once
+    // so we can call its `kill()` method outside the lock without
+    // re-borrowing. The outer tuple also carries `kill_pane` so the
+    // tmux branch below can gate the pane teardown without re-reading
+    // the body; cockpit shutdown is unconditional on archive=true.
+    let (was_cockpit_mode, inst_clone, kill_pane) = {
+        let mut instances = state.instances.write().await;
+        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        if body.archived {
+            inst.archive();
+        } else {
+            inst.unarchive();
+        }
+        let response =
+            SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
+        let cockpit;
+        #[cfg(feature = "serve")]
+        {
+            cockpit = inst.cockpit_mode;
+        }
+        #[cfg(not(feature = "serve"))]
+        {
+            cockpit = false;
+        }
+        let inst_snap = inst.clone();
+        // Persist now while we hold the per-instance lock; the side
+        // effects below are best-effort and should not block other
+        // mutations on this session.
+        let profile = inst.source_profile.clone();
+        let archived = body.archived;
+        drop(instances);
+
+        if let Ok(storage) = Storage::new(&profile) {
+            let id_clone = id.clone();
+            match tokio::task::spawn_blocking(move || {
+                storage.update(|instances, _groups| {
+                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
+                        if archived {
+                            inst.archive();
+                        } else {
+                            inst.unarchive();
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::error!(
+                    target: "http.api.sessions",
+                    "Failed to save after archive update: {e}"
+                ),
+                Err(e) => tracing::error!(
+                    target: "http.api.sessions",
+                    "Archive persist join failed: {e}"
+                ),
+            }
+        }
+
+        // Stash the cockpit flag + clone + response and break out to do
+        // the side effects below. Return early on the non-archive path
+        // because we have no work left to do; the kill_pane=false case
+        // is NOT a short-circuit because cockpit shutdown still has to
+        // run for cockpit-mode sessions (kill_pane is a tmux-only
+        // switch, per the request-body documentation).
+        if !body.archived {
+            return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
+        }
+        (cockpit, inst_snap, body.kill_pane)
+    };
+
+    // Best-effort tmux pane teardown for tmux-backed sessions. Mirrors
+    // `toggle_archive_at_cursor` in src/tui/home/operations.rs: if the
+    // kill fails (pane already dead, tmux gone), log and continue
+    // because the on-disk archived flag is the source of truth. The
+    // kill_pane=false body opt-out applies only here, so a caller can
+    // archive a tmux session without killing its pane while still
+    // unconditionally stopping a cockpit worker on the other branch.
+    if !was_cockpit_mode {
+        if kill_pane {
+            let inst_for_kill = inst_clone.clone();
+            match tokio::task::spawn_blocking(move || inst_for_kill.kill()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    target: "http.api.sessions",
+                    "Archive: tmux kill failed: {e}"
+                ),
+                Err(e) => tracing::warn!(
+                    target: "http.api.sessions",
+                    "Archive: tmux kill join failed: {e}"
+                ),
+            }
+        }
+    } else {
+        // Cockpit sessions: shut down the worker so the supervisor's
+        // reconciler does not race to respawn it. The reconciler also
+        // skips archived sessions (see cockpit_reconciler.rs), but
+        // shutting down here gives an immediate teardown rather than
+        // waiting for the next poll tick.
+        #[cfg(feature = "serve")]
+        match state.cockpit_supervisor.shutdown(&id).await {
+            Ok(()) | Err(crate::cockpit::supervisor::SupervisorError::UnknownSession(_)) => {}
+            Err(e) => tracing::warn!(
+                target: "cockpit.supervisor",
+                session = %id,
+                "shutdown during archive failed: {e}"
+            ),
+        }
+    }
+
+    // Re-read the in-memory instance so the response reflects the
+    // archived flag (the side effects above did not mutate it, but
+    // re-reading also picks up any peer write that landed during the
+    // unlock window).
+    let instances = state.instances.read().await;
+    let response = match instances.iter().find(|i| i.id == id) {
+        Some(inst) => {
+            SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
+        }
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        }
+    };
+    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
+pub async fn update_session_snooze(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateSnoozeBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "read_only",
+                "message": "Server is in read-only mode"
+            })),
+        )
+            .into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+
+    // Validate the duration up front. The TUI dialog presets, CLI, and
+    // this endpoint all share the same bounds (1..=43200 minutes); see
+    // `crate::session::config::validate_snooze_duration`.
+    if let Some(minutes) = body.minutes {
+        if let Err(msg) = crate::session::validate_snooze_duration(minutes as u64) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "validation_failed",
+                    "message": msg,
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let was_cockpit_mode = {
+        let mut instances = state.instances.write().await;
+        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+
+        match body.minutes {
+            Some(minutes) => inst.snooze(minutes),
+            None => inst.unsnooze(),
+        }
+
+        let cockpit;
+        #[cfg(feature = "serve")]
+        {
+            cockpit = inst.cockpit_mode;
+        }
+        #[cfg(not(feature = "serve"))]
+        {
+            cockpit = false;
+        }
+        cockpit
+    };
+
+    let profile = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .find(|i| i.id == id)
+            .map(|i| i.source_profile.clone())
+            .unwrap_or_default()
+    };
+    let minutes = body.minutes;
+
+    if let Ok(storage) = Storage::new(&profile) {
+        let id_clone = id.clone();
+        match tokio::task::spawn_blocking(move || {
+            storage.update(|instances, _groups| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
+                    match minutes {
+                        Some(m) => inst.snooze(m),
+                        None => inst.unsnooze(),
+                    }
+                }
+                Ok(())
+            })
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::error!(
+                target: "http.api.sessions",
+                "Failed to save after snooze update: {e}"
+            ),
+            Err(e) => tracing::error!(
+                target: "http.api.sessions",
+                "Snooze persist join failed: {e}"
+            ),
+        }
+    }
+
+    // For cockpit-mode sessions, snoozing tears down the worker the
+    // same way archive does. Snooze is a "temporary archive" in the
+    // data model and the cockpit worker (claude-agent-acp subprocess)
+    // is heavy enough that keeping it idle while the row is sunk is a
+    // resource hog. The reconciler skips snoozed sessions, so the
+    // worker stays down until the snooze expires; the next reconciler
+    // tick after expiry brings it back. Unsnooze just lets the
+    // reconciler re-pick the session naturally, no explicit respawn.
+    #[cfg(feature = "serve")]
+    if was_cockpit_mode && minutes.is_some() {
+        match state.cockpit_supervisor.shutdown(&id).await {
+            Ok(()) | Err(crate::cockpit::supervisor::SupervisorError::UnknownSession(_)) => {}
+            Err(e) => tracing::warn!(
+                target: "cockpit.supervisor",
+                session = %id,
+                "shutdown during snooze failed: {e}"
+            ),
+        }
+    }
+    #[cfg(not(feature = "serve"))]
+    let _ = was_cockpit_mode;
+
+    let instances = state.instances.read().await;
+    let response = match instances.iter().find(|i| i.id == id) {
+        Some(inst) => {
+            SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
+        }
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        }
+    };
+    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
 // --- Delete session ---
@@ -540,6 +1334,11 @@ pub struct DeleteSessionBody {
     pub delete_sandbox: bool,
     #[serde(default)]
     pub force_delete: bool,
+    /// For scratch sessions, keep the scratch directory on disk instead of
+    /// removing it. The session record is still deleted. No effect on
+    /// non-scratch sessions.
+    #[serde(default)]
+    pub keep_scratch: bool,
 }
 
 pub async fn delete_session(
@@ -623,38 +1422,98 @@ pub async fn delete_session(
             delete_branch: body.delete_branch,
             delete_sandbox: body.delete_sandbox,
             force_delete: body.force_delete,
+            detach_hooks: true,
+            keep_scratch: body.keep_scratch,
         })
     })
     .await;
 
     match deletion_result {
         Ok(result) if result.success => {
-            // Remove from in-memory state and persist
-            let mut instances = state.instances.write().await;
-            instances.retain(|i| i.id != id);
-
-            if let Ok(storage) = Storage::new(&profile) {
-                let profile_instances: Vec<_> = instances
-                    .iter()
-                    .filter(|i| i.source_profile == profile)
-                    .cloned()
-                    .collect();
-                if let Err(e) = storage.save(&profile_instances) {
-                    tracing::error!("Failed to save after deletion: {e}");
+            // `perform_deletion` may have produced user-facing messages
+            // (e.g. "Scratch directory kept at: <path>" when
+            // `--keep-scratch` is set). Capture them now so the
+            // success branch can echo them back; the result moves into
+            // the spawn_blocking below.
+            let messages = result.messages.clone();
+            // Disk first: if persistence fails, the in-memory state is left
+            // intact and we return 500. Otherwise the status poll loop
+            // would silently re-add the entry from disk on the next tick
+            // and the user would see "deleted" then the session
+            // reappearing seconds later.
+            let storage = match Storage::new(&profile) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(target: "http.api.sessions",
+                        "Storage::new failed after deletion: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": "persist_failed",
+                            "message": format!(
+                                "Session was torn down but storage init failed: {e}"
+                            ),
+                        })),
+                    );
+                }
+            };
+            let id_for_save = id.clone();
+            let persist_result = tokio::task::spawn_blocking(move || {
+                storage.update(|instances, _groups| {
+                    instances.retain(|i| i.id != id_for_save);
+                    Ok(())
+                })
+            })
+            .await;
+            match persist_result {
+                Ok(Ok(())) => {
+                    {
+                        let mut instances = state.instances.write().await;
+                        instances.retain(|i| i.id != id);
+                    }
+                    state.instance_locks.write().await.remove(&id);
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "status": "deleted",
+                            "messages": messages,
+                        })),
+                    )
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(target: "http.api.sessions",
+                        "Failed to save after deletion: {e}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": "persist_failed",
+                            "message": format!(
+                                "Session deletion completed on disk, but \
+                                 sessions.json could not be updated: {e}"
+                            ),
+                        })),
+                    )
+                }
+                Err(join_err) => {
+                    tracing::error!(target: "http.api.sessions",
+                        "Persist task panicked: {join_err}");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": "persist_failed",
+                            "message": "Persist task panicked",
+                        })),
+                    )
                 }
             }
-
-            // Clean up per-instance lock entry
-            state.instance_locks.write().await.remove(&id);
-
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "status": "deleted" })),
-            )
         }
         Ok(result) => {
             // Deletion had errors; set status to Error
-            let error_msg = result.error.unwrap_or_else(|| "Unknown error".to_string());
+            let error_msg = if result.errors.is_empty() {
+                "Unknown error".to_string()
+            } else {
+                result.errors.join("; ")
+            };
             {
                 let mut instances = state.instances.write().await;
                 if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
@@ -731,11 +1590,42 @@ pub struct CreateSessionBody {
     #[cfg(feature = "serve")]
     #[serde(default)]
     pub cockpit_model: Option<String>,
+    /// Scratch session: server provisions a fresh directory under
+    /// `<app_dir>/scratch/<id>/` and ignores `path`. Mutually exclusive with
+    /// `worktree_branch` and `extra_repo_paths`; the handler returns 400
+    /// on either combination.
+    #[serde(default)]
+    pub scratch: bool,
+}
+
+fn validate_session_tool_identity(
+    tool: &str,
+    profile: &str,
+    project_path: &std::path::Path,
+) -> bool {
+    if crate::agents::get_agent(tool).is_some() {
+        return true;
+    }
+
+    match crate::session::repo_config::resolve_config_with_repo(profile, project_path) {
+        Ok(config) => config
+            .session
+            .custom_agents
+            .get(tool)
+            .is_some_and(|command| !command.trim().is_empty()),
+        Err(e) => {
+            tracing::warn!(
+                "Failed to resolve config while validating session tool '{}': {e}",
+                tool
+            );
+            false
+        }
+    }
 }
 
 pub async fn create_session(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<CreateSessionBody>,
+    body: Result<Json<CreateSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return (
@@ -746,14 +1636,62 @@ pub async fn create_session(
         )
             .into_response();
     }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
 
-    // Validate user inputs for shell injection
-    for (value, name) in [
+    // Scratch sessions are server-provisioned; the worktree path is the
+    // wrong model for them. Reject the combination before reaching the
+    // builder so misbehaving clients get a clear 400 instead of a
+    // less-specific builder bail surfaced as 500.
+    if body.scratch && body.worktree_branch.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "validation_failed",
+                "message": "Cannot combine scratch with worktree_branch"
+            })),
+        )
+            .into_response();
+    }
+    if body.scratch && !body.extra_repo_paths.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "validation_failed",
+                "message": "Cannot combine scratch with extra_repo_paths"
+            })),
+        )
+            .into_response();
+    }
+    // The builder ignores `path` in scratch mode (provisions its own
+    // directory), but accepting both silently is a surprising contract
+    // for API callers and can make repo-aware tool validation consult
+    // config from a repo the session will never use. Fail loudly.
+    if body.scratch && !body.path.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "validation_failed",
+                "message": "Cannot combine scratch with path"
+            })),
+        )
+            .into_response();
+    }
+
+    // Validate user inputs for shell injection. For scratch sessions the
+    // `path` field is server-provisioned (and clients typically send an
+    // empty string), so skip the path entry in that case.
+    let mut shell_checks: Vec<(&str, &str)> = vec![
         (body.extra_args.as_str(), "extra_args"),
         (body.tool.as_str(), "tool"),
         (body.group.as_str(), "group"),
-        (body.path.as_str(), "path"),
-    ] {
+    ];
+    if !body.scratch {
+        shell_checks.push((body.path.as_str(), "path"));
+    }
+    for (value, name) in shell_checks {
         if let Err(msg) = validate_no_shell_injection(value, name) {
             return (
                 StatusCode::BAD_REQUEST,
@@ -788,20 +1726,53 @@ pub async fn create_session(
             )
                 .into_response();
         }
-        // Verify the profile exists ("default" is always valid even without a dir)
-        if profile_name != "default" {
-            let known = crate::session::list_profiles().unwrap_or_default();
-            if !known.contains(profile_name) {
+        // Verify the profile exists. Every profile is a real directory under
+        // profiles/; there is no implicitly-valid profile name. Distinguish
+        // an enumeration failure (I/O, permissions) from a missing profile
+        // so the client doesn't see a 400 when the real problem is server-side.
+        let known = match crate::session::list_profiles() {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::error!(
+                    target: "server.sessions",
+                    "failed to enumerate profiles while validating create_session: {e:#}"
+                );
                 return (
-                    StatusCode::BAD_REQUEST,
+                    StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
-                        "error": "profile_not_found",
-                        "message": format!("Profile '{}' does not exist", profile_name)
+                        "error": "internal_error",
+                        "message": format!("Failed to enumerate profiles: {e}"),
                     })),
                 )
                     .into_response();
             }
+        };
+        if !known.contains(profile_name) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "profile_not_found",
+                    "message": format!("Profile '{}' does not exist", profile_name)
+                })),
+            )
+                .into_response();
         }
+    }
+
+    let validation_profile = body.profile.as_deref().unwrap_or(&state.profile);
+    if !validate_session_tool_identity(
+        &body.tool,
+        validation_profile,
+        std::path::Path::new(&body.path),
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "validation_failed",
+                "message": format!("Unknown agent '{}'", body.tool),
+            })),
+        )
+            .into_response();
     }
 
     let profile = body.profile.unwrap_or_else(|| state.profile.clone());
@@ -882,6 +1853,7 @@ pub async fn create_session(
             extra_args: body.extra_args,
             command_override: body.command_override,
             extra_repo_paths,
+            scratch: body.scratch,
         };
 
         let build_result = builder::build_instance(params, &title_refs, &branch_refs, &profile)?;
@@ -906,22 +1878,54 @@ pub async fn create_session(
             instance.cockpit_model = body.cockpit_model;
         }
 
-        // Save to disk
-        let storage = Storage::new(&profile)?;
-        let mut all = storage.load().unwrap_or_default();
-        all.push(instance.clone());
-        storage.save(&all)?;
+        // Anything that fails between here and the final `Ok(..)`
+        // would otherwise orphan the scratch directory `build_instance`
+        // already provisioned (Storage::new, storage.update,
+        // instance.start). Wrap the tail in an IIFE-equivalent closure
+        // so we can run cleanup on Err once, regardless of which step
+        // tripped. Matches the CLI cleanup path in
+        // `cleanup_partial_session(... scratch_dir: Some(...))`.
+        let mut persist_and_start = || -> anyhow::Result<()> {
+            let storage = Storage::new(&profile)?;
+            let to_persist = instance.clone();
+            storage.update(|all, _groups| {
+                all.push(to_persist);
+                Ok(())
+            })?;
 
-        // Cockpit-mode sessions are not backed by tmux; the cockpit
-        // supervisor spawns the ACP agent on demand. Skip the tmux
-        // `start()` to avoid creating an empty pane that no one will
-        // attach to.
-        #[cfg(feature = "serve")]
-        let skip_tmux_start = instance.cockpit_mode;
-        #[cfg(not(feature = "serve"))]
-        let skip_tmux_start = false;
-        if !skip_tmux_start {
-            instance.start()?;
+            // Cockpit-mode sessions are not backed by tmux; the cockpit
+            // supervisor spawns the ACP agent on demand. Skip the tmux
+            // `start()` to avoid creating an empty pane that no one will
+            // attach to.
+            #[cfg(feature = "serve")]
+            let skip_tmux_start = instance.cockpit_mode;
+            #[cfg(not(feature = "serve"))]
+            let skip_tmux_start = false;
+            if !skip_tmux_start {
+                instance.start()?;
+            }
+            Ok(())
+        };
+
+        if let Err(e) = persist_and_start() {
+            // Guarded the same way as the deletion path: only remove a
+            // path that `is_scratch_path` blesses, so a corrupted
+            // `project_path` cannot trick us into wiping unrelated
+            // state.
+            if instance.scratch {
+                let scratch_path = std::path::PathBuf::from(&instance.project_path);
+                if crate::session::scratch::is_scratch_path(&scratch_path) {
+                    if let Err(rm_err) = std::fs::remove_dir_all(&scratch_path) {
+                        tracing::warn!(
+                            target: "http.api.sessions",
+                            "Failed to clean up orphan scratch dir {} after create failure: {}",
+                            scratch_path.display(),
+                            rm_err
+                        );
+                    }
+                }
+            }
+            return Err(e);
         }
 
         Ok::<(Instance, Vec<String>), anyhow::Error>((instance, build_warnings))
@@ -944,6 +1948,8 @@ pub async fn create_session(
                     instance.cockpit_model.clone(),
                     instance.project_path.clone(),
                     instance.cockpit_acp_session_id.clone(),
+                    instance.source_profile.clone(),
+                    instance.yolo_mode,
                 ))
             } else {
                 None
@@ -953,8 +1959,16 @@ pub async fn create_session(
             drop(instances);
 
             #[cfg(feature = "serve")]
-            if let Some((id, tool, agent_override, model, project_path, stored_acp_session_id)) =
-                cockpit_spawn_target
+            if let Some((
+                id,
+                tool,
+                agent_override,
+                model,
+                project_path,
+                stored_acp_session_id,
+                source_profile,
+                yolo_mode,
+            )) = cockpit_spawn_target
             {
                 let agent = state
                     .cockpit_supervisor
@@ -964,6 +1978,34 @@ pub async fn create_session(
                 let supervisor = state.cockpit_supervisor.clone();
                 let state_for_check = state.clone();
                 tokio::spawn(async move {
+                    // Initial session creation: run on_launch hooks
+                    // once here so cockpit-mode parity with the tmux
+                    // path is preserved (tmux fires on_launch from
+                    // `instance.start()` at creation, then never
+                    // again).
+                    let inst_lock = state_for_check.instance_lock(&id).await;
+                    let sandbox_info = match crate::cockpit::sandbox::ensure_container_for_session(
+                        &state_for_check.instances,
+                        &inst_lock,
+                        &id,
+                        true,
+                    )
+                    .await
+                    {
+                        Ok(info) => info,
+                        Err(e) => {
+                            let message = format!("sandbox container ensure failed: {e}");
+                            tracing::warn!(
+                                target: "cockpit.supervisor",
+                                session = %id,
+                                "auto-spawn after create failed: {message}"
+                            );
+                            supervisor.publish_startup_error(&id, message);
+                            return;
+                        }
+                    };
+                    let source_profile_for_spawn =
+                        sandbox_info.as_ref().map(|_| source_profile.clone());
                     if let Err(e) = supervisor
                         .spawn(crate::cockpit::supervisor::SpawnRequest {
                             session_id: id.clone(),
@@ -973,6 +2015,9 @@ pub async fn create_session(
                             provider_env: vec![],
                             model,
                             stored_acp_session_id,
+                            sandbox_info,
+                            source_profile: source_profile_for_spawn,
+                            yolo_mode,
                         })
                         .await
                     {
@@ -1009,7 +2054,7 @@ pub async fn create_session(
             (StatusCode::CREATED, Json(resp)).into_response()
         }
         Ok(Err(e)) => {
-            tracing::warn!("Session creation failed: {}", e);
+            tracing::warn!(target: "http.api.sessions", "Session creation failed: {}", e);
             (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": "create_failed", "message": "Failed to create session"})),
@@ -1017,7 +2062,7 @@ pub async fn create_session(
                 .into_response()
         }
         Err(e) => {
-            tracing::error!("Session creation panicked: {}", e);
+            tracing::error!(target: "http.api.sessions", "Session creation panicked: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
@@ -1044,6 +2089,24 @@ fn apply_post_restart_sync(live: &mut Instance, started: &Instance) {
     live.last_error = None;
     live.agent_session_id = started.agent_session_id.clone();
     live.last_start_time = started.last_start_time;
+    live.retroactive_capture_excludes = started.retroactive_capture_excludes.clone();
+}
+
+/// Narrow sibling of [`apply_post_restart_sync`] that propagates only the
+/// fields the resume-fallback cascade is responsible for: the post-cascade
+/// `agent_session_id` (either `None` after a bailed Tier-1 cleanup, or a
+/// fresh UUID acquired by Tier-2's `start_with_size_opts` ->
+/// `acquire_session_id`) and the updated `retroactive_capture_excludes`.
+///
+/// Intended for error paths where the cascade may have run but the caller
+/// does not want to touch user-visible status fields. `NotRunning` is the
+/// canonical use case: a recoverable transient state where overwriting
+/// `live.status` with `started.status` (typically `Starting` from the
+/// post-cascade `finalize_launch`) would briefly mis-paint a broken pane
+/// as `Starting` until the 2s status poll loop reconciles.
+fn apply_cascade_state_sync(live: &mut Instance, started: &Instance) {
+    live.agent_session_id = started.agent_session_id.clone();
+    live.retroactive_capture_excludes = started.retroactive_capture_excludes.clone();
 }
 
 /// Ensure the main agent tmux session is alive, restarting it if dead.
@@ -1059,6 +2122,20 @@ fn apply_post_restart_sync(live: &mut Instance, started: &Instance) {
 ///
 /// Read-only: in read-only mode, the endpoint may report `alive` but will
 /// refuse to kill+restart a session. Returns 403 when a restart is needed.
+///
+/// Latency: bounded by `RESUME_PROBE_MAX` (~3s) per probe.
+///   * No-op (pane alive): inspect-only, ~tmux RTT.
+///   * Healthy resume: Tier-1 probe only, returns after the
+///     `RESUME_PROBE_POST_SHELL_GRACE` (~2s) shortcut. Shell-wrapper
+///     overrides charitably burn the full ~3s instead (see
+///     `Instance::probe_settle`).
+///   * Cascade fires (Tier-1 detects a dead pane): Tier-1 returns Dead
+///     fast (`pane_dead`/`!exists` is unambiguous), then `kill_clean`
+///     (~100ms macOS grace) + Tier-2 tmux spawn + up to another
+///     `RESUME_PROBE_MAX`.
+///
+/// HTTP clients should budget ~6-7s worst-case for the full Tier-1 +
+/// Tier-2 cascade and configure timeouts accordingly.
 pub async fn ensure_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1101,7 +2178,7 @@ pub async fn ensure_session(
         } else {
             !decision_instance.expects_shell() && tmux_session.is_pane_running_shell()
         };
-        tracing::debug!(
+        tracing::debug!(target: "http.api.sessions",
             session_id = id_for_log,
             exists,
             pane_dead,
@@ -1115,7 +2192,7 @@ pub async fn ensure_session(
     let needs_restart = match decision {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
-            tracing::error!("ensure_session: failed to inspect tmux for {id}: {e}");
+            tracing::error!(target: "http.api.sessions", "ensure_session: failed to inspect tmux for {id}: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal"})),
@@ -1123,7 +2200,7 @@ pub async fn ensure_session(
                 .into_response();
         }
         Err(e) => {
-            tracing::error!("ensure_session inspect panicked for {id}: {e}");
+            tracing::error!(target: "http.api.sessions", "ensure_session inspect panicked for {id}: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal"})),
@@ -1158,34 +2235,59 @@ pub async fn ensure_session(
         }
     }
 
-    let restart_result = tokio::task::spawn_blocking(move || -> anyhow::Result<Instance> {
-        let tmux_session = instance.tmux_session()?;
-        if tmux_session.exists() {
-            let _ = tmux_session.kill();
-        }
-        let mut inst = instance;
-        inst.start_with_size_opts(None, false)?;
-        Ok(inst)
-    })
+    let restart_result = tokio::task::spawn_blocking(
+        move || -> Result<(Instance, crate::session::StartOutcome), Box<(Instance, anyhow::Error)>> {
+            let mut inst = instance;
+            // Use kill_clean (vs bare tmux kill) so a remain-on-exit dead
+            // pane is respawned-then-killed; bare kill races against the
+            // session cache on macOS and can leave the corpse pane behind,
+            // which then trips the next start_with_resume_fallback's
+            // `pane_was_preexisting` short-circuit. See `Instance::kill_clean`.
+            if let Err(e) = inst.kill_clean() {
+                return Err(Box::new((inst, e)));
+            }
+            // Surface the moved Instance on the Err arm so the caller can
+            // sync the cascade-cleared `agent_session_id` and updated
+            // `retroactive_capture_excludes` back to live state. Otherwise
+            // the live entry retains the stale sid in memory while disk has
+            // already been cleared, and subsequent calls within the
+            // `status_poll_loop` reload window (~2s) keep re-attempting
+            // resume with the bad sid. See `apply_post_restart_sync`.
+            match inst.start_with_resume_fallback(None, false) {
+                Ok(outcome) => Ok((inst, outcome)),
+                Err(e) => Err(Box::new((inst, e))),
+            }
+        },
+    )
     .await;
 
     match restart_result {
-        Ok(Ok(started)) => {
+        Ok(Ok((started, outcome))) => {
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
                 apply_post_restart_sync(inst, &started);
             }
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"status": "restarted"})),
-            )
-                .into_response()
+            let resume_outcome = match &outcome {
+                crate::session::StartOutcome::Resumed => "resumed",
+                crate::session::StartOutcome::Restarted { .. } => "restarted",
+                crate::session::StartOutcome::Fresh => "fresh",
+            };
+            let mut body = serde_json::json!({
+                "status": "restarted",
+                "resume_outcome": resume_outcome,
+            });
+            if let crate::session::StartOutcome::Restarted { stale_sid } = &outcome {
+                body["stale_session_id"] = serde_json::Value::String(stale_sid.clone());
+            }
+            (StatusCode::OK, Json(body)).into_response()
         }
-        Ok(Err(e)) => {
+        Ok(Err(boxed)) => {
+            let (started, e) = *boxed;
             let msg = e.to_string();
-            tracing::warn!("ensure_session restart failed for {id}: {msg}");
+            tracing::warn!(target: "http.api.sessions", "ensure_session restart failed for {id}: {msg}");
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                apply_post_restart_sync(inst, &started);
                 inst.status = crate::session::Status::Error;
                 inst.last_error = Some(msg.clone());
             }
@@ -1199,7 +2301,7 @@ pub async fn ensure_session(
                 .into_response()
         }
         Err(e) => {
-            tracing::error!("ensure_session panicked for {id}: {e}");
+            tracing::error!(target: "http.api.sessions", "ensure_session panicked for {id}: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal"})),
@@ -1215,6 +2317,15 @@ pub async fn ensure_terminal(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
     let instances = state.instances.read().await;
     let inst = match instances.iter().find(|i| i.id == id) {
         Some(i) => i.clone(),
@@ -1289,7 +2400,7 @@ pub async fn ensure_terminal(
                 .into_response()
         }
         Ok(Err(e)) => {
-            tracing::error!("Terminal creation failed: {}", e);
+            tracing::error!(target: "http.api.sessions", "Terminal creation failed: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "create_failed", "message": "Failed to create terminal"})),
@@ -1297,7 +2408,7 @@ pub async fn ensure_terminal(
                 .into_response()
         }
         Err(e) => {
-            tracing::error!("Terminal creation panicked: {}", e);
+            tracing::error!(target: "http.api.sessions", "Terminal creation panicked: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
@@ -1311,6 +2422,15 @@ pub async fn ensure_container_terminal(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
     let instances = state.instances.read().await;
     let inst = match instances.iter().find(|i| i.id == id) {
         Some(i) => i.clone(),
@@ -1370,7 +2490,7 @@ pub async fn ensure_container_terminal(
         )
             .into_response(),
         Ok(Err(e)) => {
-            tracing::error!("Container terminal creation failed: {}", e);
+            tracing::error!(target: "http.api.sessions", "Container terminal creation failed: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "create_failed", "message": "Failed to create container terminal"})),
@@ -1378,7 +2498,7 @@ pub async fn ensure_container_terminal(
                 .into_response()
         }
         Err(e) => {
-            tracing::error!("Container terminal creation panicked: {}", e);
+            tracing::error!(target: "http.api.sessions", "Container terminal creation panicked: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
@@ -1528,6 +2648,15 @@ struct DiffRepo {
     path: String,
 }
 
+struct DiffContext {
+    repos: Vec<DiffRepo>,
+    /// Per-session override for the diff base (set via
+    /// `PATCH /api/sessions/{id}/diff-base`, the `aoe session set-base`
+    /// CLI, or the TUI diff view's `b` keybind). Wins over the
+    /// profile-level default and the auto-detected ref. See #970.
+    base_branch_override: Option<String>,
+}
+
 /// Expand a session into the list of repos whose diffs the sidebar
 /// cares about. Workspace sessions iterate `workspace_info.repos`
 /// (each `worktree_path` becomes one entry); single-repo sessions
@@ -1536,7 +2665,7 @@ struct DiffRepo {
 async fn resolve_diff_repos(
     state: &AppState,
     id: &str,
-) -> Result<Vec<DiffRepo>, axum::response::Response> {
+) -> Result<DiffContext, axum::response::Response> {
     let instances = state.instances.read().await;
     let inst = instances.iter().find(|i| i.id == id).ok_or_else(|| {
         (
@@ -1545,43 +2674,70 @@ async fn resolve_diff_repos(
         )
             .into_response()
     })?;
-    if let Some(ws) = inst.workspace_info.as_ref() {
-        let repos = ws
-            .repos
+    let repos = if let Some(ws) = inst.workspace_info.as_ref() {
+        ws.repos
             .iter()
             .map(|r| DiffRepo {
                 name: Some(r.name.clone()),
                 path: r.worktree_path.clone(),
             })
-            .collect();
-        Ok(repos)
+            .collect()
     } else {
-        Ok(vec![DiffRepo {
+        vec![DiffRepo {
             name: None,
             path: inst.project_path.clone(),
-        }])
+        }]
+    };
+    Ok(DiffContext {
+        repos,
+        base_branch_override: inst.base_branch_override.clone(),
+    })
+}
+
+/// Resolve the diff base for one repo path. Override (per-session)
+/// wins over the profile's `DiffConfig.default_branch`, which wins
+/// over auto-detection (`get_default_base_ref`). See #970.
+fn resolve_diff_base(
+    override_value: Option<&str>,
+    config_default: Option<&str>,
+    repo_path: &std::path::Path,
+) -> String {
+    if let Some(v) = override_value.map(str::trim).filter(|v| !v.is_empty()) {
+        return v.to_string();
     }
+    if let Some(v) = config_default.map(str::trim).filter(|v| !v.is_empty()) {
+        return v.to_string();
+    }
+    crate::git::diff::get_default_base_ref(repo_path).unwrap_or_else(|_| "main".to_string())
 }
 
 pub async fn session_diff_files(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let repos = match resolve_diff_repos(&state, &id).await {
-        Ok(r) => r,
+    let ctx = match resolve_diff_repos(&state, &id).await {
+        Ok(c) => c,
         Err(resp) => return resp,
     };
 
     let result = tokio::task::spawn_blocking(move || {
         use crate::git::diff;
 
+        let config_default = crate::session::Config::load_or_warn()
+            .diff
+            .default_branch
+            .clone();
         let mut all_files: Vec<RichDiffFileInfo> = Vec::new();
         let mut per_repo_bases: Vec<RepoBase> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
 
-        for repo in &repos {
+        for repo in &ctx.repos {
             let path = std::path::Path::new(&repo.path);
-            let base_branch = diff::get_default_branch(path).unwrap_or_else(|_| "main".to_string());
+            let base_branch = resolve_diff_base(
+                ctx.base_branch_override.as_deref(),
+                config_default.as_deref(),
+                path,
+            );
             let warning = diff::check_merge_base_status(path, &base_branch);
             let changed = diff::compute_changed_files(path, &base_branch).unwrap_or_default();
 
@@ -1626,7 +2782,7 @@ pub async fn session_diff_files(
         )
             .into_response(),
         Err(e) => {
-            tracing::error!("Diff files panicked: {}", e);
+            tracing::error!(target: "http.api.sessions", "Diff files panicked: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
@@ -1659,8 +2815,8 @@ pub async fn session_diff_file(
     Path(id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<FileDiffQuery>,
 ) -> impl IntoResponse {
-    let repos = match resolve_diff_repos(&state, &id).await {
-        Ok(r) => r,
+    let ctx = match resolve_diff_repos(&state, &id).await {
+        Ok(c) => c,
         Err(resp) => return resp,
     };
 
@@ -1670,27 +2826,28 @@ pub async fn session_diff_file(
     // session's primary repo). When the named repo doesn't exist, the
     // request is rejected so a stale link doesn't quietly diff the
     // wrong repo. See #1047.
-    let selected_repo = match query.repo.as_deref() {
-        Some(name) => match repos.iter().find(|r| r.name.as_deref() == Some(name)) {
-            Some(r) => r.clone(),
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": "bad_request",
-                        "message": "unknown workspace repo"
-                    })),
-                )
-                    .into_response();
-            }
-        },
-        None => repos
-            .first()
-            .cloned()
-            .expect("resolve_diff_repos always returns at least one entry (single-repo fallback)"),
-    };
+    let selected_repo =
+        match query.repo.as_deref() {
+            Some(name) => match ctx.repos.iter().find(|r| r.name.as_deref() == Some(name)) {
+                Some(r) => r.clone(),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "bad_request",
+                            "message": "unknown workspace repo"
+                        })),
+                    )
+                        .into_response();
+                }
+            },
+            None => ctx.repos.first().cloned().expect(
+                "resolve_diff_repos always returns at least one entry (single-repo fallback)",
+            ),
+        };
     let project_path = selected_repo.path;
     let selected_repo_name = selected_repo.name;
+    let base_branch_override = ctx.base_branch_override.clone();
 
     let result =
         tokio::task::spawn_blocking(move || -> Result<RichFileDiffResponse, DiffFileError> {
@@ -1700,8 +2857,15 @@ pub async fn session_diff_file(
             let repo_path = std::path::Path::new(&project_path);
             let file_path = std::path::Path::new(&query.path);
 
-            let base_branch =
-                diff::get_default_branch(repo_path).unwrap_or_else(|_| "main".to_string());
+            let config_default = crate::session::Config::load_or_warn()
+                .diff
+                .default_branch
+                .clone();
+            let base_branch = resolve_diff_base(
+                base_branch_override.as_deref(),
+                config_default.as_deref(),
+                repo_path,
+            );
 
             // Validate the requested path against the set of actually-changed files.
             // This is the primary security boundary: only files modified on this
@@ -1803,7 +2967,7 @@ pub async fn session_diff_file(
         )
             .into_response(),
         Ok(Err(DiffFileError::Internal(e))) => {
-            tracing::error!("File diff failed: {}", e);
+            tracing::error!(target: "http.api.sessions", "File diff failed: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "diff_failed", "message": "Failed to compute file diff"})),
@@ -1811,7 +2975,7 @@ pub async fn session_diff_file(
                 .into_response()
         }
         Err(e) => {
-            tracing::error!("File diff panicked: {}", e);
+            tracing::error!(target: "http.api.sessions", "File diff panicked: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
@@ -1890,6 +3054,44 @@ mod tests {
     }
 
     #[test]
+    fn session_response_surfaces_base_branch_override() {
+        let mut inst = make_test_instance();
+        // Default: no override -> field omitted from JSON.
+        let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
+        assert!(
+            json.get("base_branch_override").is_none(),
+            "base_branch_override should be omitted when None, got: {json}"
+        );
+
+        inst.base_branch_override = Some("upstream/main".to_string());
+        let resp = SessionResponse::from_instance(&inst, false);
+        assert_eq!(resp.base_branch_override.as_deref(), Some("upstream/main"));
+    }
+
+    #[test]
+    fn resolve_diff_base_prefers_override_then_config_then_auto() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Override wins over everything.
+        assert_eq!(
+            resolve_diff_base(Some("release-1.2"), Some("develop"), tmp.path()),
+            "release-1.2"
+        );
+        // Config wins when no override; empty / whitespace override falls
+        // through to the next layer.
+        assert_eq!(
+            resolve_diff_base(Some("   "), Some("develop"), tmp.path()),
+            "develop"
+        );
+        assert_eq!(
+            resolve_diff_base(None, Some("develop"), tmp.path()),
+            "develop"
+        );
+        // Auto-detect when neither is set. The tmp dir is not a repo so
+        // `get_default_base_ref` returns Err -> "main" fallback.
+        assert_eq!(resolve_diff_base(None, None, tmp.path()), "main");
+    }
+
+    #[test]
     fn session_response_surfaces_base_branch_when_set() {
         let mut inst = make_test_instance();
         inst.worktree_info = Some(crate::session::WorktreeInfo {
@@ -1963,6 +3165,113 @@ mod tests {
         let resp = SessionResponse::from_instance(&make_test_instance(), true);
         assert_eq!(resp.tool, "claude");
         assert!(resp.claude_fullscreen);
+    }
+
+    #[test]
+    fn session_response_surfaces_pinned_at() {
+        let mut inst = make_test_instance();
+
+        // Default: no pin -> field omitted from the JSON body.
+        let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
+        assert!(
+            json.get("pinned_at").is_none(),
+            "pinned_at should be omitted when None, got: {json}"
+        );
+
+        inst.pin();
+        let resp = SessionResponse::from_instance(&inst, false);
+        assert!(resp.pinned_at.is_some(), "pinned_at must surface when set");
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(
+            json.get("pinned_at").is_some(),
+            "pinned_at must appear in JSON when set"
+        );
+    }
+
+    #[test]
+    fn session_response_surfaces_archived_at() {
+        let mut inst = make_test_instance();
+        let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
+        assert!(json.get("archived_at").is_none());
+
+        inst.archive();
+        let resp = SessionResponse::from_instance(&inst, false);
+        assert!(resp.archived_at.is_some());
+    }
+
+    #[test]
+    fn session_response_gates_snoozed_until_on_active_snooze() {
+        let mut inst = make_test_instance();
+
+        // Not snoozed -> field omitted.
+        let resp = SessionResponse::from_instance(&inst, false);
+        assert!(resp.snoozed_until.is_none());
+
+        // Active snooze -> field surfaced.
+        inst.snooze(30);
+        let resp = SessionResponse::from_instance(&inst, false);
+        assert!(resp.snoozed_until.is_some());
+
+        // Expired snooze -> stays on disk for the next mutation to rewrite,
+        // but the API gates on `is_snoozed()` so the wire value is None.
+        // This prevents the web from rendering "snoozed 0m" on rows that
+        // have already woken on the server.
+        inst.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+        let resp = SessionResponse::from_instance(&inst, false);
+        assert!(
+            resp.snoozed_until.is_none(),
+            "expired snooze must be filtered out on the wire even though the persisted field stays set"
+        );
+    }
+
+    #[test]
+    fn update_pin_body_parses() {
+        let body: UpdatePinBody = serde_json::from_str(r#"{"pinned": true}"#).unwrap();
+        assert!(body.pinned);
+        let body: UpdatePinBody = serde_json::from_str(r#"{"pinned": false}"#).unwrap();
+        assert!(!body.pinned);
+    }
+
+    #[test]
+    fn update_archive_body_defaults_kill_pane_to_true() {
+        let body: UpdateArchiveBody = serde_json::from_str(r#"{"archived": true}"#).unwrap();
+        assert!(body.archived);
+        assert!(
+            body.kill_pane,
+            "kill_pane must default to true so callers that omit the field get TUI/CLI parity"
+        );
+
+        let body: UpdateArchiveBody =
+            serde_json::from_str(r#"{"archived": true, "kill_pane": false}"#).unwrap();
+        assert!(body.archived);
+        assert!(!body.kill_pane);
+    }
+
+    #[test]
+    fn update_snooze_body_parses_minutes_and_null() {
+        let body: UpdateSnoozeBody = serde_json::from_str(r#"{"minutes": 60}"#).unwrap();
+        assert_eq!(body.minutes, Some(60));
+
+        // `{"minutes": null}` and an empty body both mean unsnooze.
+        let body: UpdateSnoozeBody = serde_json::from_str(r#"{"minutes": null}"#).unwrap();
+        assert_eq!(body.minutes, None);
+        let body: UpdateSnoozeBody = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(body.minutes, None);
+    }
+
+    #[test]
+    fn update_snooze_validates_against_shared_bounds() {
+        // The handler uses `validate_snooze_duration` to reject 0 and >
+        // SNOOZE_MAX_MINUTES. Mirror the assertions here so a regression in
+        // the validator shape (or in the dialog presets at
+        // src/tui/dialogs/snooze_duration.rs) is caught locally.
+        assert!(crate::session::validate_snooze_duration(0).is_err());
+        for &m in &[60u64, 120, 180, 240, 300, 360, 1440, 7 * 1440] {
+            assert!(
+                crate::session::validate_snooze_duration(m).is_ok(),
+                "preset {m} min must pass validator (matches TUI dialog presets)"
+            );
+        }
     }
 
     #[test]
@@ -2044,6 +3353,199 @@ mod tests {
         apply_post_restart_sync(&mut live, &started);
 
         assert_eq!(live.agent_session_id.as_deref(), Some("fresh-id"));
+    }
+
+    fn isolated_app_dir(temp_home: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            let config_home = temp_home.join(".config");
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+            config_home.join(crate::session::APP_DIR_NAME_LINUX)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            temp_home.join(crate::session::APP_DIR_NAME_OTHER)
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn session_tool_identity_accepts_builtin_agent() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let project = tempfile::tempdir().unwrap();
+
+        assert!(validate_session_tool_identity(
+            "claude",
+            "default",
+            project.path()
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn session_tool_identity_accepts_non_empty_configured_custom_agent() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let app_dir = isolated_app_dir(temp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            r#"
+                [session.custom_agents]
+                remote-claude = "ssh -t host claude"
+            "#,
+        )
+        .unwrap();
+        let project = tempfile::tempdir().unwrap();
+
+        assert!(validate_session_tool_identity(
+            "remote-claude",
+            "default",
+            project.path()
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn session_tool_identity_rejects_unknown_agent() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let project = tempfile::tempdir().unwrap();
+
+        assert!(!validate_session_tool_identity(
+            "surprise-agent",
+            "default",
+            project.path()
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn session_tool_identity_rejects_empty_custom_agent_command() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let app_dir = isolated_app_dir(temp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            r#"
+                [session.custom_agents]
+                remote-claude = ""
+            "#,
+        )
+        .unwrap();
+        let project = tempfile::tempdir().unwrap();
+
+        assert!(!validate_session_tool_identity(
+            "remote-claude",
+            "default",
+            project.path()
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn session_tool_identity_rejects_whitespace_only_custom_agent_command() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let app_dir = isolated_app_dir(temp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            r#"
+                [session.custom_agents]
+                remote-claude = "   "
+            "#,
+        )
+        .unwrap();
+        let project = tempfile::tempdir().unwrap();
+
+        assert!(!validate_session_tool_identity(
+            "remote-claude",
+            "default",
+            project.path()
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn session_tool_identity_uses_requested_profile() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let app_dir = isolated_app_dir(temp_home.path());
+        let work_profile = app_dir.join("profiles").join("work");
+        std::fs::create_dir_all(&work_profile).unwrap();
+        std::fs::write(
+            work_profile.join("config.toml"),
+            r#"
+                [session.custom_agents]
+                work-agent = "ssh -t work claude"
+            "#,
+        )
+        .unwrap();
+        let project = tempfile::tempdir().unwrap();
+
+        assert!(!validate_session_tool_identity(
+            "work-agent",
+            "default",
+            project.path()
+        ));
+        assert!(validate_session_tool_identity(
+            "work-agent",
+            "work",
+            project.path()
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn session_tool_identity_uses_repo_aware_config_for_request_path() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _app_dir = isolated_app_dir(temp_home.path());
+        let project = tempfile::tempdir().unwrap();
+        let repo_config_dir = project.path().join(".agent-of-empires");
+        std::fs::create_dir_all(&repo_config_dir).unwrap();
+        std::fs::write(
+            repo_config_dir.join("config.toml"),
+            r#"
+                [session.custom_agents]
+                repo-agent = "ssh -t repo claude"
+            "#,
+        )
+        .unwrap();
+
+        assert!(validate_session_tool_identity(
+            "repo-agent",
+            "default",
+            project.path()
+        ));
+    }
+
+    #[test]
+    fn create_session_validates_tool_before_builder_or_persistence() {
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server/api/sessions.rs"),
+        )
+        .unwrap();
+        let create_start = source.find("pub async fn create_session").unwrap();
+        let create_source = &source[create_start..];
+        let validation = create_source
+            .find("validate_session_tool_identity")
+            .unwrap();
+        let unwrap_or_else = create_source.find("body.profile.unwrap_or_else").unwrap();
+        let spawn_blocking = create_source.find("tokio::task::spawn_blocking").unwrap();
+        let builder = create_source.find("builder::build_instance").unwrap();
+        let storage = create_source.find("Storage::new").unwrap();
+
+        assert!(validation < unwrap_or_else);
+        assert!(validation < spawn_blocking);
+        assert!(validation < builder);
+        assert!(validation < storage);
+        assert!(create_source.contains("body.profile.as_deref().unwrap_or(&state.profile)"));
+        assert!(create_source.contains("std::path::Path::new(&body.path)"));
+        assert!(!create_source[validation..spawn_blocking].contains("command_override"));
     }
     // ── validate_diff_path: security regression tests ──────────────────────────
     //
@@ -2304,10 +3806,13 @@ enum SendKeysError {
     Tmux(anyhow::Error),
 }
 
+type SendKeysResult =
+    Result<(EnsureReadyOutcome, Instance), Box<(Instance, EnsureReadyOutcome, SendKeysError)>>;
+
 pub async fn send_message(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(req): Json<SendMessageRequest>,
+    req: Result<Json<SendMessageRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return (
@@ -2316,6 +3821,10 @@ pub async fn send_message(
         )
             .into_response();
     }
+    let Json(req) = match req {
+        Ok(j) => j,
+        Err(rej) => return rej.into_response(),
+    };
 
     if req.message.trim().is_empty() {
         return (
@@ -2345,32 +3854,66 @@ pub async fn send_message(
     let tool = instance.tool.clone();
     let message = req.message;
     let revive = req.revive;
-    let send_result = tokio::task::spawn_blocking(
-        move || -> Result<(EnsureReadyOutcome, Instance), SendKeysError> {
-            // Revive the pane before sending. Without this, a send to a dead
-            // pane silently writes keystrokes to a corpse with no agent.
-            // Skipped when the caller opts out via `revive: false`.
-            let mut inst_owned = instance;
-            let outcome = if revive {
-                inst_owned.ensure_pane_ready().map_err(|e| match e {
-                    EnsureReadyError::Transient(s) => SendKeysError::Transient(s),
-                    EnsureReadyError::CockpitMode => SendKeysError::CockpitMode,
-                    EnsureReadyError::Tmux(e) => SendKeysError::Tmux(e),
-                })?
-            } else {
-                EnsureReadyOutcome::AlreadyAlive
-            };
-            let tmux_session = inst_owned.tmux_session().map_err(SendKeysError::Tmux)?;
-            if !tmux_session.exists() {
-                return Err(SendKeysError::NotRunning);
+    let send_result = tokio::task::spawn_blocking(move || -> SendKeysResult {
+        // Revive the pane before sending. Without this, a send to a dead
+        // pane silently writes keystrokes to a corpse with no agent.
+        // Skipped when the caller opts out via `revive: false`.
+        //
+        // The closure surfaces both `inst_owned` AND the
+        // `EnsureReadyOutcome` on the Err arm so the caller can sync
+        // the post-cascade `agent_session_id` (None after Tier-1
+        // cleanup, or the fresh UUID acquired by Tier-2) and the
+        // updated `retroactive_capture_excludes` back to live state
+        // regardless of which post-cascade failure path fires. The
+        // outcome lets the caller distinguish cascade-fired
+        // (`Respawned`/`Started`) from the no-op `AlreadyAlive` path
+        // so a sync only happens when there's actual cascade state to
+        // propagate; this avoids clobbering live `last_error` on the
+        // `revive=false + NotRunning` path where `started` is
+        // unmutated.
+        let mut inst_owned = instance;
+        let outcome = if revive {
+            match inst_owned.ensure_pane_ready() {
+                Ok(o) => o,
+                Err(e) => {
+                    let mapped = match e {
+                        EnsureReadyError::Transient(s) => SendKeysError::Transient(s),
+                        EnsureReadyError::CockpitMode => SendKeysError::CockpitMode,
+                        EnsureReadyError::Tmux(e) => SendKeysError::Tmux(e),
+                    };
+                    // ensure_pane_ready did not mutate user-visible
+                    // state via the outcome path. Tag as AlreadyAlive
+                    // so the outer match's `did_work` flag stays
+                    // false. `EnsureReadyError::Tmux` may be either
+                    // pre-cascade (tmux_session() / start_with_size
+                    // subprocess failure: `inst_owned` unmutated) or
+                    // post-cascade (Tier-2 bail: mutations committed).
+                    // The Tmux outer arm syncs unconditionally and
+                    // covers both shapes; the others (Transient /
+                    // CockpitMode) bail before any mutation.
+                    return Err(Box::new((
+                        inst_owned,
+                        EnsureReadyOutcome::AlreadyAlive,
+                        mapped,
+                    )));
+                }
             }
-            let delay = crate::agents::send_keys_enter_delay(&tool);
-            tmux_session
-                .send_keys_with_delay(&message, delay)
-                .map_err(SendKeysError::Tmux)?;
-            Ok((outcome, inst_owned))
-        },
-    )
+        } else {
+            EnsureReadyOutcome::AlreadyAlive
+        };
+        let tmux_session = match inst_owned.tmux_session() {
+            Ok(s) => s,
+            Err(e) => return Err(Box::new((inst_owned, outcome, SendKeysError::Tmux(e)))),
+        };
+        if !tmux_session.exists() {
+            return Err(Box::new((inst_owned, outcome, SendKeysError::NotRunning)));
+        }
+        let delay = crate::agents::send_keys_enter_delay(&tool);
+        if let Err(e) = tmux_session.send_keys_with_delay(&message, delay) {
+            return Err(Box::new((inst_owned, outcome, SendKeysError::Tmux(e))));
+        }
+        Ok((outcome, inst_owned))
+    })
     .await;
 
     match send_result {
@@ -2394,52 +3937,116 @@ pub async fn send_message(
                 // left to persist.
                 return (StatusCode::OK, Json(serde_json::json!({"sent": true}))).into_response();
             };
-            // Persist only the target session's profile, mirroring the pattern
-            // used by rename/delete. Saving `state.instances` wholesale would
-            // write every profile's sessions into one profile's storage file.
-            let profile_instances: Vec<Instance> = instances
-                .iter()
-                .filter(|i| i.source_profile == profile)
-                .cloned()
-                .collect();
             drop(instances);
+            let id_for_save = id.clone();
+            let started_for_save = started.clone();
+            let outcome_already_alive = matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
             tokio::task::spawn_blocking(move || {
                 if let Ok(storage) = Storage::new(&profile) {
-                    if let Err(e) = storage.save(&profile_instances) {
-                        tracing::warn!("send_message: persist failed: {e}");
+                    if let Err(e) = storage.update(|all, _groups| {
+                        if let Some(disk_inst) = all.iter_mut().find(|i| i.id == id_for_save) {
+                            if !outcome_already_alive {
+                                apply_post_restart_sync(disk_inst, &started_for_save);
+                            }
+                            disk_inst.touch_last_accessed();
+                        }
+                        Ok(())
+                    }) {
+                        tracing::warn!(target: "http.api.sessions", "send_message: persist failed: {e}");
                     }
                 }
             });
-            (StatusCode::OK, Json(serde_json::json!({"sent": true}))).into_response()
+            let mut body = serde_json::json!({"sent": true});
+            let stale_sid = match &outcome {
+                EnsureReadyOutcome::Respawned {
+                    stale_sid: Some(sid),
+                }
+                | EnsureReadyOutcome::Started {
+                    stale_sid: Some(sid),
+                } => Some(sid.clone()),
+                _ => None,
+            };
+            if let Some(sid) = stale_sid {
+                body["stale_session_id"] = serde_json::Value::String(sid);
+            }
+            (StatusCode::OK, Json(body)).into_response()
         }
-        Ok(Err(SendKeysError::NotRunning)) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "session_not_running"})),
-        )
-            .into_response(),
-        Ok(Err(SendKeysError::Transient(status))) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "session_transient",
-                "status": format!("{status:?}"),
-            })),
-        )
-            .into_response(),
-        Ok(Err(SendKeysError::CockpitMode)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "cockpit_mode_unsupported"})),
-        )
-            .into_response(),
-        Ok(Err(SendKeysError::Tmux(e))) => {
-            tracing::error!("send_message: tmux error for {id}: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "tmux_error"})),
-            )
-                .into_response()
+        Ok(Err(boxed)) => {
+            let (started, outcome, send_err) = *boxed;
+            // ensure_pane_ready did mutate state when the outcome is
+            // anything other than AlreadyAlive. The cascade itself only
+            // runs in `Respawned { stale_sid: Some(_) }`, but `Started`
+            // and `Respawned { stale_sid: None }` also touch fields the
+            // live entry needs to reflect (fresh sid from acquire,
+            // last_start_time, etc.). Sync only when work happened.
+            let did_work = !matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
+            match send_err {
+                SendKeysError::NotRunning => {
+                    // External kill or remain-on-exit-off Tier-2 crash can
+                    // race ensure_pane_ready's Alive decision against the
+                    // tmux_session.exists() check. Propagate the
+                    // post-cascade agent_session_id (fresh UUID acquired
+                    // in place of the stale, or None for Tier-1 cleanup)
+                    // and the updated excludes when applicable so the
+                    // next call won't orphan or re-attempt resume with
+                    // the bad sid; use the narrow sync helper to leave
+                    // status and last_error untouched (NotRunning is
+                    // recoverable; `started.status = Starting` from
+                    // finalize_launch would briefly mis-paint a broken
+                    // pane).
+                    if did_work {
+                        let mut instances = state.instances.write().await;
+                        if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
+                            apply_cascade_state_sync(i, &started);
+                        }
+                    }
+                    (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({"error": "session_not_running"})),
+                    )
+                        .into_response()
+                }
+                SendKeysError::Transient(status) => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "session_transient",
+                        "status": format!("{status:?}"),
+                    })),
+                )
+                    .into_response(),
+                SendKeysError::CockpitMode => (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "cockpit_mode_unsupported"})),
+                )
+                    .into_response(),
+                SendKeysError::Tmux(e) => {
+                    tracing::error!(target: "http.api.sessions", "send_message: tmux error for {id}: {e}");
+                    let msg = e.to_string();
+                    // Sync cascade-mutated fields back to live state. Mirror
+                    // `ensure_session`'s Err arm: full sync, then override
+                    // `status` and `last_error` so observers don't see
+                    // `Status::Starting` (set by `finalize_launch` before
+                    // Tier-2 bail) on a broken session. Tmux Err is the
+                    // catch-all for both pre-cascade tmux failures (where
+                    // `started` is unmutated and the sync is a no-op) and
+                    // post-cascade Tier-2 bails (where the sync propagates
+                    // the cleared sid + updated excludes).
+                    let mut instances = state.instances.write().await;
+                    if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
+                        apply_post_restart_sync(i, &started);
+                        i.status = crate::session::Status::Error;
+                        i.last_error = Some(msg);
+                    }
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": "tmux_error"})),
+                    )
+                        .into_response()
+                }
+            }
         }
         Err(e) => {
-            tracing::error!("send_message: blocking task panicked for {id}: {e}");
+            tracing::error!(target: "http.api.sessions", "send_message: blocking task panicked for {id}: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal"})),
@@ -2534,7 +4141,7 @@ pub async fn read_output(
         )
             .into_response(),
         Ok(Err(CaptureError::Tmux(e))) => {
-            tracing::error!("read_output: tmux error for {id}: {e}");
+            tracing::error!(target: "http.api.sessions", "read_output: tmux error for {id}: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "tmux_error"})),
@@ -2542,13 +4149,254 @@ pub async fn read_output(
                 .into_response()
         }
         Err(e) => {
-            tracing::error!("read_output: blocking task panicked for {id}: {e}");
+            tracing::error!(target: "http.api.sessions", "read_output: blocking task panicked for {id}: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal"})),
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod workspace_ordering_tests {
+    use super::*;
+    use serial_test::serial;
+    use tempfile::tempdir;
+
+    fn setup_test_home(temp: &std::path::Path) {
+        std::env::set_var("HOME", temp);
+        #[cfg(target_os = "linux")]
+        std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"));
+    }
+
+    fn mock_response(id: &str, project_path: &str, branch: Option<&str>) -> SessionResponse {
+        SessionResponse {
+            id: id.to_string(),
+            title: id.to_string(),
+            project_path: project_path.to_string(),
+            group_path: String::new(),
+            tool: "claude".to_string(),
+            status: "Idle".to_string(),
+            yolo_mode: false,
+            created_at: "2025-01-01T00:00:00Z".to_string(),
+            last_accessed_at: None,
+            idle_entered_at: None,
+            last_error: None,
+            branch: branch.map(str::to_string),
+            main_repo_path: None,
+            base_branch: None,
+            base_branch_override: None,
+            is_sandboxed: false,
+            scratch: false,
+            has_managed_worktree: false,
+            has_terminal: false,
+            profile: "default".to_string(),
+            cleanup_defaults: CleanupDefaults {
+                delete_worktree: false,
+                delete_branch: false,
+                delete_sandbox: false,
+            },
+            remote_owner: None,
+            notify_on_waiting: None,
+            notify_on_idle: None,
+            notify_on_error: None,
+            #[cfg(feature = "serve")]
+            cockpit_mode: false,
+            #[cfg(feature = "serve")]
+            cockpit_worker_state: crate::cockpit::supervisor::CockpitWorkerState::Absent,
+            claude_fullscreen: false,
+            workspace_repos: Vec::new(),
+            warnings: Vec::new(),
+            plan_summary: None,
+            next_wakeup_at: None,
+            next_wakeup_reason: None,
+            favorited: false,
+            pinned_at: None,
+            archived_at: None,
+            snoozed_until: None,
+        }
+    }
+
+    #[test]
+    fn id_uses_branch_when_present() {
+        let r = mock_response("s1", "/tmp/repo", Some("feature/x"));
+        assert_eq!(workspace_id_for_session(&r), "/tmp/repo::feature/x");
+    }
+
+    #[test]
+    fn id_falls_back_to_session_id_when_branchless() {
+        let r = mock_response("abc123", "/tmp/repo", None);
+        assert_eq!(
+            workspace_id_for_session(&r),
+            "/tmp/repo::__session__::abc123"
+        );
+    }
+
+    #[test]
+    fn id_strips_trailing_slash() {
+        // The client's `useWorkspaces.normalizePath` strips trailing
+        // slashes. Server must match so the merged ordering keys line up.
+        let r = mock_response("s1", "/tmp/repo/", Some("main"));
+        assert_eq!(workspace_id_for_session(&r), "/tmp/repo::main");
+    }
+
+    #[test]
+    fn id_prefers_main_repo_path_over_project_path() {
+        let mut r = mock_response("s1", "/tmp/worktree", Some("main"));
+        r.main_repo_path = Some("/tmp/repo".to_string());
+        assert_eq!(workspace_id_for_session(&r), "/tmp/repo::main");
+    }
+
+    #[test]
+    #[serial]
+    fn merge_prepends_unseen_newest_first() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        setup_test_home(temp.path());
+
+        // Persisted ordering already contains `b`. Sessions come in
+        // creation order (oldest first) `[b, a, c]`; `a` and `c` are
+        // unseen and should land at the top in newest-first order: `[c, a, b]`.
+        crate::session::update_workspace_ordering(|ord| {
+            ord.order = vec!["/tmp/repo::b".to_string()];
+            Ok(())
+        })?;
+
+        let sessions = vec![
+            mock_response("sb", "/tmp/repo", Some("b")),
+            mock_response("sa", "/tmp/repo", Some("a")),
+            mock_response("sc", "/tmp/repo", Some("c")),
+        ];
+
+        let merged = merge_workspace_ordering(&sessions, /* read_only */ false)?;
+        assert_eq!(
+            merged,
+            vec![
+                "/tmp/repo::c".to_string(),
+                "/tmp/repo::a".to_string(),
+                "/tmp/repo::b".to_string(),
+            ]
+        );
+
+        // And the merge was persisted.
+        let on_disk = crate::session::load_workspace_ordering()?;
+        assert_eq!(on_disk.order, merged);
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn merge_dedupes_within_a_single_request() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        setup_test_home(temp.path());
+
+        // Two sessions on the same workspace (rare but legal: multiple
+        // agents in one worktree). The workspace id appears once.
+        let sessions = vec![
+            mock_response("sa1", "/tmp/repo", Some("main")),
+            mock_response("sa2", "/tmp/repo", Some("main")),
+        ];
+
+        let merged = merge_workspace_ordering(&sessions, false)?;
+        assert_eq!(merged, vec!["/tmp/repo::main".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn merge_no_op_when_all_known() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        setup_test_home(temp.path());
+
+        crate::session::update_workspace_ordering(|ord| {
+            ord.order = vec!["/tmp/repo::a".to_string(), "/tmp/repo::b".to_string()];
+            Ok(())
+        })?;
+
+        let sessions = vec![
+            mock_response("sa", "/tmp/repo", Some("a")),
+            mock_response("sb", "/tmp/repo", Some("b")),
+        ];
+
+        let merged = merge_workspace_ordering(&sessions, false)?;
+        assert_eq!(
+            merged,
+            vec!["/tmp/repo::a".to_string(), "/tmp/repo::b".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn merge_read_only_returns_merged_but_does_not_write() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        setup_test_home(temp.path());
+
+        // Empty starting state. Read-only request observes a new
+        // workspace; the response includes it but disk is untouched.
+        let sessions = vec![mock_response("sa", "/tmp/repo", Some("a"))];
+
+        let merged = merge_workspace_ordering(&sessions, /* read_only */ true)?;
+        assert_eq!(merged, vec!["/tmp/repo::a".to_string()]);
+
+        let on_disk = crate::session::load_workspace_ordering()?;
+        assert!(on_disk.order.is_empty(), "read-only path must not persist");
+
+        Ok(())
+    }
+
+    #[test]
+    fn compute_merged_ordering_pure_no_known_ids() {
+        let sessions = vec![
+            mock_response("s1", "/repo/a", Some("main")),
+            mock_response("s2", "/repo/b", Some("dev")),
+        ];
+        let merged = compute_merged_ordering(&sessions, &[]);
+        assert_eq!(
+            merged,
+            vec!["/repo/b::dev".to_string(), "/repo/a::main".to_string()]
+        );
+    }
+
+    #[test]
+    fn compute_merged_ordering_pure_dedupes_unknowns() {
+        let sessions = vec![
+            mock_response("s1", "/repo/a", Some("main")),
+            mock_response("s2", "/repo/a", Some("main")),
+            mock_response("s3", "/repo/b", Some("dev")),
+        ];
+        let merged = compute_merged_ordering(&sessions, &[]);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.contains(&"/repo/a::main".to_string()));
+        assert!(merged.contains(&"/repo/b::dev".to_string()));
+    }
+
+    #[test]
+    fn compute_merged_ordering_pure_preserves_existing_order() {
+        let existing = vec!["/repo/x::main".to_string(), "/repo/y::dev".to_string()];
+        let sessions = vec![mock_response("s1", "/repo/z", Some("feat"))];
+        let merged = compute_merged_ordering(&sessions, &existing);
+        assert_eq!(
+            merged,
+            vec![
+                "/repo/z::feat".to_string(),
+                "/repo/x::main".to_string(),
+                "/repo/y::dev".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn compute_merged_ordering_pure_returns_existing_when_all_known() {
+        let existing = vec!["/repo/x::main".to_string(), "/repo/y::dev".to_string()];
+        let sessions = vec![
+            mock_response("s1", "/repo/x", Some("main")),
+            mock_response("s2", "/repo/y", Some("dev")),
+        ];
+        let merged = compute_merged_ordering(&sessions, &existing);
+        assert_eq!(merged, existing);
     }
 }
 

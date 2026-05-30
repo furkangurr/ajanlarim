@@ -47,6 +47,14 @@ interface Props {
    *  Threaded through to `useCockpit` so the drain effect parks queued
    *  prompts while the reconciler is mid-resume. See #1088. */
   cockpitWorkerState?: "absent" | "resuming" | "running";
+  /** RFC3339 archived-at timestamp, or null. Threaded into `useCockpit`
+   *  so `sendPrompt` can auto-unarchive the session before enqueueing,
+   *  matching the `touch_last_accessed` invariant the server enforces
+   *  for tmux sends. See #1581. */
+  archivedAt?: string | null;
+  /** RFC3339 snoozed-until timestamp, or null. Same auto-wake purpose
+   *  as `archivedAt`. See #1581. */
+  snoozedUntil?: string | null;
   /** When true, every row is rendered including those preceding the
    *  most recent `/clear`. When false (the default), rows before the
    *  latest `session_cleared` divider are folded out of the message
@@ -61,6 +69,14 @@ export interface CockpitContext {
   state: CockpitState;
   status: ReturnType<typeof useCockpit>["status"];
   hasEverOpened: boolean;
+  /** True while the auto-reconnect backoff is armed between a close
+   *  and the next dial. Drives the "Reconnecting (N/MAX) in Xs" copy
+   *  in SystemNotices. See #1130. */
+  reconnecting: boolean;
+  retryCount: number;
+  retryCountdown: number;
+  maxRetries: number;
+  manualReconnect: () => void;
   resolveApproval: (
     nonce: string,
     decision: ApprovalDecision,
@@ -73,6 +89,10 @@ export interface CockpitContext {
   removeQueuedPrompt: (id: string) => void;
   editQueuedPrompt: (id: string, text: string) => void;
   clearQueue: () => void;
+  dismissRejectedPrompt: (id: string) => void;
+  dismissModeSwitchFailed: () => void;
+  setConfigOption: (configId: string, value: string) => Promise<void>;
+  dismissConfigOptionSwitchFailed: () => void;
 }
 
 /**
@@ -84,10 +104,12 @@ export interface CockpitContext {
 export function CockpitRuntime({
   sessionId,
   cockpitWorkerState = "running",
+  archivedAt = null,
+  snoozedUntil = null,
   showClearedTurns = false,
   children,
 }: Props) {
-  const cockpit = useCockpit(sessionId, cockpitWorkerState);
+  const cockpit = useCockpit(sessionId, cockpitWorkerState, archivedAt, snoozedUntil);
   // Memoise the activity → ThreadMessageLike conversion. The function
   // walks the entire activity array, allocates a new AssistantBuilder
   // per turn, and produces brand-new message objects. Without
@@ -131,6 +153,11 @@ export function CockpitRuntime({
         state: cockpit.state,
         status: cockpit.status,
         hasEverOpened: cockpit.hasEverOpened,
+        reconnecting: cockpit.reconnecting,
+        retryCount: cockpit.retryCount,
+        retryCountdown: cockpit.retryCountdown,
+        maxRetries: cockpit.maxRetries,
+        manualReconnect: cockpit.manualReconnect,
         resolveApproval: cockpit.resolveApproval,
         sendPrompt: cockpit.sendPrompt,
         forceEndTurn: cockpit.forceEndTurn,
@@ -140,6 +167,10 @@ export function CockpitRuntime({
         removeQueuedPrompt: cockpit.removeQueuedPrompt,
         editQueuedPrompt: cockpit.editQueuedPrompt,
         clearQueue: cockpit.clearQueue,
+        dismissRejectedPrompt: cockpit.dismissRejectedPrompt,
+        dismissModeSwitchFailed: cockpit.dismissModeSwitchFailed,
+        setConfigOption: cockpit.setConfigOption,
+        dismissConfigOptionSwitchFailed: cockpit.dismissConfigOptionSwitchFailed,
       })}
     </AssistantRuntimeProvider>
   );

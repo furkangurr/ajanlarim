@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::git::diff::{
-    check_merge_base_status, compute_changed_files, compute_file_diff, get_default_branch,
+    check_merge_base_status, compute_changed_files, compute_file_diff, get_default_base_ref,
     list_branches, DiffFile, FileDiff,
 };
 use crate::session::config::{load_config, save_config};
@@ -27,6 +27,15 @@ pub struct BranchSelectState {
 pub struct DiffView {
     /// Path to the repository root
     pub(crate) repo_path: PathBuf,
+
+    /// Session id this diff view belongs to. None when opened in a
+    /// session-agnostic context (legacy `DiffView::new`); persistence
+    /// of the per-session base-branch override is skipped in that case.
+    pub(crate) session_id: Option<String>,
+
+    /// Profile the session belongs to, used to look up `Storage` when
+    /// persisting the base-branch override.
+    pub(crate) profile: String,
 
     /// Base branch to compare against
     pub(crate) base_branch: String,
@@ -69,19 +78,49 @@ pub struct DiffView {
 
     /// Warning dialog shown when merge-base can't be computed
     pub(crate) warning_dialog: Option<InfoDialog>,
+
+    /// Override that has been persisted to disk but not yet propagated
+    /// back to HomeView's in-memory `Instance.base_branch_override`.
+    /// HomeView consumes this after each key event via
+    /// `take_pending_override` and applies it to its cache; without
+    /// this hand-off, HomeView's next `commit` would overwrite the
+    /// disk value with its stale memory copy. See #1175.
+    pub(crate) pending_override: Option<(String, Option<String>)>,
+
+    /// Inner rect of the file-list panel, captured during `render`.
+    /// Lets a click on a file row select it and a hover highlight it
+    /// the same way `j`/`k` would.
+    pub(crate) file_list_inner: ratatui::layout::Rect,
 }
 
 impl DiffView {
-    /// Create a new diff view for a repository
+    /// Create a session-agnostic diff view. Selecting a different
+    /// branch through the picker only mutates in-memory state. Callers
+    /// that have a session id should use `new_for_session` so the
+    /// override persists.
     pub fn new(repo_path: PathBuf) -> anyhow::Result<Self> {
+        Self::new_for_session(repo_path, None, String::new(), None)
+    }
+
+    /// Create a diff view bound to a session. `base_override` (the
+    /// session's persisted `base_branch_override`) wins over the
+    /// profile default and auto-detection. Subsequent calls to
+    /// `select_branch` persist the new ref back to the session record.
+    pub fn new_for_session(
+        repo_path: PathBuf,
+        session_id: Option<String>,
+        profile: String,
+        base_override: Option<String>,
+    ) -> anyhow::Result<Self> {
         let config = Config::load_or_warn();
 
-        // Determine base branch
-        let base_branch = config
-            .diff
-            .default_branch
-            .clone()
-            .or_else(|| get_default_branch(&repo_path).ok())
+        let base_branch = base_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .or_else(|| config.diff.default_branch.clone())
+            .or_else(|| get_default_base_ref(&repo_path).ok())
             .unwrap_or_else(|| "main".to_string());
 
         let context_lines = config.diff.context_lines;
@@ -91,6 +130,8 @@ impl DiffView {
 
         let mut view = Self {
             repo_path,
+            session_id,
+            profile,
             base_branch,
             files: Vec::new(),
             selected_file: 0,
@@ -105,6 +146,8 @@ impl DiffView {
             show_help: false,
             file_list_width: config.app_state.diff_file_list_width.unwrap_or(35),
             warning_dialog,
+            pending_override: None,
+            file_list_inner: ratatui::layout::Rect::default(),
         };
 
         view.refresh_files()?;
@@ -168,15 +211,48 @@ impl DiffView {
         }
     }
 
-    /// Select a branch and refresh
+    /// Select a branch and refresh. When the view is bound to a
+    /// session, the choice is persisted as `base_branch_override` on
+    /// the session record so the next launch comes back to the same
+    /// comparison. Persistence failures only surface as a soft error
+    /// message; the in-memory switch still applies. See #970.
     pub fn select_branch(&mut self, branch: String) {
         self.base_branch = branch;
         self.branch_select = None;
         self.warning_dialog = check_merge_base_status(&self.repo_path, &self.base_branch)
             .map(|msg| InfoDialog::new("Warning", &msg));
+        if let Err(e) = self.persist_base_override() {
+            self.error_message = Some(format!("Failed to persist base branch: {e}"));
+        }
         if let Err(e) = self.refresh_files() {
             self.error_message = Some(format!("Failed to refresh: {}", e));
         }
+    }
+
+    fn persist_base_override(&mut self) -> anyhow::Result<()> {
+        let Some(session_id) = self.session_id.clone() else {
+            return Ok(());
+        };
+        let storage = crate::session::Storage::new(&self.profile)?;
+        let new_override = Some(self.base_branch.clone());
+        let id_for_closure = session_id.clone();
+        let new_override_for_closure = new_override.clone();
+        storage.update(|instances, _groups| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_closure) {
+                inst.base_branch_override = new_override_for_closure;
+            }
+            Ok(())
+        })?;
+        self.pending_override = Some((session_id, new_override));
+        Ok(())
+    }
+
+    /// Drain a pending base-branch override that was just persisted to
+    /// disk. HomeView calls this after each key event so its in-memory
+    /// `Instance.base_branch_override` stays consistent with disk;
+    /// otherwise its next `commit` would overwrite the persisted value.
+    pub fn take_pending_override(&mut self) -> Option<(String, Option<String>)> {
+        self.pending_override.take()
     }
 
     /// Navigate to next file
@@ -251,6 +327,8 @@ impl DiffView {
     pub(crate) fn test_default() -> Self {
         Self {
             repo_path: std::path::PathBuf::from("/tmp/fake"),
+            session_id: None,
+            profile: String::new(),
             base_branch: "main".to_string(),
             files: Vec::new(),
             selected_file: 0,
@@ -265,6 +343,8 @@ impl DiffView {
             show_help: false,
             file_list_width: 35,
             warning_dialog: None,
+            pending_override: None,
+            file_list_inner: ratatui::layout::Rect::default(),
         }
     }
 }

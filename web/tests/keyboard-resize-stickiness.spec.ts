@@ -1,12 +1,13 @@
-import { test, expect, devices, type Page } from "@playwright/test";
-import { clickSidebarSession } from "./helpers/sidebar";
+import { test, expect } from "./helpers/mockedTest";
+import { devices, type Page } from "@playwright/test";
+import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
 import { mockTerminalApis, type MockHandle } from "./helpers/terminal-mocks";
 
 // Regression for the SIGWINCH-on-every-soft-keyboard-cycle bug.
 //
 // useMobileKeyboard previously exposed only `keyboardHeight` (live), and
 // TerminalView padded its viewport by that. Every time the soft keyboard
-// dismissed, paddingBottom flipped back to 0, the wterm container grew,
+// dismissed, paddingBottom flipped back to 0, the terminal container grew,
 // ResizeObserver fired, and a fresh PTY resize landed at the server.
 // claude (and any non-fullscreen TUI) redrew on the SIGWINCH and stacked
 // banners into tmux scrollback.
@@ -86,15 +87,10 @@ async function setKeyboard(page: Page, opts: { open: boolean; px?: number; pwa?:
 }
 
 async function openSession(page: Page, handle: MockHandle) {
-  // Sidebar is collapsed on mobile; open it before clicking the session row.
-  const sidebarToggle = page.getByRole("button", { name: "Toggle sidebar" });
-  if (await sidebarToggle.isVisible()) {
-    await sidebarToggle.click();
-    await page.waitForTimeout(200);
-  }
+  await openMobileSidebar(page);
   await clickSidebarSession(page, "pinch-test");
   await page
-    .locator('[data-term="agent"] .wterm')
+    .locator('[data-term="agent"] .xterm')
     .waitFor({ state: "visible", timeout: 10_000 });
   await expect
     .poll(() => handle.wsMessages.length, { timeout: 5_000 })
@@ -216,7 +212,7 @@ test.describe("Keyboard cycle stickiness regression", () => {
     await page.waitForTimeout(500);
     const afterOn = extractResizes(handle).length;
 
-    // Toggling fullscreen ON releases paddingBottom -> the wterm
+    // Toggling fullscreen ON releases paddingBottom -> the terminal
     // container grows -> exactly one resize message.
     expect(afterOn - before).toBeGreaterThanOrEqual(1);
     expect(afterOn - before).toBeLessThanOrEqual(2);

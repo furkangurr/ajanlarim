@@ -106,7 +106,7 @@ fn test_cli_add_respects_config_extra_args() {
     let config_dir = crate::harness::app_dir_in(h.home_path());
     let config_content = format!(
         r#"[updates]
-check_enabled = false
+update_check_mode = "off"
 
 [app_state]
 has_seen_welcome = true
@@ -146,7 +146,7 @@ fn test_cli_add_respects_config_command_override() {
     let config_dir = crate::harness::app_dir_in(h.home_path());
     let config_content = format!(
         r#"[updates]
-check_enabled = false
+update_check_mode = "off"
 
 [app_state]
 has_seen_welcome = true
@@ -186,7 +186,7 @@ fn test_cli_add_cli_flags_override_config() {
     let config_dir = crate::harness::app_dir_in(h.home_path());
     let config_content = format!(
         r#"[updates]
-check_enabled = false
+update_check_mode = "off"
 
 [app_state]
 has_seen_welcome = true
@@ -241,7 +241,7 @@ fn test_cli_add_respects_default_tool() {
     let config_dir = crate::harness::app_dir_in(h.home_path());
     let config_content = format!(
         r#"[updates]
-check_enabled = false
+update_check_mode = "off"
 
 [app_state]
 has_seen_welcome = true
@@ -284,7 +284,7 @@ fn test_cli_add_cmd_overrides_default_tool() {
     let config_dir = crate::harness::app_dir_in(h.home_path());
     let config_content = format!(
         r#"[updates]
-check_enabled = false
+update_check_mode = "off"
 
 [app_state]
 has_seen_welcome = true
@@ -329,7 +329,7 @@ fn test_cli_add_respects_yolo_mode_default() {
     let config_dir = crate::harness::app_dir_in(h.home_path());
     let config_content = format!(
         r#"[updates]
-check_enabled = false
+update_check_mode = "off"
 
 [app_state]
 has_seen_welcome = true
@@ -406,6 +406,311 @@ fn test_cli_add_default_tool_no_config() {
     );
 }
 
+#[test]
+#[serial]
+fn cli_add_custom_agent_persists_configured_command_extra_args_and_detect_as() {
+    let h = TuiTestHarness::new("cli_add_custom_agent_success");
+    let project = h.project_path();
+
+    let config_dir = crate::harness::app_dir_in(h.home_path());
+    let config_content = format!(
+        r#"[updates]
+update_check_mode = "off"
+
+[app_state]
+has_seen_welcome = true
+last_seen_version = "{}"
+
+[session]
+custom_agents = {{ custom = "bash -lc true" }}
+agent_detect_as = {{ custom = "claude" }}
+"#,
+        env!("CARGO_PKG_VERSION")
+    );
+    std::fs::write(config_dir.join("config.toml"), config_content).expect("write config.toml");
+
+    let add_output = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--tool",
+        "custom",
+        "-t",
+        "CustomTool",
+        "--extra-args",
+        "--flag value",
+    ]);
+    assert!(
+        add_output.status.success(),
+        "aoe add --tool custom failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&add_output.stdout),
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let sessions = read_sessions_json(&h);
+    let session = &sessions[0];
+    assert_eq!(session["tool"].as_str().unwrap_or(""), "custom");
+    assert_eq!(session["command"].as_str().unwrap_or(""), "bash -lc true");
+    assert_eq!(session["extra_args"].as_str().unwrap_or(""), "--flag value");
+    assert_eq!(session["detect_as"].as_str().unwrap_or(""), "claude");
+}
+
+#[test]
+#[serial]
+fn cli_add_custom_agent_allows_missing_detect_as_mapping() {
+    let h = TuiTestHarness::new("cli_add_custom_agent_no_detect_as");
+    let project = h.project_path();
+
+    let config_dir = crate::harness::app_dir_in(h.home_path());
+    let config_content = format!(
+        r#"[updates]
+update_check_mode = "off"
+
+[app_state]
+has_seen_welcome = true
+last_seen_version = "{}"
+
+[session]
+custom_agents = {{ custom = "bash -lc true" }}
+"#,
+        env!("CARGO_PKG_VERSION")
+    );
+    std::fs::write(config_dir.join("config.toml"), config_content).expect("write config.toml");
+
+    let add_output = h.run_cli(&["add", project.to_str().unwrap(), "--tool", "custom"]);
+    assert!(
+        add_output.status.success(),
+        "aoe add --tool custom should not require agent_detect_as:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&add_output.stdout),
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let sessions = read_sessions_json(&h);
+    let session = &sessions[0];
+    assert_eq!(session["tool"].as_str().unwrap_or(""), "custom");
+    assert_eq!(session["command"].as_str().unwrap_or(""), "bash -lc true");
+    assert_eq!(session["detect_as"].as_str().unwrap_or(""), "");
+}
+
+#[test]
+#[serial]
+fn cli_add_custom_agent_unknown_tool_fails_safely_without_persistence() {
+    let h = TuiTestHarness::new("cli_add_custom_agent_unknown");
+    let project = h.project_path();
+
+    let config_dir = crate::harness::app_dir_in(h.home_path());
+    let config_content = format!(
+        r#"[updates]
+update_check_mode = "off"
+
+[app_state]
+has_seen_welcome = true
+last_seen_version = "{}"
+
+[session]
+custom_agents = {{ custom = "secret-custom-command-for-leak-check" }}
+"#,
+        env!("CARGO_PKG_VERSION")
+    );
+    std::fs::write(config_dir.join("config.toml"), config_content).expect("write config.toml");
+
+    let output = h.run_cli(&["add", project.to_str().unwrap(), "--tool", "missing"]);
+    assert!(!output.status.success(), "unknown tool should fail");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("custom") || combined.contains("claude"),
+        "error should list safe built-in or custom names. Output:\n{}",
+        combined
+    );
+    assert!(
+        !combined.contains("secret-custom-command-for-leak-check"),
+        "error must not leak configured command string. Output:\n{}",
+        combined
+    );
+
+    let sessions_path = config_dir.join("profiles/default/sessions.json");
+    assert!(
+        !sessions_path.exists(),
+        "unknown tool must fail before writing sessions.json"
+    );
+}
+
+#[test]
+#[serial]
+fn cli_add_custom_agent_rejects_custom_cmd_override() {
+    let h = TuiTestHarness::new("cli_add_custom_agent_cmd_override");
+    let project = h.project_path();
+
+    let config_dir = crate::harness::app_dir_in(h.home_path());
+    let config_content = format!(
+        r#"[updates]
+update_check_mode = "off"
+
+[app_state]
+has_seen_welcome = true
+last_seen_version = "{}"
+
+[session]
+custom_agents = {{ custom = "bash -lc true" }}
+"#,
+        env!("CARGO_PKG_VERSION")
+    );
+    std::fs::write(config_dir.join("config.toml"), config_content).expect("write config.toml");
+
+    let output = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--tool",
+        "custom",
+        "--cmd-override",
+        "other",
+    ]);
+    assert!(
+        !output.status.success(),
+        "custom --tool should reject --cmd-override"
+    );
+}
+
+#[test]
+#[serial]
+fn cli_add_custom_agent_rejects_empty_configured_command() {
+    let h = TuiTestHarness::new("cli_add_custom_agent_empty_command");
+    let project = h.project_path();
+
+    let config_dir = crate::harness::app_dir_in(h.home_path());
+    let config_content = format!(
+        r#"[updates]
+update_check_mode = "off"
+
+[app_state]
+has_seen_welcome = true
+last_seen_version = "{}"
+
+[session]
+custom_agents = {{ custom = "" }}
+"#,
+        env!("CARGO_PKG_VERSION")
+    );
+    std::fs::write(config_dir.join("config.toml"), config_content).expect("write config.toml");
+
+    let output = h.run_cli(&["add", project.to_str().unwrap(), "--tool", "custom"]);
+    assert!(
+        !output.status.success(),
+        "empty custom-agent command should fail"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("empty") && combined.contains("custom"),
+        "error should explain empty custom-agent command. Output:\n{}",
+        combined
+    );
+}
+
+#[test]
+#[serial]
+fn cli_add_custom_agent_rejects_invalid_detect_as_target() {
+    let h = TuiTestHarness::new("cli_add_custom_agent_bad_detect_as");
+    let project = h.project_path();
+
+    let config_dir = crate::harness::app_dir_in(h.home_path());
+    let config_content = format!(
+        r#"[updates]
+update_check_mode = "off"
+
+[app_state]
+has_seen_welcome = true
+last_seen_version = "{}"
+
+[session]
+custom_agents = {{ custom = "bash -lc true" }}
+agent_detect_as = {{ custom = "not-a-built-in" }}
+"#,
+        env!("CARGO_PKG_VERSION")
+    );
+    std::fs::write(config_dir.join("config.toml"), config_content).expect("write config.toml");
+
+    let output = h.run_cli(&["add", project.to_str().unwrap(), "--tool", "custom"]);
+    assert!(
+        !output.status.success(),
+        "invalid detect_as target should fail"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("agent_detect_as") && combined.contains("not-a-built-in"),
+        "error should explain invalid detect_as mapping. Output:\n{}",
+        combined
+    );
+}
+
+#[test]
+#[serial]
+fn cli_add_custom_agent_allows_builtin_cmd_override() {
+    let h = TuiTestHarness::new("cli_add_builtin_tool_cmd_override");
+    let project = h.project_path();
+
+    let output = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--tool",
+        "claude",
+        "--cmd-override",
+        "custom-claude",
+        "-t",
+        "BuiltInOverride",
+    ]);
+    assert!(
+        output.status.success(),
+        "built-in --tool should allow --cmd-override:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let sessions = read_sessions_json(&h);
+    let session = &sessions[0];
+    assert_eq!(session["tool"].as_str().unwrap_or(""), "claude");
+    assert_eq!(session["command"].as_str().unwrap_or(""), "custom-claude");
+}
+
+#[test]
+#[serial]
+fn cli_add_custom_agent_tool_conflicts_with_cmd() {
+    let h = TuiTestHarness::new("cli_add_tool_cmd_conflict");
+    let project = h.project_path();
+
+    let output = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "--tool",
+        "custom",
+        "--cmd",
+        "claude",
+    ]);
+    assert!(!output.status.success(), "--tool and --cmd should conflict");
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("--tool") || combined.contains("--cmd"),
+        "conflict error should mention the conflicting flags. Output:\n{}",
+        combined
+    );
+}
+
 /// `aoe session capture` should return pane content or empty output for a stopped session.
 #[test]
 #[serial]
@@ -465,7 +770,7 @@ fn test_cli_session_capture_plain() {
 }
 
 /// Renaming a session via CLI should rename the tmux session, not kill it.
-/// Regression test for https://github.com/njbrake/agent-of-empires/issues/431
+/// Regression test for https://github.com/agent-of-empires/agent-of-empires/issues/431
 #[test]
 #[serial]
 fn test_cli_rename_preserves_tmux_session() {
@@ -651,7 +956,7 @@ fn test_cli_add_workspace_global_hook_fallback() {
     let config_dir = crate::harness::app_dir_in(h.home_path());
     let config_content = format!(
         r#"[updates]
-check_enabled = false
+update_check_mode = "off"
 
 [app_state]
 has_seen_welcome = true
@@ -693,5 +998,223 @@ on_create = ["touch {}"]
     assert!(
         hook_marker.exists(),
         "global hook marker file should exist, proving global on_create hooks ran as fallback"
+    );
+}
+
+/// #969: `aoe add -w <branch>` (without `-b`) should attach to an
+/// already-existing worktree for that branch instead of bailing
+/// because the computed path collides. Matches the TUI's
+/// "Attach to existing branch" behavior.
+#[test]
+#[serial]
+fn test_cli_add_attaches_to_existing_worktree() {
+    let h = TuiTestHarness::new("cli_attach_existing");
+    let project = h.home_path().join("attach-project");
+    init_git_repo(&project);
+
+    // Create a worktree for `feat/existing` via the first `aoe add`.
+    let first = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-w",
+        "feat/existing",
+        "-b",
+        "-t",
+        "FirstSession",
+    ]);
+    assert!(
+        first.status.success(),
+        "first aoe add failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    // Second `aoe add -w feat/existing` (no `-b`) should attach to the
+    // existing worktree, not bail.
+    let second = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-w",
+        "feat/existing",
+        "-t",
+        "SecondSession",
+    ]);
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        second.status.success(),
+        "second aoe add (attach) failed:\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("Attaching to existing worktree"),
+        "expected 'Attaching to existing worktree' in stdout; got:\n{}",
+        stdout
+    );
+
+    let json = read_sessions_json(&h);
+    let sessions = json.as_array().expect("sessions array");
+    let second_session = sessions
+        .iter()
+        .find(|s| s["title"].as_str() == Some("SecondSession"))
+        .expect("SecondSession should exist");
+    assert_eq!(
+        second_session["worktree_info"]["managed_by_aoe"], false,
+        "attached session should not own the worktree"
+    );
+    assert_eq!(
+        second_session["worktree_info"]["branch"].as_str(),
+        Some("feat/existing"),
+    );
+}
+
+#[test]
+#[serial]
+fn test_cli_add_scratch_provisions_dir() {
+    let h = TuiTestHarness::new("cli_add_scratch");
+
+    let add_output = h.run_cli(&["add", "--scratch", "-t", "QuickScratch"]);
+    assert!(
+        add_output.status.success(),
+        "aoe add --scratch failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&add_output.stdout),
+        String::from_utf8_lossy(&add_output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&add_output.stdout);
+    assert!(
+        stdout.contains("Scratch:") && stdout.contains("yes"),
+        "expected scratch yes summary line; got:\n{}",
+        stdout
+    );
+
+    let json = read_sessions_json(&h);
+    let sessions = json.as_array().expect("sessions array");
+    let session = sessions
+        .iter()
+        .find(|s| s["title"].as_str() == Some("QuickScratch"))
+        .expect("QuickScratch must exist");
+    assert_eq!(session["scratch"].as_bool(), Some(true));
+    let project_path = session["project_path"]
+        .as_str()
+        .expect("project_path must be a string");
+    let path = Path::new(project_path);
+    assert!(path.exists(), "scratch dir must exist: {}", project_path);
+    // Lives under <app_dir>/scratch/<id>/. The harness isolates app_dir
+    // under its own temp tree, so we assert the structural shape rather than
+    // a hard-coded location.
+    assert!(
+        path.parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("scratch"),
+        "scratch dir must sit under a `scratch/` parent: {}",
+        project_path
+    );
+
+    // Capture path before rm so we can assert cleanup.
+    let captured = path.to_path_buf();
+
+    let rm_output = h.run_cli(&["rm", "QuickScratch"]);
+    assert!(
+        rm_output.status.success(),
+        "aoe rm failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&rm_output.stdout),
+        String::from_utf8_lossy(&rm_output.stderr),
+    );
+    assert!(
+        !captured.exists(),
+        "scratch dir must be removed after aoe rm: {}",
+        captured.display(),
+    );
+}
+
+#[test]
+#[serial]
+fn test_cli_add_scratch_rejects_explicit_path() {
+    let h = TuiTestHarness::new("cli_add_scratch_path");
+    let project = h.project_path();
+
+    let output = h.run_cli(&["add", project.to_str().unwrap(), "--scratch"]);
+    assert!(
+        !output.status.success(),
+        "aoe add <path> --scratch must error"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Cannot specify a project path with --scratch"),
+        "unexpected error output:\n{}",
+        stderr,
+    );
+}
+
+#[test]
+#[serial]
+fn test_cli_rm_keep_scratch_leaves_dir_on_disk() {
+    let h = TuiTestHarness::new("cli_rm_keep_scratch");
+
+    let add_output = h.run_cli(&["add", "--scratch", "-t", "KeepMe"]);
+    assert!(add_output.status.success(), "aoe add --scratch failed");
+
+    let json = read_sessions_json(&h);
+    let session = json
+        .as_array()
+        .and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|s| s["title"].as_str() == Some("KeepMe"))
+        })
+        .expect("KeepMe session must exist");
+    let project_path = session["project_path"].as_str().expect("project_path");
+    let path = Path::new(project_path).to_path_buf();
+    assert!(path.exists(), "scratch dir must exist before rm");
+
+    let rm_output = h.run_cli(&["rm", "KeepMe", "--keep-scratch"]);
+    assert!(
+        rm_output.status.success(),
+        "aoe rm --keep-scratch failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&rm_output.stdout),
+        String::from_utf8_lossy(&rm_output.stderr),
+    );
+    assert!(
+        path.exists(),
+        "scratch dir must survive when --keep-scratch is passed: {}",
+        path.display(),
+    );
+
+    // The session record itself is gone.
+    let json_after = read_sessions_json(&h);
+    let still_there = json_after.as_array().and_then(|sessions| {
+        sessions
+            .iter()
+            .find(|s| s["title"].as_str() == Some("KeepMe"))
+    });
+    assert!(
+        still_there.is_none(),
+        "session record must be removed even with --keep-scratch"
+    );
+
+    // Clean up the leftover dir so re-runs of this test don't accumulate
+    // entries under the user's scratch root.
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+#[serial]
+fn test_cli_add_scratch_conflicts_with_worktree_flag() {
+    let h = TuiTestHarness::new("cli_add_scratch_worktree");
+
+    let output = h.run_cli(&["add", "--scratch", "-w", "feat/x"]);
+    assert!(
+        !output.status.success(),
+        "aoe add --scratch -w must error at clap layer"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // clap's mutex error wording mentions one of the two flag names.
+    assert!(
+        stderr.contains("--scratch")
+            || stderr.contains("--worktree")
+            || stderr.contains("cannot be used"),
+        "unexpected error output:\n{}",
+        stderr,
     );
 }

@@ -364,14 +364,13 @@ impl EventStore {
             .optional()
             .ok()
             .flatten();
-        let Some(json) = json else {
-            trace!(
-                target: "cockpit.event_store",
-                session = %session_id,
-                "latest_pending_wakeup: no WakeupScheduled row"
-            );
-            return None;
-        };
+        // No log for the "no row" branch. The web UI polls /api/sessions
+        // every ~2-3s and fans this query out per cockpit session; every
+        // idle session would land here on every poll. The "still pending"
+        // and "treated as fired" branches below stay at trace because
+        // those carry the wake `at` timestamp, which is the only
+        // diagnostic value of this function.
+        let json = json?;
         let event: Event = match serde_json::from_str(&json) {
             Ok(e) => e,
             Err(e) => {
@@ -831,17 +830,23 @@ fn event_kind(event: &Event) -> &'static str {
         Event::ModeChanged { .. } => "mode_changed",
         Event::ModesAvailable { .. } => "modes_available",
         Event::CurrentModeChanged { .. } => "current_mode_changed",
+        Event::ModeSwitchFailed { .. } => "mode_switch_failed",
         Event::AvailableCommandsUpdated { .. } => "available_commands_updated",
+        Event::ConfigOptionsUpdated { .. } => "config_options_updated",
+        Event::ConfigOptionSwitchFailed { .. } => "config_option_switch_failed",
         Event::RawAgentUpdate { .. } => "raw_agent_update",
         Event::AgentMessageChunk { .. } => "agent_message_chunk",
         Event::Stopped { .. } => "stopped",
         Event::AgentStartupError { .. } => "agent_startup_error",
+        Event::IncompatibleAgent { .. } => "incompatible_agent",
         Event::UserPromptSent { .. } => "user_prompt_sent",
         Event::AcpSessionAssigned { .. } => "acp_session_assigned",
         Event::SessionContextReset { .. } => "session_context_reset",
         Event::SessionCleared => "session_cleared",
         Event::ConversationCompacted => "conversation_compacted",
         Event::WakeupScheduled { .. } => "wakeup_scheduled",
+        Event::PromptRejected { .. } => "prompt_rejected",
+        Event::AgentSwitched { .. } => "agent_switched",
     }
 }
 
@@ -1502,6 +1507,7 @@ mod tests {
             args_preview: "ls".into(),
             started_at: Utc::now(),
             parent_tool_call_id: None,
+            memory_recall: None,
         };
         let nonce_a = Nonce("aaaa".into());
         let nonce_b = Nonce("bbbb".into());

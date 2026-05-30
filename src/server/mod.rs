@@ -27,7 +27,8 @@ use axum::Router;
 use rust_embed::Embed;
 use serde::Serialize;
 use tokio::sync::{broadcast, RwLock};
-use tracing::info;
+use tokio_util::sync::CancellationToken;
+use tracing::{info, Instrument};
 
 use self::push::{PushState, StatusChange, STATUS_CHANNEL_CAPACITY};
 
@@ -70,6 +71,7 @@ struct TokenState {
     previous: Option<String>,
     grace_expires: Option<tokio::time::Instant>,
     lifetime: Duration,
+    grace: Duration,
 }
 
 /// Manages auth tokens with rotation and grace periods.
@@ -77,14 +79,21 @@ pub struct TokenManager {
     state: RwLock<TokenState>,
 }
 
+const DEFAULT_TOKEN_GRACE: Duration = Duration::from_secs(300);
+
 impl TokenManager {
     pub fn new(initial_token: Option<String>, lifetime: Duration) -> Self {
+        Self::with_grace(initial_token, lifetime, DEFAULT_TOKEN_GRACE)
+    }
+
+    pub fn with_grace(initial_token: Option<String>, lifetime: Duration, grace: Duration) -> Self {
         Self {
             state: RwLock::new(TokenState {
                 current: initial_token,
                 previous: None,
                 grace_expires: None,
                 lifetime,
+                grace,
             }),
         }
     }
@@ -140,10 +149,11 @@ impl TokenManager {
     pub async fn rotate(&self) {
         let mut state = self.state.write().await;
         let new_token = generate_token();
+        let grace = state.grace;
 
         state.previous = state.current.take();
         state.current = Some(new_token.clone());
-        state.grace_expires = Some(tokio::time::Instant::now() + Duration::from_secs(300));
+        state.grace_expires = Some(tokio::time::Instant::now() + grace);
 
         // Persist to disk
         if let Ok(app_dir) = crate::session::get_app_dir() {
@@ -152,22 +162,28 @@ impl TokenManager {
 
         info!(
             target: "auth.token",
-            grace_secs = 300,
+            grace_secs = grace.as_secs(),
             "auth token rotated"
         );
     }
 
-    /// Spawn a background rotation task (only in remote mode).
+    /// Spawn a background rotation task. Production paths only call this
+    /// from the `--remote` branch; debug builds also call it when the
+    /// `AOE_TEST_TOKEN_LIFETIME_SECS` env override is set, so live e2e
+    /// specs can observe the grace window without waiting hours.
     pub fn spawn_rotation_task(self: &Arc<Self>) {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             loop {
-                let lifetime = manager.state.read().await.lifetime;
+                let (lifetime, grace) = {
+                    let state = manager.state.read().await;
+                    (state.lifetime, state.grace)
+                };
                 tokio::time::sleep(lifetime).await;
                 manager.rotate().await;
 
                 // After grace period, clear previous
-                tokio::time::sleep(Duration::from_secs(300)).await;
+                tokio::time::sleep(grace).await;
                 {
                     let mut state = manager.state.write().await;
                     state.previous = None;
@@ -176,6 +192,38 @@ impl TokenManager {
             }
         });
     }
+}
+
+/// Read `AOE_TEST_TOKEN_LIFETIME_SECS`. Debug builds only; ignored in
+/// release so production cannot be forced into a short rotation cycle
+/// by a stray env var.
+#[cfg(debug_assertions)]
+fn test_token_lifetime_override() -> Option<Duration> {
+    std::env::var("AOE_TEST_TOKEN_LIFETIME_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map(Duration::from_secs)
+}
+
+#[cfg(not(debug_assertions))]
+fn test_token_lifetime_override() -> Option<Duration> {
+    None
+}
+
+/// Read `AOE_TEST_TOKEN_GRACE_SECS`. Debug builds only.
+#[cfg(debug_assertions)]
+fn test_token_grace_override() -> Option<Duration> {
+    std::env::var("AOE_TEST_TOKEN_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map(Duration::from_secs)
+}
+
+#[cfg(not(debug_assertions))]
+fn test_token_grace_override() -> Option<Duration> {
+    None
 }
 
 // ── AppState ────────────────────────────────────────────────────────────────
@@ -210,6 +258,15 @@ pub struct AppState {
     /// first use and live for the lifetime of the process — there are only
     /// as many as the user has sessions.
     pub instance_locks: RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Suppression set for the startup-recovery cascade. While an entry is
+    /// present and younger than `recovery::RECENTLY_RESTARTED_TTL`, the
+    /// `status_poll_loop` skips `update_status_with_metadata` for that
+    /// instance and surfaces `Status::Starting` instead. Without this,
+    /// `last_start_time` (which is `#[serde(skip)]`) is lost on the loop's
+    /// `load_all_instances` reload, and a freshly-recovered session
+    /// transitions to `Status::Error` for up to 8 seconds while the agent
+    /// is still settling. Periodically GC'd by a background task.
+    pub recently_restarted: crate::session::recovery::RecentlyRestarted,
     /// Cached per-profile cleanup defaults for the delete dialog, with a
     /// timestamp so we re-resolve after config changes (see
     /// `CLEANUP_DEFAULTS_TTL`).
@@ -282,6 +339,12 @@ pub struct AppState {
     /// burst'ünü Linear/Sentry rate limit'inden korur.
     #[cfg(feature = "serve")]
     pub widget_cache: Arc<crate::server::api::WidgetCache>,
+    /// Resolved when the daemon receives SIGINT/SIGTERM/SIGHUP. Long-lived
+    /// handlers (cockpit WS, terminal WS) clone this and `select!` on
+    /// `cancelled()` so they exit promptly instead of holding axum's
+    /// graceful drain open until the browser tab decides to disconnect.
+    /// See #1198.
+    pub shutdown: CancellationToken,
 }
 
 impl AppState {
@@ -351,7 +414,7 @@ fn raise_fd_limit() {
             let target = TARGET.min(hard).max(soft);
             if target > soft {
                 if let Err(e) = setrlimit(Resource::RLIMIT_NOFILE, target, hard) {
-                    tracing::warn!("Failed to raise RLIMIT_NOFILE to {}: {}", target, e);
+                    tracing::warn!(target: "http.middleware", "Failed to raise RLIMIT_NOFILE to {}: {}", target, e);
                 } else {
                     info!(
                         "Raised RLIMIT_NOFILE soft limit from {} to {}",
@@ -360,7 +423,7 @@ fn raise_fd_limit() {
                 }
             }
         }
-        Err(e) => tracing::warn!("Failed to read RLIMIT_NOFILE: {}", e),
+        Err(e) => tracing::warn!(target: "http.middleware", "Failed to read RLIMIT_NOFILE: {}", e),
     }
 }
 
@@ -379,6 +442,11 @@ pub struct ServerConfig<'a> {
     pub no_tailscale: bool,
     pub is_daemon: bool,
     pub passphrase: Option<&'a str>,
+    /// True when the server sits behind an external reverse proxy
+    /// that terminates TLS. Forces cookies to `; Secure` and trusts
+    /// `X-Forwarded-For` / `cf-connecting-ip` from loopback peers,
+    /// same surface as `remote`, without spawning a tunnel.
+    pub behind_proxy: bool,
     pub open_browser: bool,
 }
 
@@ -395,6 +463,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         no_tailscale,
         is_daemon,
         passphrase,
+        behind_proxy,
         open_browser,
     } = config;
 
@@ -413,13 +482,20 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         Some(load_or_generate_token().await?)
     };
 
-    let token_lifetime = if remote {
-        Duration::from_secs(4 * 60 * 60) // 4 hours
-    } else {
-        Duration::from_secs(24 * 60 * 60) // 24 hours (existing behavior)
-    };
+    let token_lifetime = test_token_lifetime_override().unwrap_or_else(|| {
+        if remote {
+            Duration::from_secs(4 * 60 * 60) // 4 hours
+        } else {
+            Duration::from_secs(24 * 60 * 60) // 24 hours (existing behavior)
+        }
+    });
+    let token_grace = test_token_grace_override().unwrap_or(DEFAULT_TOKEN_GRACE);
 
-    let token_manager = Arc::new(TokenManager::new(auth_token.clone(), token_lifetime));
+    let token_manager = Arc::new(TokenManager::with_grace(
+        auth_token.clone(),
+        token_lifetime,
+        token_grace,
+    ));
     let login_manager = Arc::new(login::LoginManager::new(passphrase));
     let rate_limiter = Arc::new(RateLimiter::new());
 
@@ -445,7 +521,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             Ok(dir) => match PushState::init(&dir) {
                 Ok(s) => Some(Arc::new(s)),
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::warn!(target: "http.middleware",
                         "Push notifications disabled: failed to init VAPID/state: {}",
                         e
                     );
@@ -453,7 +529,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                 }
             },
             Err(e) => {
-                tracing::warn!("Push notifications disabled: app_dir unavailable: {}", e);
+                tracing::warn!(target: "http.middleware", "Push notifications disabled: app_dir unavailable: {}", e);
                 None
             }
         }
@@ -481,36 +557,12 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     };
     #[cfg(feature = "serve")]
     let cockpit_supervisor = {
-        let push_for_sink = push_state.clone();
-        let push_enabled_for_sink = push_enabled;
-        let on_approval =
-            std::sync::Arc::new(move |session_id: &str, title: &str, destructive: bool| {
-                let session_id = session_id.to_string();
-                let title = title.to_string();
-                let push = push_for_sink.clone();
-                tokio::spawn(async move {
-                    if let Some(_push) = push {
-                        if push_enabled_for_sink {
-                            // We re-enter the cockpit_ws helper when we have
-                            // an AppState in scope; the standalone trigger
-                            // here just logs intent. The full server-driven
-                            // path lives at cockpit_ws::trigger_approval_push,
-                            // invoked from the API handler that receives
-                            // the cockpit broadcast.
-                            tracing::debug!(
-                                target: "cockpit.supervisor",
-                                session = %session_id,
-                                title = %title,
-                                destructive,
-                                "approval event observed (push delivery handled via api layer)"
-                            );
-                        }
-                    }
-                });
-            }) as std::sync::Arc<dyn Fn(&str, &str, bool) + Send + Sync>;
+        // Approval pushes are dispatched from `cockpit_event_listener`,
+        // which subscribes to the broadcast that ChannelSink::publish
+        // feeds and has `Arc<AppState>` in scope without a closure
+        // dance through the supervisor. See #1038.
         let sink = std::sync::Arc::new(crate::cockpit::supervisor::ChannelSink {
             tx: cockpit_events_tx.clone(),
-            on_approval,
             event_store: cockpit_event_store.clone(),
         });
         let supervisor =
@@ -535,8 +587,9 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         login_manager: Arc::clone(&login_manager),
         rate_limiter: Arc::clone(&rate_limiter),
         devices: RwLock::new(Vec::new()),
-        behind_tunnel: remote,
+        behind_tunnel: remote || behind_proxy,
         instance_locks: RwLock::new(std::collections::HashMap::new()),
+        recently_restarted: crate::session::recovery::new_recently_restarted(),
         cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
             // Seed with an already-stale timestamp so the first request
             // forces a fresh resolve instead of handing out an empty map.
@@ -561,6 +614,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         last_web_activity: std::sync::atomic::AtomicI64::new(0),
         #[cfg(feature = "serve")]
         widget_cache: Arc::new(crate::server::api::WidgetCache::new()),
+        shutdown: CancellationToken::new(),
     });
 
     let app = build_router(state.clone());
@@ -587,7 +641,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // The probe itself also logs details about each underlying call.
     let tailscale_ok = if remote && !no_tailscale {
         let available = tunnel::tailscale_available().await;
-        tracing::debug!(
+        tracing::debug!(target: "http.middleware",
             no_tailscale,
             tailscale_available = available,
             "tunnel: choosing transport"
@@ -595,7 +649,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         available
     } else {
         if remote && no_tailscale {
-            tracing::debug!("tunnel: --no-tailscale set, skipping Tailscale auto-detection");
+            tracing::debug!(target: "http.middleware", "tunnel: --no-tailscale set, skipping Tailscale auto-detection");
         }
         false
     };
@@ -675,7 +729,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             // "tailscale" for Tailscale Funnel, "local" for local-only.
             let mode = format!("{}\n", handle.mode_label());
             if let Err(e) = tokio::fs::write(app_dir.join("serve.mode"), mode).await {
-                tracing::debug!("Failed to write serve.mode: {e}");
+                tracing::debug!(target: "http.middleware", "Failed to write serve.mode: {e}");
             }
         }
 
@@ -742,7 +796,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             }
             write_secret_file(&app_dir.join("serve.url"), &contents).await;
             if let Err(e) = tokio::fs::write(app_dir.join("serve.mode"), "local\n").await {
-                tracing::debug!("Failed to write serve.mode: {e}");
+                tracing::debug!(target: "http.middleware", "Failed to write serve.mode: {e}");
             }
         }
 
@@ -757,11 +811,60 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // lifecycle event arrives. See #1103.
     seed_cockpit_statuses(state.clone()).await;
 
+    // Two-phase startup recovery. Phase A runs synchronously (acquire
+    // lock, snapshot candidates, mark them in `recently_restarted`) so
+    // that the marks are in place before `status_poll_loop` is spawned
+    // and its first tick fires; otherwise the first poll could observe
+    // missing tmux state and broadcast a phantom Idle->Error transition.
+    // Phase B (the cascade workers) runs in a spawned task and holds
+    // the lock until done.
+    let recovery_inputs = daemon_startup_recovery_mark(state.clone()).await;
+
+    // GC the recently_restarted suppression map periodically; the TTL
+    // check on read filters but does not remove entries. Without this,
+    // a long-running daemon's map grows unbounded.
+    {
+        let gc_map = state.recently_restarted.clone();
+        let shutdown = state.shutdown.clone();
+        crate::task_util::spawn_supervised(
+            "server.gc.recently_restarted",
+            crate::task_util::PanicPolicy::Log,
+            async move {
+                let mut interval =
+                    tokio::time::interval(crate::session::recovery::RECENTLY_RESTARTED_GC_INTERVAL);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            crate::session::recovery::gc_recently_restarted(&gc_map);
+                        }
+                        _ = shutdown.cancelled() => break,
+                    }
+                }
+            },
+        );
+    }
+
+    if let Some((lock, candidates)) = recovery_inputs {
+        let cascade_state = state.clone();
+        crate::task_util::spawn_supervised(
+            "server.startup_recovery_cascade",
+            crate::task_util::PanicPolicy::Log,
+            async move {
+                daemon_startup_recovery_cascade(cascade_state, lock, candidates).await;
+            },
+        );
+    }
+
     // Spawn background tasks
     let poll_state = state.clone();
-    tokio::spawn(async move {
-        status_poll_loop(poll_state).await;
-    });
+    crate::task_util::spawn_supervised(
+        "server.status_poll_loop",
+        crate::task_util::PanicPolicy::Log,
+        async move {
+            status_poll_loop(poll_state).await;
+        },
+    );
 
     // Cockpit broadcast listener: a single subscriber that handles
     // every in-process consumer of cockpit events. Status mirroring
@@ -772,9 +875,13 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // matter to both (e.g. AcpSessionAssigned).
     {
         let listener_state = state.clone();
-        tokio::spawn(async move {
-            cockpit_event_listener(listener_state).await;
-        });
+        crate::task_util::spawn_supervised(
+            "server.cockpit_event_listener",
+            crate::task_util::PanicPolicy::Log,
+            async move {
+                cockpit_event_listener(listener_state).await;
+            },
+        );
     }
 
     // Push-notification consumer: subscribes to status_tx, applies
@@ -783,8 +890,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     push::spawn_consumer(state.clone());
     avk_push_listener::spawn(state.clone());
 
-    rate_limiter.spawn_cleanup_task();
-    login_manager.spawn_cleanup_task();
+    rate_limiter.spawn_cleanup_task(state.shutdown.clone());
+    login_manager.spawn_cleanup_task(state.shutdown.clone());
 
     if remote {
         // Inline the rotation loop here rather than calling
@@ -793,6 +900,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         // rotation. Behavior otherwise matches the original: wait one
         // lifetime, rotate, wait 300s grace, clear previous.
         let rot_state = state.clone();
+        let rot_shutdown = state.shutdown.clone();
         // The tunnel URL is stable across the daemon's lifetime (Tailscale
         // and named CF tunnels are stable; quick CF rotates only on
         // restart, which is outside this task's scope). Capture once so
@@ -801,7 +909,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         tokio::spawn(async move {
             loop {
                 let lifetime = rot_state.token_manager.lifetime_secs().await;
-                tokio::time::sleep(std::time::Duration::from_secs(lifetime)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(lifetime)) => {}
+                    _ = rot_shutdown.cancelled() => break,
+                }
 
                 // Capture the hashes of the current and (about-to-be)
                 // previous tokens BEFORE rotating, so we know which
@@ -841,18 +952,23 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                     }
                     match push.store.retain_owners(&valid_hashes).await {
                         Ok(0) => {}
-                        Ok(n) => tracing::info!(
+                        Ok(n) => tracing::info!(target: "http.middleware",
                             removed = n,
                             "push: dropped subscriptions whose owner-hash is no longer valid after rotation"
                         ),
-                        Err(e) => tracing::warn!(error = %e, "push: retain_owners failed"),
+                        Err(e) => {
+                            tracing::warn!(target: "http.middleware", error = %e, "push: retain_owners failed")
+                        }
                     }
                 }
 
                 // After grace period, the previous token becomes invalid.
                 // Clear it AND drop any subscriptions that were bound
                 // only to the old hash (retain_owners with only the new).
-                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {}
+                    _ = rot_shutdown.cancelled() => break,
+                }
                 // Clear previous token inside TokenManager. Reuse its
                 // internal state access via a tiny helper on the manager.
                 rot_state.token_manager.clear_previous().await;
@@ -869,12 +985,38 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                 }
             }
         });
+    } else if test_token_lifetime_override().is_some() && auth_token.is_some() {
+        // Debug-build test path: live Playwright specs set
+        // AOE_TEST_TOKEN_LIFETIME_SECS (and optionally AOE_TEST_TOKEN_GRACE_SECS)
+        // so they can observe the rotation grace window without waiting hours.
+        // Skips the remote-only serve.url rewrite and push retain steps because
+        // neither exists in the local test setup.
+        token_manager.spawn_rotation_task();
     }
 
     // Graceful shutdown: SIGINT (Ctrl-C), SIGTERM (`aoe serve --stop`),
     // and SIGHUP (parent session died). Without these, the default handler
     // kills the process immediately, skipping PID/URL file cleanup.
-    let shutdown_signal = async {
+    //
+    // After the signal fires the future:
+    //   1. Cancels `state.shutdown` so long-lived WS handlers (cockpit +
+    //      terminal) wake from their `select!` and close cleanly,
+    //      letting `axum::serve` return promptly instead of blocking
+    //      on the open WebSockets the browser hasn't disconnected.
+    //   2. Spawns a 5s deadline as the safety net: if any handler
+    //      somehow ignores the cancel, the process force-exits so
+    //      `Ctrl-C` and `aoe serve --stop` never hang. See #1198.
+    //
+    // Note: this future is awaited by `with_graceful_shutdown`, which
+    // signals axum to stop accepting new connections once the future
+    // resolves. Wrapping `axum::serve(...).await` itself in a
+    // `tokio::time::timeout` would cap TOTAL server lifetime instead
+    // of just the post-signal drain, which is wrong (the server would
+    // exit after 5s of normal uptime). The deadline lives inside the
+    // signal handler so the clock only starts after the signal fires.
+    const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+    let shutdown_state = state.clone();
+    let shutdown_signal = async move {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{signal, SignalKind};
@@ -882,21 +1024,38 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             let mut sighup = signal(SignalKind::hangup()).ok();
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
-                    info!("Received SIGINT, shutting down...");
+                    tracing::info!(target: "serve.shutdown", signal = "SIGINT", "received signal, shutting down");
                 }
                 _ = async { match sigterm { Some(ref mut s) => { s.recv().await; } None => std::future::pending().await } } => {
-                    info!("Received SIGTERM, shutting down...");
+                    tracing::info!(target: "serve.shutdown", signal = "SIGTERM", "received signal, shutting down");
                 }
                 _ = async { match sighup { Some(ref mut s) => { s.recv().await; } None => std::future::pending().await } } => {
-                    info!("Received SIGHUP, shutting down...");
+                    tracing::info!(target: "serve.shutdown", signal = "SIGHUP", "received signal, shutting down");
                 }
             }
         }
         #[cfg(not(unix))]
         {
             let _ = tokio::signal::ctrl_c().await;
-            info!("Shutting down...");
+            tracing::info!(target: "serve.shutdown", "received ctrl-c, shutting down");
         }
+        shutdown_state.shutdown.cancel();
+        tokio::spawn(async {
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+            tracing::warn!(
+                target: "shutdown",
+                grace_secs = SHUTDOWN_GRACE.as_secs(),
+                "graceful shutdown exceeded grace window, forcing exit"
+            );
+            // Force-exit skips the post-`axum::serve` cleanup block below
+            // (cockpit detach, tunnel SIGTERM of cloudflared, removal of
+            // serve.passphrase). The PID file is swept by `daemon_pid`'s
+            // stale-PID check on the next start, but a leftover cloudflared
+            // subprocess and residual passphrase file may survive a forced
+            // exit. The common path (handlers honor cancel) returns from
+            // `axum::serve` normally and runs the full cleanup.
+            std::process::exit(0);
+        });
     };
 
     axum::serve(
@@ -926,13 +1085,17 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 }
 
 fn build_router(state: Arc<AppState>) -> Router {
-    use axum::routing::{delete, get, patch, post};
+    use axum::routing::{delete, get, patch, post, put};
 
     let app = Router::new()
         // Sessions
         .route(
             "/api/sessions",
             get(api::list_sessions).post(api::create_session),
+        )
+        .route(
+            "/api/workspace-ordering",
+            put(api::update_workspace_ordering),
         )
         .route(
             "/api/sessions/{id}",
@@ -949,6 +1112,19 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/sessions/{id}/notifications",
             patch(api::update_session_notifications),
+        )
+        .route(
+            "/api/sessions/{id}/diff-base",
+            patch(api::update_session_diff_base),
+        )
+        .route("/api/sessions/{id}/pin", patch(api::update_session_pin))
+        .route(
+            "/api/sessions/{id}/archive",
+            patch(api::update_session_archive),
+        )
+        .route(
+            "/api/sessions/{id}/snooze",
+            patch(api::update_session_snooze),
         )
         .route("/api/sessions/{id}/terminal", post(api::ensure_terminal))
         .route(
@@ -1019,7 +1195,10 @@ fn build_router(state: Arc<AppState>) -> Router {
             get(api::get_settings).patch(api::update_settings),
         )
         .route("/api/themes", get(api::list_themes))
+        .route("/api/themes/{name}", get(api::get_resolved_theme))
+        .route("/api/theme/current", get(api::get_current_theme))
         .route("/api/sounds", get(api::list_sounds))
+        .route("/api/sounds/file/{name}", get(api::serve_sound_file))
         // FUR-3957 transplant — avk-suite custom widgets (5 endpoint).
         // Contract: docs/aoe-transplant/02-widget-api-contract.md (Code-1 dondurucu).
         .route("/api/widgets/linear/summary", get(api::get_linear_summary))
@@ -1044,6 +1223,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/push/test", post(push::test))
         // Login (second-factor auth)
         .route("/api/login", post(login::login_handler))
+        .route("/api/login/elevate", post(login::elevate_handler))
         .route("/api/logout", post(login::logout_handler))
         .route("/api/login/status", get(login::login_status_handler))
         // Devices
@@ -1071,6 +1251,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/cockpit/spawn", post(api::spawn_cockpit))
         .route("/api/sessions/{id}/cockpit", delete(api::shutdown_cockpit))
         .route(
+            "/api/sessions/{id}/cockpit/switch-agent",
+            post(api::switch_cockpit_agent),
+        )
+        .route(
             "/api/sessions/{id}/cockpit/prompt",
             post(api::cockpit_prompt),
         )
@@ -1096,6 +1280,10 @@ fn build_router(state: Arc<AppState>) -> Router {
             post(api::cockpit_set_mode),
         )
         .route(
+            "/api/sessions/{id}/cockpit/config-option",
+            post(api::cockpit_set_config_option),
+        )
+        .route(
             "/api/sessions/{id}/cockpit/enable",
             post(api::cockpit_enable),
         )
@@ -1107,7 +1295,8 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/cockpit/approvals/{nonce}",
             post(api::resolve_approval),
         )
-        .route("/api/cockpit/master", patch(api::set_cockpit_master));
+        .route("/api/cockpit/master", patch(api::set_cockpit_master))
+        .route("/api/cockpit/agents", get(api::list_cockpit_agents));
 
     app
         // Static assets (Vite build output: assets/, manifest.json, sw.js, icons)
@@ -1123,18 +1312,74 @@ fn build_router(state: Arc<AppState>) -> Router {
             auth::auth_middleware,
         ))
         .layer(axum::middleware::from_fn(security_headers))
+        .layer(axum::middleware::from_fn(http_request_span))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
         .with_state(state)
+}
+
+/// Middleware that wraps every request in an `http.request` span with a
+/// generated or echoed `X-Request-Id`, then emits one completion event at
+/// the level matching the response status. Logs fired inside the request
+/// (auth middleware, route handlers, downstream `tracing` events) inherit
+/// the span fields, so a single grep on `request_id` reconstructs the call.
+///
+/// Successful completions (2xx/3xx) emit at `debug`, not `info`: the web
+/// UI polls `/api/sessions` every ~2s, so an info-level success log here
+/// would flood `debug.log` at the default `info` filter. Users who want
+/// to see every request can dial `http.request=debug` from settings;
+/// 4xx (`warn`) and 5xx (`error`) stay visible at the default level.
+async fn http_request_span(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let rid = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let span = tracing::debug_span!(
+        target: "http.request",
+        "http_request",
+        request_id = %rid,
+        method = %method,
+        path = %path,
+    );
+    let start = std::time::Instant::now();
+    let mut response = next.run(request).instrument(span.clone()).await;
+    let latency_ms = start.elapsed().as_millis() as u64;
+    let status = response.status().as_u16();
+    span.in_scope(|| {
+        if status >= 500 {
+            tracing::error!(target: "http.request", status, latency_ms, "completed");
+        } else if status >= 400 {
+            tracing::warn!(target: "http.request", status, latency_ms, "completed");
+        } else {
+            tracing::debug!(target: "http.request", status, latency_ms, "completed");
+        }
+    });
+    if let Ok(value) = rid.parse() {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
 }
 
 /// Content-Security-Policy for the dashboard.
 ///
 /// - `default-src 'self'`: deny everything we don't explicitly allow.
-/// - `script-src 'self' 'wasm-unsafe-eval'`: wterm compiles WebAssembly;
-///   the `wasm-unsafe-eval` source is the CSP3 opt-in for WASM compilation.
+/// - `script-src 'self' 'wasm-unsafe-eval'`: scripts are bundled by
+///   Vite from the same origin; no inline scripts, no `eval`. The
+///   `'wasm-unsafe-eval'` source is the CSP3 opt-in for WebAssembly
+///   compilation; Shiki's Oniguruma regex engine ships as WASM, so
+///   the diff syntax highlighter falls over without it (PR #1275
+///   dropped this when wterm was replaced with xterm.js on the
+///   incorrect premise that nothing else still needed WASM).
 /// - `style-src 'self' 'unsafe-inline'`: React writes to element.style at
-///   runtime (terminal theme vars, font-size updates) and Tailwind v4 emits
-///   inline `<style>` blocks in dev. Blocking inline styles breaks wterm.
+///   runtime (terminal font-size updates) and Tailwind v4 emits inline
+///   `<style>` blocks in dev. Blocking inline styles breaks xterm.js's
+///   rendered viewport.
 /// - `img-src 'self' data: https://github.com https://avatars.githubusercontent.com`:
 ///   repo-owner avatars are loaded from `github.com/{user}.png` which 302s
 ///   to `avatars.githubusercontent.com`; CSP checks both URLs across the
@@ -1205,20 +1450,20 @@ async fn serve_public_file(uri: axum::http::Uri) -> impl axum::response::IntoRes
 /// Failures are logged but never propagate; the server keeps running.
 fn maybe_open_browser(url: &str) {
     if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
-        tracing::info!("--open ignored: running over SSH");
+        tracing::info!(target: "http.middleware", "--open ignored: running over SSH");
         return;
     }
 
     #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
     {
         if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
-            tracing::info!("--open ignored: no DISPLAY or WAYLAND_DISPLAY set");
+            tracing::info!(target: "http.middleware", "--open ignored: no DISPLAY or WAYLAND_DISPLAY set");
             return;
         }
     }
 
     if let Err(e) = webbrowser::open(url) {
-        tracing::warn!("--open: failed to launch browser: {e}");
+        tracing::warn!(target: "http.middleware", "--open: failed to launch browser: {e}");
     }
 }
 
@@ -1383,18 +1628,22 @@ fn load_all_instances() -> anyhow::Result<Vec<Instance>> {
             }
         }
     }
-    // Also load from the default profile if it wasn't in the list
-    if !profiles.iter().any(|p| p == "default") {
-        if let Ok(storage) = Storage::new("default") {
-            if let Ok(mut instances) = storage.load() {
-                for inst in &mut instances {
-                    inst.source_profile = "default".to_string();
-                }
-                all.extend(instances);
-            }
-        }
-    }
     Ok(all)
+}
+
+/// Carry over the in-memory-only fields from the prior `state.instances`
+/// entry into the freshly-loaded one. These fields are `#[serde(skip)]`
+/// on `Instance` and would otherwise be reset to default every 2 s when
+/// `status_poll_loop` reloads from disk. Adding a new `#[serde(skip)]`
+/// field on `Instance` requires extending this function or the field is
+/// silently wiped on every poll tick.
+fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
+    fresh.last_error_check = prior.last_error_check;
+    fresh.last_start_time = prior.last_start_time;
+    fresh.last_error = prior.last_error;
+    fresh.session_id_poller = prior.session_id_poller;
+    fresh.retroactive_capture_excludes = prior.retroactive_capture_excludes;
+    fresh
 }
 
 /// Background task that periodically refreshes session statuses. On each
@@ -1418,14 +1667,32 @@ async fn status_poll_loop(state: Arc<AppState>) {
             instances.iter().map(|i| (i.id.clone(), i.status)).collect()
         };
 
-        // Run blocking tmux subprocess calls in a dedicated thread
+        // Run blocking tmux subprocess calls in a dedicated thread.
+        // Snapshot the suppression set BEFORE `batch_pane_metadata()` so
+        // a worker that unmarks between the scrape and the per-instance
+        // decision cannot combine "pane missing" metadata with a cleared
+        // mark and re-emit the phantom Error transition the suppression
+        // exists to prevent.
+        let suppressed_ids =
+            crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
         let updated = tokio::task::spawn_blocking(move || {
             let mut instances = load_all_instances().unwrap_or_default();
 
             crate::tmux::refresh_session_cache();
-            let pane_metadata = crate::tmux::batch_pane_metadata();
+            let pane_metadata = crate::tmux::batch_pane_metadata().unwrap_or_default();
 
             for inst in &mut instances {
+                if suppressed_ids.contains(&inst.id) {
+                    // Suppress the status update: a recovery cascade just
+                    // ran for this id, and `last_start_time` was lost on
+                    // the disk reload above. Surfacing `Status::Error`
+                    // ("tmux session is gone") here would broadcast a
+                    // phantom transition before the agent has finished
+                    // settling. The TTL window is sized to cover the
+                    // worst-case cascade + cold-start latency.
+                    inst.status = Status::Starting;
+                    continue;
+                }
                 let session_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
                 let metadata = pane_metadata.get(&session_name);
                 inst.update_status_with_metadata(metadata);
@@ -1478,15 +1745,10 @@ async fn status_poll_loop(state: Arc<AppState>) {
                 }
             }
 
-            // Emit transitions before swapping in the new snapshot so
-            // consumers see events in the same order regardless of when
-            // they read state.instances themselves.
             let now = chrono::Utc::now();
             for inst in &instances {
                 if let Some(old) = prev.get(&inst.id) {
                     if *old != inst.status {
-                        // send() errors only when there are no receivers;
-                        // that's fine, we emit best-effort.
                         let _ = state.status_tx.send(StatusChange {
                             instance_id: inst.id.clone(),
                             instance_title: inst.title.clone(),
@@ -1497,7 +1759,30 @@ async fn status_poll_loop(state: Arc<AppState>) {
                     }
                 }
             }
-            *state.instances.write().await = instances;
+            // Merge by id rather than blind-replace: preserves the
+            // in-memory-only `#[serde(skip)]` runtime state on Instance
+            // (last_error, last_start_time, last_error_check,
+            // session_id_poller, retroactive_capture_excludes) that the
+            // disk reload otherwise resets to default every 2 s.
+            // Additions on disk surface here; ids absent from disk are
+            // dropped, matching the prior wholesale-replace semantics
+            // for create/delete propagation.
+            {
+                let mut current = state.instances.write().await;
+                let mut by_id: std::collections::HashMap<String, Instance> = current
+                    .drain(..)
+                    .map(|inst| (inst.id.clone(), inst))
+                    .collect();
+                let mut merged = Vec::with_capacity(instances.len());
+                for fresh in instances {
+                    if let Some(prior) = by_id.remove(&fresh.id) {
+                        merged.push(merge_runtime_fields(prior, fresh));
+                    } else {
+                        merged.push(fresh);
+                    }
+                }
+                *current = merged;
+            }
 
             #[cfg(feature = "serve")]
             cockpit_reconciler::reconcile_cockpit_workers(&state, &mut attempted_cockpit_spawns)
@@ -1506,12 +1791,322 @@ async fn status_poll_loop(state: Arc<AppState>) {
     }
 }
 
-/// Single subscriber for the cockpit broadcast channel. Pattern-matches
-/// each event once and dispatches to the in-process consumers:
+/// Startup auto-recovery for AI agent sessions whose tmux pane is missing
+/// after a daemon restart or system reboot.
 ///
-/// - status mirroring (sidebar dot, push notifications)
-/// - ACP-session-id persistence (so `session/load` works across restart)
+/// Acquires the cross-process recovery lock; if another process holds it
+/// (TUI in standalone mode, or a peer daemon), this returns without doing
+/// anything. The lock is held for the entire pass so a late-starting peer
+/// cannot duplicate cascades.
 ///
+/// For each candidate:
+/// 1. Acquire the per-instance `instance_lock` (serialises against any
+///    `ensure_session` REST call that arrives concurrently).
+/// 2. Mark `recently_restarted` BEFORE the cascade so the
+///    `status_poll_loop` suppression window covers the entire ~7s
+///    worst-case latency.
+/// 3. Run `restart_with_size_opts(None, false)` via `spawn_blocking`.
+/// 4. Update `state.instances` in place with the post-cascade `Instance`.
+///
+/// Concurrency is capped at `recovery::STARTUP_RECOVERY_CONCURRENCY` to
+/// bound cold-start latency without thundering-herd-ing tmux at server
+/// warm-up.
+/// Phase A: acquire the cross-process lock, warm tmux, snapshot the
+/// candidate set, and pre-mark every candidate in `recently_restarted`.
+///
+/// Returning the marked candidates synchronously (before
+/// `status_poll_loop` is spawned) closes the first-tick race where the
+/// poller's immediate first iteration could observe missing tmux state
+/// and broadcast a phantom Idle->Error transition before any worker
+/// has had a chance to mark.
+///
+/// Uses `batch_pane_metadata()` instead of per-instance probes to keep
+/// the listener-bind path under ~20ms regardless of session count.
+async fn daemon_startup_recovery_mark(
+    state: Arc<AppState>,
+) -> Option<(
+    crate::session::recovery::RecoveryLock,
+    Vec<crate::session::Instance>,
+)> {
+    let lock = match crate::session::recovery::try_acquire_recovery_lock() {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            tracing::info!(
+                target: "session.startup_recovery",
+                "another process holds the recovery lock; skipping daemon startup recovery",
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "session.startup_recovery",
+                error = %e,
+                "failed to acquire recovery lock; skipping daemon startup recovery",
+            );
+            return None;
+        }
+    };
+
+    crate::session::recovery::warm_tmux_server();
+    crate::tmux::refresh_session_cache();
+    // On probe failure we cannot distinguish "all panes dead" from "tmux
+    // unreachable", and treating the latter as the former would trigger
+    // spurious recovery cascades that kill possibly-alive panes. Skip
+    // the entire pass on Err; the next daemon launch will retry.
+    let pane_meta = match crate::tmux::batch_pane_metadata() {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::warn!(
+                target: "session.startup_recovery",
+                error = %e,
+                "tmux probe failed at daemon startup; skipping recovery this launch",
+            );
+            return None;
+        }
+    };
+
+    let candidates: Vec<crate::session::Instance> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .filter(|i| {
+                let session_name = crate::tmux::Session::generate_name(&i.id, &i.title);
+                let has_live_tmux = pane_meta
+                    .get(&session_name)
+                    .map(|m| !m.pane_dead)
+                    .unwrap_or(false);
+                !has_live_tmux && crate::session::recovery::is_recovery_candidate(i)
+            })
+            .cloned()
+            .collect()
+    };
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    for inst in &candidates {
+        crate::session::recovery::mark_recently_restarted(&state.recently_restarted, &inst.id);
+    }
+
+    tracing::info!(
+        target: "session.startup_recovery",
+        count = candidates.len(),
+        "starting daemon recovery for missing tmux sessions",
+    );
+
+    Some((lock, candidates))
+}
+
+/// Phase B: drive the cascade workers for the pre-marked candidates.
+async fn daemon_startup_recovery_cascade(
+    state: Arc<AppState>,
+    lock: crate::session::recovery::RecoveryLock,
+    candidates: Vec<crate::session::Instance>,
+) {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(
+        crate::session::recovery::STARTUP_RECOVERY_CONCURRENCY,
+    ));
+    let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
+    for inst in candidates {
+        let permit_sem = semaphore.clone();
+        let inst_state = state.clone();
+        let id = inst.id.clone();
+        let lock_handle = inst_state.instance_lock(&id).await;
+        tasks.spawn(async move {
+            let _permit = permit_sem
+                .acquire_owned()
+                .await
+                .expect("recovery semaphore not closed");
+            let _guard = lock_handle.lock().await;
+
+            // Re-check both `is_recovery_candidate` AND tmux liveness after
+            // acquiring the lock: between the snapshot and this point a
+            // REST handler (e.g. ensure_session) could have toggled
+            // `cockpit_mode` OR brought the tmux pane back. Without the
+            // tmux re-check, recovery would `kill_clean` a freshly-started
+            // pane the user just attached to. The lock + this re-check
+            // serialise against any other AoE writer.
+            //
+            // Use the fallible `batch_pane_metadata()` here so a transient
+            // tmux probe failure does NOT collapse to "pane dead" and
+            // wrongly proceed with the cascade: skip + unmark instead.
+            // Mirrors Phase A's pattern at the mark site.
+            let pane_meta = match crate::tmux::batch_pane_metadata() {
+                Ok(map) => map,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "session.startup_recovery",
+                        instance_id = %id,
+                        error = %e,
+                        "tmux probe failed during recovery re-check; skipping cascade",
+                    );
+                    crate::session::recovery::unmark_recently_restarted(
+                        &inst_state.recently_restarted,
+                        &id,
+                    );
+                    return;
+                }
+            };
+            let still_candidate = {
+                let instances = inst_state.instances.read().await;
+                instances
+                    .iter()
+                    .find(|i| i.id == id)
+                    .map(|i| {
+                        let session_name = crate::tmux::Session::generate_name(&i.id, &i.title);
+                        let has_live_tmux = pane_meta
+                            .get(&session_name)
+                            .map(|m| !m.pane_dead)
+                            .unwrap_or(false);
+                        !has_live_tmux && crate::session::recovery::is_recovery_candidate(i)
+                    })
+                    .unwrap_or(false)
+            };
+            if !still_candidate {
+                // Phase A pre-marked this id; without unmarking, the
+                // status_poll_loop would suppress the real status for
+                // the full TTL even though we are not running a cascade.
+                crate::session::recovery::unmark_recently_restarted(
+                    &inst_state.recently_restarted,
+                    &id,
+                );
+                return;
+            }
+
+            // Phase A already marked this id, but re-mark now to refresh
+            // the timestamp so the suppression window covers the full
+            // cascade latency starting from this point rather than from
+            // the (possibly older) Phase A snapshot.
+            crate::session::recovery::mark_recently_restarted(&inst_state.recently_restarted, &id);
+
+            // Refresh the working snapshot from latest in-memory state.
+            // Between Phase A's snapshot and acquiring instance_lock, a
+            // serialised REST writer (ensure_session, set-session-id, etc.)
+            // could have mutated this instance. Without the refresh, the
+            // final `*slot = updated` would silently revert that writer's
+            // changes (e.g. a freshly-set agent_session_id).
+            let mut working = {
+                let instances = inst_state.instances.read().await;
+                instances
+                    .iter()
+                    .find(|i| i.id == id)
+                    .cloned()
+                    .unwrap_or(inst)
+            };
+            let title = working.title.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let res = crate::session::recovery::run_recovery_for_instance(&mut working);
+                (working, res)
+            })
+            .await;
+
+            match result {
+                Ok((updated, Ok(outcome))) => {
+                    tracing::info!(
+                        target: "session.startup_recovery",
+                        instance_id = %id,
+                        title = %title,
+                        ?outcome,
+                        "recovery completed",
+                    );
+                    let mut instances = inst_state.instances.write().await;
+                    if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
+                        *slot = updated;
+                    }
+                    drop(instances);
+                    // Release the suppression now that the cascade has
+                    // succeeded and the pane is alive. Without this, the
+                    // next `status_poll_loop` tick (within 2s) would force
+                    // `Status::Starting` for the rest of the TTL window,
+                    // broadcasting a phantom `Idle -> Starting` transition
+                    // followed by `Starting -> Idle/Running` at TTL expiry.
+                    // The suppression's purpose is to cover the in-cascade
+                    // window where `last_start_time` is lost on the disk
+                    // reload; once the cascade has finished the on-disk
+                    // status is current and the poll path resolves to the
+                    // correct status without help.
+                    crate::session::recovery::unmark_recently_restarted(
+                        &inst_state.recently_restarted,
+                        &id,
+                    );
+                }
+                Ok((mut updated, Err(e))) => {
+                    tracing::warn!(
+                        target: "session.startup_recovery",
+                        instance_id = %id,
+                        title = %title,
+                        error = %e,
+                        "recovery cascade failed",
+                    );
+                    // The cascade leaves last_error=None on every Err exit
+                    // (no failure path sets it) and self.status as either
+                    // `Status::Starting` (the common case: probe_settle
+                    // returned Dead, or Tier-2 failed after finalize_launch
+                    // ran at instance.rs:1403) or `Status::Idle` (rare:
+                    // kill_clean failed, or Tier-1 start_with_size_opts
+                    // failed before finalize_launch). In either case,
+                    // without an explicit Error transition the next
+                    // status_poll_loop tick falls through to
+                    // update_status_with_metadata and generates a generic
+                    // "tmux session is gone" message, hiding the
+                    // cascade-specific error.
+                    updated.status = crate::session::Status::Error;
+                    updated.last_error = Some(format!("recovery cascade: {}", e));
+                    // Stamp last_error_check so the in-memory error overlay
+                    // in status_poll_loop arms the 30s stickiness in
+                    // update_status_with_metadata_inner. Without this
+                    // (#[serde(skip)] would otherwise leave it None on the
+                    // next disk reload), the cascade-specific message is
+                    // overwritten by the generic "tmux session is gone" on
+                    // the very next poll tick.
+                    updated.last_error_check = Some(std::time::Instant::now());
+                    let mut instances = inst_state.instances.write().await;
+                    if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
+                        *slot = updated;
+                    }
+                    drop(instances);
+                    // Release the suppression so the next poll respects the
+                    // Error state instead of forcing Status::Starting for
+                    // the rest of the TTL window.
+                    crate::session::recovery::unmark_recently_restarted(
+                        &inst_state.recently_restarted,
+                        &id,
+                    );
+                }
+                Err(join_err) => {
+                    tracing::error!(
+                        target: "session.startup_recovery",
+                        instance_id = %id,
+                        title = %title,
+                        error = %join_err,
+                        "recovery worker panicked",
+                    );
+                    let mut instances = inst_state.instances.write().await;
+                    if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
+                        slot.status = crate::session::Status::Error;
+                        slot.last_error = Some(format!("recovery worker panicked: {}", join_err));
+                        // Same stickiness arming as the cascade-Err arm above.
+                        slot.last_error_check = Some(std::time::Instant::now());
+                    }
+                    drop(instances);
+                    // Same suppression release as above: without unmarking,
+                    // the next poll forces Status::Starting and wipes the
+                    // panic-specific last_error written above.
+                    crate::session::recovery::unmark_recently_restarted(
+                        &inst_state.recently_restarted,
+                        &id,
+                    );
+                }
+            }
+        });
+    }
+
+    while tasks.join_next().await.is_some() {}
+    drop(lock);
+}
+
 /// One task instead of two halves the broadcast clone count and locks
 /// `state.instances` once per event instead of twice for the events
 /// (e.g. `AcpSessionAssigned`) that both consumers care about.
@@ -1597,6 +2192,29 @@ async fn cockpit_event_listener(state: Arc<AppState>) {
             }
         }
 
+        // Approval push: when the worker emits an `ApprovalRequested`
+        // event, trigger a Web Push so the user sees a "needs approval"
+        // alert even when the dashboard is backgrounded. Unlike the
+        // status-change pushes in `push.rs`, approvals do NOT honour
+        // the TUI/web active-session suppression; the service worker
+        // still routes focused clients to an in-app toast via the
+        // existing `aoe-push` postMessage path. See #1038.
+        if let crate::cockpit::state::Event::ApprovalRequested { approval } = frame.event.as_ref() {
+            let state_for_push = state.clone();
+            let session_id = frame.session_id.clone();
+            let approval_title = approval.tool_call.name.clone();
+            let destructive = approval.destructive;
+            tokio::spawn(async move {
+                cockpit_ws::trigger_approval_push(
+                    &state_for_push,
+                    &session_id,
+                    &approval_title,
+                    destructive,
+                )
+                .await;
+            });
+        }
+
         let status_intent = derive_cockpit_status(frame.event.as_ref());
         let acp_change = derive_acp_session_change(frame.event.as_ref());
         if status_intent.is_none() && acp_change.is_none() {
@@ -1622,19 +2240,22 @@ async fn cockpit_event_listener(state: Arc<AppState>) {
         // Sync FS (file copy + JSON write) goes through spawn_blocking
         // so the runtime stays responsive under large session lists.
         if let Some(profile) = profile_to_save {
-            let scoped: Vec<_> = state
-                .instances
-                .read()
-                .await
-                .iter()
-                .filter(|i| i.source_profile == profile)
-                .cloned()
-                .collect();
             let session_id_for_log = frame.session_id.clone();
+            let session_id_for_save = frame.session_id.clone();
             let profile_for_save = profile.clone();
+            let acp_change_for_save = acp_change.clone();
             let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let storage = crate::session::Storage::new(&profile_for_save)?;
-                storage.save(&scoped)?;
+                storage.update(|all, _groups| {
+                    if let Some(inst) = all.iter_mut().find(|i| i.id == session_id_for_save) {
+                        apply_acp_session_change(
+                            inst,
+                            &session_id_for_save,
+                            acp_change_for_save.as_ref(),
+                        );
+                    }
+                    Ok(())
+                })?;
                 Ok(())
             })
             .await;
@@ -1789,7 +2410,7 @@ fn apply_acp_session_change(
 /// the event is irrelevant. Extracted so the JSON-shape parsing has a
 /// pure-function test surface.
 #[cfg(feature = "serve")]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 enum AcpSessionChange {
     Assigned(String),
     Reset(String),
@@ -1827,6 +2448,12 @@ pub(crate) fn derive_cockpit_status(event: &crate::cockpit::Event) -> Option<Sta
             Some(StatusIntent::Set(Status::Running))
         }
         Event::ApprovalRequested { .. } => Some(StatusIntent::Set(Status::Waiting)),
+        // All Stopped reasons surface as Idle, including the
+        // rate-limit park: the worker is not crashed, the user just
+        // hit a provider quota and the session is waiting for reset
+        // (or for the user to switch to another ACP backend). The
+        // dedicated RateLimit banner carries the reset time, so the
+        // sidebar pill staying grey is the right signal. See #1281.
         Event::Stopped { .. } => Some(StatusIntent::Set(Status::Idle)),
         Event::AgentStartupError { .. } => Some(StatusIntent::Set(Status::Error)),
         // A successful session/new or session/load means the agent
@@ -1857,6 +2484,7 @@ mod tests {
             args_preview: "{}".into(),
             started_at: chrono::Utc::now(),
             parent_tool_call_id: None,
+            memory_recall: None,
         };
         assert_eq!(
             derive_cockpit_status(&Event::UserPromptSent { text: "hi".into() }),
@@ -1878,6 +2506,14 @@ mod tests {
         assert_eq!(
             derive_cockpit_status(&Event::Stopped {
                 reason: "prompt_complete".into()
+            }),
+            Some(StatusIntent::Set(Status::Idle))
+        );
+        // Rate-limit park: NOT an error; sidebar stays grey, the
+        // dedicated RateLimit banner carries the reset time. See #1281.
+        assert_eq!(
+            derive_cockpit_status(&Event::Stopped {
+                reason: "rate_limited".into()
             }),
             Some(StatusIntent::Set(Status::Idle))
         );
@@ -2038,7 +2674,7 @@ mod tests {
         // accidentally drops one fails loudly.
         for needle in [
             "default-src 'self'",
-            "'wasm-unsafe-eval'",
+            "script-src 'self' 'wasm-unsafe-eval'",
             "img-src 'self' data: https://github.com https://avatars.githubusercontent.com",
             "connect-src 'self' ws: wss:",
             "frame-ancestors 'none'",

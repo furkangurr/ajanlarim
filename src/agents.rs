@@ -164,6 +164,41 @@ const QWEN_HOOK_EVENTS: &[HookEvent] = &[
     },
 ];
 
+/// Codex hook events. Codex loads these from the `[hooks]` table in
+/// `~/.codex/config.toml`.
+const CODEX_HOOK_EVENTS: &[HookEvent] = &[
+    HookEvent {
+        name: "SessionStart",
+        matcher: None,
+        status: Some("idle"),
+    },
+    HookEvent {
+        name: "UserPromptSubmit",
+        matcher: None,
+        status: Some("running"),
+    },
+    HookEvent {
+        name: "PreToolUse",
+        matcher: None,
+        status: Some("running"),
+    },
+    HookEvent {
+        name: "PermissionRequest",
+        matcher: None,
+        status: Some("waiting"),
+    },
+    HookEvent {
+        name: "PostToolUse",
+        matcher: None,
+        status: Some("running"),
+    },
+    HookEvent {
+        name: "Stop",
+        matcher: None,
+        status: Some("idle"),
+    },
+];
+
 pub const AGENTS: &[AgentDef] = &[
     AgentDef {
         name: "claude",
@@ -231,7 +266,10 @@ pub const AGENTS: &[AgentDef] = &[
         set_default_command: true,
         detect_status: status_detection::detect_codex_status,
         container_env: &[],
-        hook_config: None,
+        hook_config: Some(AgentHookConfig {
+            settings_rel_path: ".codex/config.toml",
+            events: CODEX_HOOK_EVENTS,
+        }),
         resume_strategy: ResumeStrategy::Subcommand("resume"),
         host_only: false,
         // Codex has paste-burst detection with a 120ms Enter-suppression window;
@@ -330,7 +368,7 @@ pub const AGENTS: &[AgentDef] = &[
         resume_strategy: ResumeStrategy::Flag("--session"),
         host_only: false,
         send_keys_enter_delay_ms: 0,
-        install_hint: "npm install -g @mariozechner/pi-coding-agent",
+        install_hint: "npm install -g @earendil-works/pi-coding-agent",
     },
     AgentDef {
         name: "droid",
@@ -451,6 +489,22 @@ pub const AGENTS: &[AgentDef] = &[
         send_keys_enter_delay_ms: 0,
         install_hint: "see https://platform.moonshot.ai/docs",
     },
+    AgentDef {
+        name: "antigravity",
+        binary: "agy",
+        aliases: &["agy"],
+        detection: DetectionMethod::Which("agy"),
+        yolo: Some(YoloMode::CliFlag("--dangerously-skip-permissions")),
+        instruction_flag: None,
+        set_default_command: false,
+        detect_status: status_detection::detect_antigravity_status,
+        container_env: &[],
+        hook_config: None,
+        resume_strategy: ResumeStrategy::Unsupported,
+        host_only: false,
+        send_keys_enter_delay_ms: 0,
+        install_hint: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
+    },
 ];
 
 /// Look up an agent by canonical name.
@@ -536,6 +590,7 @@ mod tests {
         assert_eq!(get_agent("hermes").unwrap().binary, "hermes");
         assert_eq!(get_agent("kiro").unwrap().binary, "kiro-cli");
         assert_eq!(get_agent("qwen").unwrap().binary, "qwen");
+        assert_eq!(get_agent("antigravity").unwrap().binary, "agy");
     }
 
     #[test]
@@ -566,8 +621,21 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "claude", "opencode", "vibe", "codex", "gemini", "cursor", "copilot", "pi",
-                "droid", "settl", "hermes", "kiro", "qwen", "kimi"
+                "claude",
+                "opencode",
+                "vibe",
+                "codex",
+                "gemini",
+                "cursor",
+                "copilot",
+                "pi",
+                "droid",
+                "settl",
+                "hermes",
+                "kiro",
+                "qwen",
+                "kimi",
+                "antigravity"
             ]
         );
     }
@@ -592,6 +660,8 @@ mod tests {
         assert_eq!(resolve_tool_name("kiro"), Some("kiro"));
         assert_eq!(resolve_tool_name("kiro-cli"), Some("kiro"));
         assert_eq!(resolve_tool_name("qwen"), Some("qwen"));
+        assert_eq!(resolve_tool_name("antigravity"), Some("antigravity"));
+        assert_eq!(resolve_tool_name("agy"), Some("antigravity"));
         assert_eq!(resolve_tool_name(""), Some("claude"));
         assert_eq!(resolve_tool_name("agent"), Some("cursor"));
         assert_eq!(resolve_tool_name("unknown-tool"), None);
@@ -610,6 +680,7 @@ mod tests {
         assert_eq!(settings_index_from_name(Some("hermes")), 11);
         assert_eq!(settings_index_from_name(Some("kiro")), 12);
         assert_eq!(settings_index_from_name(Some("qwen")), 13);
+        assert_eq!(settings_index_from_name(Some("antigravity")), 14);
 
         assert_eq!(name_from_settings_index(0), None);
         assert_eq!(name_from_settings_index(1), Some("claude"));
@@ -622,6 +693,7 @@ mod tests {
         assert_eq!(name_from_settings_index(11), Some("hermes"));
         assert_eq!(name_from_settings_index(12), Some("kiro"));
         assert_eq!(name_from_settings_index(13), Some("qwen"));
+        assert_eq!(name_from_settings_index(14), Some("antigravity"));
         assert_eq!(name_from_settings_index(99), None);
     }
 
@@ -652,6 +724,7 @@ mod tests {
         assert_eq!(send_keys_enter_delay("opencode"), 0);
         assert_eq!(send_keys_enter_delay("hermes"), 0);
         assert_eq!(send_keys_enter_delay("kiro"), 0);
+        assert_eq!(send_keys_enter_delay("antigravity"), 0);
         assert_eq!(send_keys_enter_delay("unknown_agent"), 0);
     }
 
@@ -676,7 +749,7 @@ mod tests {
         // Pi is distributed via npm, not pip (issue #818).
         assert_eq!(
             install_hint("pi"),
-            Some("npm install -g @mariozechner/pi-coding-agent")
+            Some("npm install -g @earendil-works/pi-coding-agent")
         );
         // Mistral Vibe's PyPI package is `mistral-vibe`, not `vibe-tool`.
         assert_eq!(install_hint("vibe"), Some("pip install mistral-vibe"));
@@ -695,6 +768,10 @@ mod tests {
         assert_eq!(
             install_hint("kiro"),
             Some("curl -fsSL https://cli.kiro.dev/install | bash")
+        );
+        assert_eq!(
+            install_hint("antigravity"),
+            Some("curl -fsSL https://antigravity.google/cli/install.sh | bash")
         );
         assert!(install_hint("unknown").is_none());
     }

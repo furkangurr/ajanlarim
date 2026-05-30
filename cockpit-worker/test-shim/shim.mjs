@@ -29,6 +29,11 @@ class ShimAgent {
     if (preseed) {
       this.sessions.set(preseed, {});
     }
+    // Resolver used by the SILENT_ORPHAN test mode: prompt() parks on
+    // a Promise that the cancel() handler resolves so the test can
+    // assert the watchdog without waiting for CANCEL_ESCALATION_GRACE
+    // to elapse.
+    this._silentOrphanResolve = null;
   }
 
   async initialize(params) {
@@ -36,6 +41,10 @@ class ShimAgent {
       protocolVersion: params.protocolVersion ?? acp.PROTOCOL_VERSION,
       agentCapabilities: {
         loadSession: false,
+      },
+      agentInfo: {
+        name: "@agentclientprotocol/claude-agent-acp",
+        version: "0.38.0",
       },
     };
   }
@@ -63,11 +72,237 @@ class ShimAgent {
       .map((c) => c.text)
       .join("\n");
 
+    // SILENT_ORPHAN reproduces the upstream
+    // `agentclientprotocol/claude-agent-acp#688` failure mode for the
+    // silent-orphan watchdog test in
+    // tests/cockpit_silent_orphan.rs. Sequence:
+    //   1. emit one assistant chunk
+    //   2. emit a cost-populated usage_update (claude-agent-acp's
+    //      "wrap up accounting" marker the daemon uses as a
+    //      terminal-candidate signal)
+    //   3. park until cancel() resolves the promise
+    // Without the cancel handler we'd hang the test for the full
+    // CANCEL_ESCALATION_GRACE; the explicit resolve keeps the test
+    // under a second while still exercising the watchdog. See #1240.
+    if (userText.includes("SILENT_ORPHAN")) {
+      await this.connection.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "wedged response complete" },
+        },
+      });
+      await this.connection.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "usage_update",
+          input_tokens: 100,
+          output_tokens: 200,
+          cost: { amount: 0.01, currency: "USD" },
+        },
+      });
+      await new Promise((resolve) => {
+        this._silentOrphanResolve = resolve;
+      });
+      return { stopReason: "cancelled" };
+    }
+
+    // ASYNC_AGENT_ORPHAN reproduces the Claude SDK async-agent shape
+    // for the #1360 watchdog suppression test. Sequence:
+    //   1. emit tool_call for an Agent invocation
+    //   2. emit tool_call_update with status=completed and content text
+    //      "Async agent launched successfully. agentId: ..." (the marker
+    //      the Rust classifier looks for to flip async_agent_running)
+    //   3. park until cancel() resolves the promise
+    // The Rust test then drains for longer than the base watchdog grace
+    // and asserts NO `prompt_orphaned` Stopped frame arrived. Without
+    // the async detection, the watchdog would fire ~300ms after the
+    // completion; with it, the effective grace is lifted to 30 minutes
+    // so the test window stays silent.
+    if (userText.includes("ASYNC_AGENT_ORPHAN")) {
+      await this.connection.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "tc-async-agent-1",
+          title: "Research async target",
+          kind: "other",
+          status: "pending",
+          rawInput: { description: "Research target", prompt: "..." },
+        },
+      });
+      await this.connection.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "tc-async-agent-1",
+          status: "completed",
+          content: [
+            {
+              type: "content",
+              content: {
+                type: "text",
+                text: "Async agent launched successfully.\nagentId: async-test-1 (internal ID)",
+              },
+            },
+          ],
+        },
+      });
+      await new Promise((resolve) => {
+        this._silentOrphanResolve = resolve;
+      });
+      return { stopReason: "cancelled" };
+    }
+
+    // BACKGROUND_BASH_ORPHAN reproduces the #1401 shape: the Claude SDK
+    // `Bash` tool fired with `run_in_background: true`. The visible
+    // ToolCall completes immediately with the marker
+    // "Command running in background with ID: <id>", then the prompt
+    // also receives a cost-populated usage_update (the production
+    // false-positive's trigger). The Rust watchdog must observe the
+    // off-protocol marker and stay suppressed past the fast grace.
+    if (userText.includes("BACKGROUND_BASH_ORPHAN")) {
+      await this.connection.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "tc-bg-orphan-1",
+          title: "Bash",
+          kind: "execute",
+          status: "pending",
+          rawInput: { command: "sleep 600", run_in_background: true },
+        },
+      });
+      await this.connection.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "tc-bg-orphan-1",
+          status: "completed",
+          content: [
+            {
+              type: "content",
+              content: {
+                type: "text",
+                text: "Command running in background with ID: btest-orphan-1. Output is being written to: /tmp/x",
+              },
+            },
+          ],
+        },
+      });
+      // Force the daemon down the fast-grace path; if off-protocol
+      // suppression is wired correctly, the watchdog should still
+      // stay quiet for the full test window.
+      await this.connection.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "usage_update",
+          input_tokens: 10,
+          output_tokens: 10,
+          cost: { amount: 0.01, currency: "USD" },
+        },
+      });
+      await new Promise((resolve) => {
+        this._silentOrphanResolve = resolve;
+      });
+      return { stopReason: "cancelled" };
+    }
+
+    // WAKEUP_ORPHAN reproduces the ScheduleWakeup path from #1401: the
+    // agent registers an absolute wake-at, then idles intentionally
+    // waiting for the scheduled prompt to fire. A cost-populated
+    // usage_update follows so the daemon would otherwise switch to the
+    // fast grace; the wakeup suppression must override it until
+    // `at + base_grace` passes.
+    if (userText.includes("WAKEUP_ORPHAN")) {
+      await this.connection.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "tc-wakeup-1",
+          title: "ScheduleWakeup",
+          kind: "other",
+          status: "pending",
+          rawInput: {
+            delaySeconds: 60,
+            reason: "test scheduled wakeup",
+            prompt: "continue",
+          },
+        },
+      });
+      // Real claude-agent-acp lands `raw_input` on an interim
+      // `tool_call_update` BEFORE the final completed frame; the
+      // watchdog now requires this carrier to fire `WakeupPending`
+      // (so a Failed completion doesn't blindly suppress for the
+      // delay window). Mirror the real shape: emit one in-progress
+      // update with raw_input.delaySeconds, then a final completed
+      // update.
+      await this.connection.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "tc-wakeup-1",
+          status: "in_progress",
+          title: "ScheduleWakeup",
+          rawInput: {
+            delaySeconds: 60,
+            reason: "test scheduled wakeup",
+            prompt: "continue",
+          },
+        },
+      });
+      await this.connection.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "tc-wakeup-1",
+          status: "completed",
+          content: [
+            {
+              type: "content",
+              content: {
+                type: "text",
+                text: "Next wakeup scheduled.",
+              },
+            },
+          ],
+        },
+      });
+      await this.connection.sessionUpdate({
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "usage_update",
+          input_tokens: 10,
+          output_tokens: 10,
+          cost: { amount: 0.01, currency: "USD" },
+        },
+      });
+      await new Promise((resolve) => {
+        this._silentOrphanResolve = resolve;
+      });
+      return { stopReason: "cancelled" };
+    }
+
     // Optional slow path: tests that need to observe mid-turn UI
     // (e.g. the working spinner) include "SLOW" in the prompt so the
     // shim adds a configurable delay between events.
     const slow = userText.includes("SLOW");
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    // Optional rate-limit path: tests for #1281 include "RATE_LIMIT"
+    // in the prompt so the shim returns the same JSON-RPC error shape
+    // claude-agent-acp emits when the Anthropic API rejects a request
+    // for quota reasons. Uses the SDK's RequestError so the structured
+    // `data` field reaches the wire (a plain `throw new Error(...)`
+    // would be stringified into the message). The Rust ACP client
+    // must classify this as RateLimit + Stopped{rate_limited} instead
+    // of treating it as a worker crash.
+    if (userText.includes("RATE_LIMIT")) {
+      throw acp.RequestError.internalError(
+        { errorKind: "rate_limit" },
+        "You've hit your limit · resets 12:10pm (Europe/Paris)",
+      );
+    }
 
     await this.connection.sessionUpdate({
       sessionId: params.sessionId,
@@ -221,7 +456,14 @@ class ShimAgent {
   }
 
   async cancel(_params) {
-    // Shim doesn't track cancellable work.
+    // Unstick the SILENT_ORPHAN park so prompt() returns and the
+    // daemon's prompt_fut resolves. Other prompt branches finish
+    // synchronously so this is a no-op for them.
+    if (this._silentOrphanResolve) {
+      const resolve = this._silentOrphanResolve;
+      this._silentOrphanResolve = null;
+      resolve();
+    }
   }
 }
 

@@ -12,23 +12,33 @@ mod instance;
 pub mod poller;
 pub mod profile_config;
 pub mod projects;
+pub(crate) mod recovery;
 pub mod repo_config;
+pub mod scratch;
 pub(crate) mod serde_helpers;
 mod storage;
 
 pub use crate::sound::{SoundConfig, SoundConfigOverride};
+pub use crate::status_hooks::{StatusHookConfig, StatusHookConfigOverride};
 pub(crate) use capture::is_valid_session_id;
 pub use config::{
-    get_update_settings, load_config, save_config, Config, ContainerRuntimeName,
-    DefaultTerminalMode, GroupByMode, SandboxConfig, SessionConfig, ThemeConfig, TmuxClipboardMode,
-    TmuxMouseMode, TmuxStatusBarMode, UpdatesConfig, WorktreeConfig,
+    get_update_settings, load_config, save_config, validate_snooze_duration, ClickAction, Config,
+    ContainerRuntimeName, DefaultTerminalMode, GroupByMode, NewSessionAttachMode, RowTagMode,
+    SandboxConfig, SessionConfig, ThemeConfig, TmuxClipboardMode, TmuxMouseMode, TmuxStatusBarMode,
+    UpdatesConfig, WorktreeConfig,
 };
 pub(crate) use environment::user_shell;
-pub use environment::validate_env_entry;
-pub use groups::{flatten_tree, flatten_tree_all_profiles, Group, GroupTree, Item};
+pub use environment::{validate_env_entries, validate_env_entry};
+pub use groups::{
+    append_archived_section, append_archived_section_by_project, archived_project_sub_path,
+    flatten_sessions_by_attention, flatten_tree, flatten_tree_all_profiles,
+    is_archived_section_path, is_within_archived_section, Group, GroupTree, Item,
+    ARCHIVED_SECTION_NAME, ARCHIVED_SECTION_PATH,
+};
+pub(crate) use instance::persist_session_to_storage;
 pub use instance::{
-    EnsureReadyError, EnsureReadyOutcome, Instance, SandboxInfo, Status, TerminalInfo,
-    WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
+    EnsureReadyError, EnsureReadyOutcome, Instance, SandboxInfo, StartOutcome, Status,
+    TerminalInfo, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
 };
 pub use profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
@@ -44,14 +54,13 @@ pub use repo_config::{
     resolve_config_with_repo_or_warn, save_repo_config, trust_repo, HookTrustStatus, HooksConfig,
     RepoConfig,
 };
-pub use storage::Storage;
+pub(crate) use storage::atomic_write;
+pub use storage::{load_workspace_ordering, update_workspace_ordering, Storage, WorkspaceOrdering};
 
 use anyhow::Result;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-pub const DEFAULT_PROFILE: &str = "default";
 
 /// Linux app dir name (under `$XDG_CONFIG_HOME`). Debug builds use a `-dev`
 /// suffix so a `cargo run` instance shares no state with an installed
@@ -154,8 +163,10 @@ pub fn format_debug_namespace_warning(release: &Path, dev: &Path) -> String {
 
 pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
     let base = get_app_dir()?;
+    let resolved;
     let profile_name = if profile.is_empty() {
-        DEFAULT_PROFILE
+        resolved = config::resolve_default_profile();
+        resolved.as_str()
     } else {
         profile
     };
@@ -166,6 +177,33 @@ pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Resolve the on-disk profile directory path WITHOUT creating it.
+///
+/// Use this for read-only operations (loading config, looking up paths)
+/// where the directory-creation side effect of [`get_profile_dir`] would
+/// pollute `profiles/` with empty stub directories. Notably, GET
+/// /api/settings?profile=<name> for an unknown profile used to create
+/// that profile's directory as a side effect of the read, which then
+/// made the unknown profile appear in subsequent GET /api/profiles
+/// responses. Routing those reads through this helper keeps the lookup
+/// pure.
+///
+/// Empty `profile` resolves through [`config::resolve_default_profile`]
+/// just like [`get_profile_dir`] does, including its bootstrap side
+/// effect on a genuine first run; callers that want to avoid that should
+/// pass an explicit non-empty name.
+pub fn get_profile_dir_path(profile: &str) -> Result<PathBuf> {
+    let base = get_app_dir()?;
+    let resolved;
+    let profile_name = if profile.is_empty() {
+        resolved = config::resolve_default_profile();
+        resolved.as_str()
+    } else {
+        profile
+    };
+    Ok(base.join("profiles").join(profile_name))
+}
+
 pub fn list_profiles() -> Result<Vec<String>> {
     let base = get_app_dir()?;
     let profiles_dir = base.join("profiles");
@@ -174,10 +212,25 @@ pub fn list_profiles() -> Result<Vec<String>> {
         return Ok(vec![]);
     }
 
+    list_profile_names_in(&profiles_dir)
+}
+
+/// Enumerate profile directory names in `profiles_dir`, skipping symlinks.
+/// Symlinks are aliases used by the `cs`/`cxa` account-switcher (e.g.
+/// `forit-work -> default`) so multiple Claude account names share a single
+/// profile directory; without the skip, every alias renders as a duplicate
+/// profile and the session list multiplies (the original "three of every
+/// folder" symptom). Extracted from `list_profiles` so tests can drive it
+/// against a tempdir.
+fn list_profile_names_in(profiles_dir: &std::path::Path) -> Result<Vec<String>> {
     let mut profiles = Vec::new();
-    for entry in fs::read_dir(&profiles_dir)? {
+    for entry in fs::read_dir(profiles_dir)? {
         let entry = entry?;
-        if entry.path().is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             if let Some(name) = entry.file_name().to_str() {
                 profiles.push(name.to_string());
             }
@@ -187,16 +240,111 @@ pub fn list_profiles() -> Result<Vec<String>> {
     Ok(profiles)
 }
 
-pub fn create_profile(name: &str) -> Result<()> {
+#[cfg(test)]
+mod profile_listing_tests {
+    //! Regression tests for the "three of every folder" bug (2026-04-25).
+    //!
+    //! The `cs`/`cxa` account-switcher creates `~/.agent-of-empires/profiles/<name>`
+    //! as a symlink to `default` so multiple Claude account names share a
+    //! single AOE profile directory. Before the fix, `list_profiles()` used
+    //! `entry.path().is_dir()` which follows symlinks, so each alias was
+    //! enumerated as a separate profile and the all-profiles session list
+    //! rendered the same data N times.
+    //!
+    //! These tests pin the skip-symlink behavior so a future refactor that
+    //! "simplifies" the file-type check fails CI instead of silently
+    //! re-introducing the duplication.
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    fn make_temp_profiles_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aoe-profile-listing-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        fs::create_dir_all(&dir).expect("create tempdir");
+        dir
+    }
+
+    #[test]
+    fn list_profile_names_skips_symlinks_to_real_profiles() {
+        let dir = make_temp_profiles_dir();
+        fs::create_dir(dir.join("default")).unwrap();
+        fs::create_dir(dir.join("personal")).unwrap();
+        // The cs/cxa pattern: aliases are symlinks pointing at `default`.
+        symlink("default", dir.join("forit-work")).unwrap();
+        symlink("default", dir.join("wma-work")).unwrap();
+
+        let names = list_profile_names_in(&dir).expect("list");
+        assert_eq!(
+            names,
+            vec!["default".to_string(), "personal".to_string()],
+            "symlinked aliases must be invisible to list_profiles; \
+             otherwise each alias inflates the all-profiles session list \
+             with duplicates of the linked profile's data (the original \
+             three-of-every-folder bug)."
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_profile_names_includes_real_dirs_only() {
+        let dir = make_temp_profiles_dir();
+        fs::create_dir(dir.join("default")).unwrap();
+        fs::create_dir(dir.join("work")).unwrap();
+        // A regular file in profiles/ should also be ignored.
+        fs::write(dir.join("README"), "ignore me").unwrap();
+
+        let names = list_profile_names_in(&dir).expect("list");
+        assert_eq!(names, vec!["default".to_string(), "work".to_string()]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// Validate that `name` is a safe, single-component profile name.
+///
+/// Defense in depth: `get_profile_dir` and `delete_profile` ultimately
+/// `join` `name` onto `<app_dir>/profiles/`, so a name like `..`, `/etc`,
+/// or `a/b` would resolve outside the profiles directory. We require
+/// exactly one path component, and that component must be `Normal`. Also
+/// rejects empty strings and the reserved `all` (which the TUI uses as a
+/// sentinel for "all-profiles" mode in profile pickers).
+fn validate_profile_name(name: &str) -> Result<()> {
     if name.is_empty() {
         anyhow::bail!("Profile name cannot be empty");
-    }
-    if name.contains('/') || name.contains('\\') {
-        anyhow::bail!("Profile name cannot contain path separators");
     }
     if name.eq_ignore_ascii_case("all") {
         anyhow::bail!("Profile name 'all' is reserved");
     }
+    // Unix Path treats `\` as a regular byte, so backslashes pass the
+    // components check below. Reject them explicitly so the validator
+    // behaves the same on every host the binary might land on.
+    if name.contains('\\') {
+        anyhow::bail!("Profile name cannot contain path separators");
+    }
+    let mut components = Path::new(name).components();
+    let first = components.next();
+    if components.next().is_some() {
+        anyhow::bail!("Profile name cannot contain path separators");
+    }
+    match first {
+        Some(std::path::Component::Normal(c)) if c == std::ffi::OsStr::new(name) => Ok(()),
+        _ => anyhow::bail!(
+            "Profile name '{}' is not a valid single-component name",
+            name
+        ),
+    }
+}
+
+pub fn create_profile(name: &str) -> Result<()> {
+    validate_profile_name(name)?;
 
     let profiles = list_profiles()?;
     if profiles.contains(&name.to_string()) {
@@ -208,15 +356,19 @@ pub fn create_profile(name: &str) -> Result<()> {
 }
 
 pub fn delete_profile(name: &str) -> Result<()> {
-    if name == DEFAULT_PROFILE {
-        anyhow::bail!("Cannot delete the default profile");
-    }
+    validate_profile_name(name)?;
 
     let base = get_app_dir()?;
     let profile_dir = base.join("profiles").join(name);
 
     if !profile_dir.exists() {
         anyhow::bail!("Profile '{}' does not exist", name);
+    }
+
+    // The invariant is "at least one profile must exist", a count, not a name.
+    // Any profile is deletable as long as deleting it would not leave zero.
+    if list_profiles()?.len() <= 1 {
+        anyhow::bail!("Cannot delete '{}': at least one profile must exist", name);
     }
 
     fs::remove_dir_all(&profile_dir)?;
@@ -273,22 +425,14 @@ pub fn collect_startup_config_warnings(profile: &str) -> Option<String> {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "config.toml".to_string());
 
-    let global_ok = match Config::load() {
-        Ok(_) => true,
-        Err(e) => {
-            messages.push(format!(
-                "Failed to load global config ({global_path_display}); using defaults.\n{e}"
-            ));
-            false
-        }
-    };
+    if let Err(e) = Config::load() {
+        messages.push(format!(
+            "Failed to load global config ({global_path_display}); using defaults.\n{e}"
+        ));
+    }
 
     let effective = if profile.is_empty() {
-        if global_ok {
-            config::resolve_default_profile()
-        } else {
-            DEFAULT_PROFILE.to_string()
-        }
+        config::resolve_default_profile()
     } else {
         profile.to_string()
     };
@@ -477,5 +621,155 @@ mod tests {
         assert!(msg.contains("/home/u/.config/agent-of-empires-dev"));
         assert!(msg.contains("cp -r"));
         assert!(msg.contains("not repeat"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_fresh_install_bootstraps_main_profile() {
+        // Genuine first run: no profiles/ entries. Resolution must create a
+        // single profile named "main", never the magic "default".
+        let _temp = isolate_app_dir();
+        assert!(list_profiles().unwrap().is_empty());
+
+        let resolved = config::resolve_default_profile();
+        assert_eq!(resolved, "main");
+        assert_eq!(list_profiles().unwrap(), vec!["main".to_string()]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_existing_default_profile_is_untouched_and_usable() {
+        // An install that already has profiles/default/ keeps it; "default"
+        // is now an ordinary profile, resolved like any other first entry.
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::create_dir_all(dir.join("profiles").join("default")).unwrap();
+
+        let resolved = config::resolve_default_profile();
+        assert_eq!(resolved, "default");
+        assert!(dir.join("profiles").join("default").exists());
+
+        let storage = Storage::new("default").unwrap();
+        assert_eq!(storage.profile(), "default");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_get_profile_dir_empty_resolves_without_default_literal() {
+        // An empty profile argument resolves through resolve_default_profile,
+        // landing on the first existing profile rather than a "default" name.
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::create_dir_all(dir.join("profiles").join("alpha")).unwrap();
+        fs::create_dir_all(dir.join("profiles").join("beta")).unwrap();
+
+        let resolved = get_profile_dir("").unwrap();
+        assert_eq!(resolved, dir.join("profiles").join("alpha"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_delete_profile_refuses_last_remaining() {
+        // The invariant is a count, not a name: deleting the only profile is
+        // refused so AoE always has somewhere to file sessions.
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::create_dir_all(dir.join("profiles").join("solo")).unwrap();
+
+        let err = delete_profile("solo").expect_err("deleting the last profile must fail");
+        assert!(err.to_string().contains("at least one profile must exist"));
+        assert!(dir.join("profiles").join("solo").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_delete_profile_named_default_allowed_when_others_exist() {
+        // A profile literally named "default" carries no protection once
+        // other profiles exist; only the count invariant applies.
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::create_dir_all(dir.join("profiles").join("default")).unwrap();
+        fs::create_dir_all(dir.join("profiles").join("work")).unwrap();
+
+        delete_profile("default").expect("a non-last profile named default is deletable");
+        assert!(!dir.join("profiles").join("default").exists());
+        assert!(dir.join("profiles").join("work").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_delete_profile_rejects_path_traversal() {
+        // Without name validation, delete_profile("../foo") would resolve
+        // to <app_dir>/profiles/../foo and remove an arbitrary sibling
+        // directory. The validator must catch this before any FS work.
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::create_dir_all(dir.join("profiles").join("real")).unwrap();
+        // A directory that must NOT be touched by the call below.
+        let bystander = dir.join("bystander");
+        fs::create_dir_all(&bystander).unwrap();
+
+        for malicious in ["..", "../bystander", "/etc", "a/b", "", "all"] {
+            let err = delete_profile(malicious).expect_err(&format!(
+                "delete_profile({malicious:?}) must fail validation"
+            ));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Profile name")
+                    || msg.contains("cannot be empty")
+                    || msg.contains("reserved")
+                    || msg.contains("path separators"),
+                "unexpected error for {malicious:?}: {msg}"
+            );
+        }
+
+        assert!(bystander.exists(), "bystander directory must survive");
+        assert!(dir.join("profiles").join("real").exists());
+    }
+
+    #[test]
+    fn test_validate_profile_name_accepts_normal_names() {
+        for name in ["work", "personal", "client-a", ".hidden", "1", "main"] {
+            validate_profile_name(name)
+                .unwrap_or_else(|e| panic!("expected {name:?} to validate: {e}"));
+        }
+    }
+
+    #[test]
+    fn test_validate_profile_name_rejects_traversal_and_separators() {
+        for bad in ["", "..", ".", "/etc", "a/b", "a\\b", "all", "ALL"] {
+            validate_profile_name(bad)
+                .err()
+                .unwrap_or_else(|| panic!("expected {bad:?} to be rejected"));
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_load_profile_config_does_not_create_dir_for_unknown_profile() {
+        // Regression: previously `load_profile_config` flowed through
+        // `get_profile_dir` which `create_dir_all`'d the profile dir as a
+        // side effect of the read. That meant any GET against a profile
+        // name that did not yet exist (the dashboard's mount-time settings
+        // fetch fires before the profile list resolves) polluted
+        // `profiles/` with a stub directory, and the stub then showed up
+        // in subsequent GET /api/profiles responses. The read must stay
+        // pure.
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::create_dir_all(dir.join("profiles").join("real")).unwrap();
+        let unknown_dir = dir.join("profiles").join("does-not-exist");
+        assert!(!unknown_dir.exists());
+
+        let cfg = crate::session::profile_config::load_profile_config("does-not-exist")
+            .expect("loading config for an unknown profile must succeed with defaults");
+        assert!(
+            !crate::session::profile_config::profile_has_overrides(&cfg),
+            "unknown profile must load to defaults",
+        );
+        assert!(
+            !unknown_dir.exists(),
+            "load_profile_config must not create profiles/<unknown>/ as a side effect",
+        );
     }
 }

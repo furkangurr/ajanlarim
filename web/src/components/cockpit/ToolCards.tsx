@@ -34,7 +34,13 @@ import {
   Trash2,
 } from "lucide-react";
 
-import { getHighlighter, langKeyForExt, loadLanguage } from "../../lib/highlighter";
+import {
+  ensureThemeLoaded,
+  getHighlighter,
+  langKeyForExt,
+  loadLanguage,
+} from "../../lib/highlighter";
+import { useShikiTheme } from "../../hooks/useShikiTheme";
 import { hasAnsi, parseAnsi, type AnsiStyle } from "../../lib/ansi";
 import { parseJsonObject, pickFirst, pickStr } from "../../lib/cockpitArgs";
 import { useCockpitPrefs } from "../../lib/cockpitPrefs";
@@ -53,6 +59,8 @@ import {
   type MemoryHit,
 } from "../../lib/memoryClassify";
 import { reclassifyBash } from "../../lib/toolReclassify";
+import { useAgentProfile } from "../../lib/agentProfileContext";
+import type { AgentProfile, CardKind } from "../../lib/agentProfiles";
 
 interface Props {
   tool: ToolCall;
@@ -87,19 +95,32 @@ interface ToolCardProps extends Props {
 }
 
 export function ToolCard({ tool, result, nested }: ToolCardProps) {
-  const card = renderToolCard(tool, result);
+  const profile = useAgentProfile();
+  const card = renderToolCard(tool, result, profile);
   if (!nested && hasSubagentParent(tool)) {
     return <SubagentChildWrap>{card}</SubagentChildWrap>;
   }
   return card;
 }
 
-function renderToolCard(tool: ToolCall, result?: ActivityRow) {
+function renderToolCard(
+  tool: ToolCall,
+  result: ActivityRow | undefined,
+  profile: AgentProfile,
+) {
+  // claude-agent-acp v0.37.0+ routes session-start memory recall
+  // through the tool channel with structured metadata (upstream #703).
+  // Render the dedicated card before falling through to the path-sniff
+  // MemoryCard so adapters that emit the structured shape don't end up
+  // double-classified.
+  if (tool.memory_recall) {
+    return <MemoryRecallCard tool={tool} result={result} />;
+  }
   const memory = classifyMemory(tool);
   if (memory.isMemory) {
     return <MemoryCard tool={tool} result={result} hit={memory} />;
   }
-  const mcp = classifyMcp(tool);
+  const mcp = classifyMcp(tool, profile);
   if (mcp.isMcp) {
     return (
       <McpToolCard
@@ -110,20 +131,31 @@ function renderToolCard(tool: ToolCall, result?: ActivityRow) {
       />
     );
   }
-  const skill = classifySkill(tool);
-  if (skill.isSkill) {
-    return <SkillToolCard tool={tool} result={result} skillName={skill.name} />;
+  if (profile.capabilities.skills) {
+    const skill = classifySkill(tool, profile);
+    if (skill.isSkill) {
+      return (
+        <SkillToolCard tool={tool} result={result} skillName={skill.name} />
+      );
+    }
   }
-  const todos = classifyTodoWrite(tool);
-  if (todos.isTodoWrite) {
-    return <TodoUpdateCard tool={tool} result={result} todos={todos.todos} />;
+  if (profile.capabilities.todos) {
+    const todos = classifyTodoWrite(tool, profile);
+    if (todos.isTodoWrite) {
+      return <TodoUpdateCard tool={tool} result={result} todos={todos.todos} />;
+    }
   }
-  const schedule = classifySchedule(tool);
-  if (schedule.kind) {
-    return <ScheduleToolCard tool={tool} result={result} kind={schedule.kind} />;
+  if (profile.capabilities.wakeup) {
+    const schedule = classifySchedule(tool, profile);
+    if (schedule.kind) {
+      return (
+        <ScheduleToolCard tool={tool} result={result} kind={schedule.kind} />
+      );
+    }
   }
   const { kind, provenance } = reclassifyBash(tool);
-  switch (kind) {
+  const effectiveKind = resolveEffectiveKind(tool, kind, profile);
+  switch (effectiveKind) {
     case "execute":
       return <ExecuteToolCard tool={tool} result={result} />;
     case "read":
@@ -143,6 +175,41 @@ function renderToolCard(tool: ToolCall, result?: ActivityRow) {
     default:
       return <GenericToolCard tool={tool} result={result} />;
   }
+}
+
+/** Resolve the dispatch kind for a tool call. Trusts the ACP `kind`
+ *  when it's a concrete card category; for `"other"` or unrecognised
+ *  kinds, consults the active agent profile's alias table so adapter
+ *  tools that don't take advantage of `ToolKind` (codex `shell`,
+ *  gemini `run_shell_command`, etc.) still land on the right card. */
+function resolveEffectiveKind(
+  tool: ToolCall,
+  reclassifiedKind: string,
+  profile: AgentProfile,
+): string {
+  const known: ReadonlySet<string> = new Set([
+    "execute",
+    "read",
+    "edit",
+    "delete",
+    "search",
+    "fetch",
+    "think",
+  ]);
+  if (known.has(reclassifiedKind)) {
+    return reclassifiedKind;
+  }
+  const name = tool.name?.trim() ?? "";
+  if (!name) return reclassifiedKind;
+  for (const [card, aliases] of Object.entries(profile.aliases) as [
+    CardKind,
+    string[],
+  ][]) {
+    if (aliases.some((alias) => alias === name)) {
+      return card;
+    }
+  }
+  return reclassifiedKind;
 }
 
 /** Indented wrap that marks a tool card as a sub-agent (Claude Task)
@@ -412,6 +479,7 @@ function HighlightedBlock({
 }) {
   const [html, setHtml] = useState<string | null>(null);
   const [showAll, setShowAll] = useState(false);
+  const shiki = useShikiTheme();
   const unwrapped = unwrapMarkdownFence(text);
   const effectiveText = unwrapped.text;
   const effectiveLang = unwrapped.lang ?? language;
@@ -435,11 +503,15 @@ function HighlightedBlock({
       try {
         const langKey = langKeyForExt(effectiveLang) ?? effectiveLang;
         await loadLanguage(langKey);
+        const resolvedTheme = await ensureThemeLoaded(
+          shiki.theme,
+          shiki.appearance,
+        );
         const hl = await getHighlighter();
         if (cancelled) return;
         const out = hl.codeToHtml(shown, {
           lang: langKey,
-          theme: "github-dark",
+          theme: resolvedTheme,
         });
         setHtml(out);
       } catch {
@@ -449,7 +521,7 @@ function HighlightedBlock({
     return () => {
       cancelled = true;
     };
-  }, [effectiveLang, shown]);
+  }, [effectiveLang, shown, shiki.theme, shiki.appearance, ansi]);
 
   return (
     <div className="border-t border-surface-800 bg-surface-950">
@@ -857,13 +929,16 @@ interface TodoItem {
  *  `kind: "think"` tool call with the joined todo list crammed into the
  *  title (`"Update TODOs: a, b, c"`) and the structured `{todos: [...]}`
  *  payload in raw_input. We detect via the title prefix and parse the
- *  args payload to render a proper checklist. See #1064. */
+ *  args payload to render a proper checklist. See #1064. Profile-keyed
+ *  so coincidental matches on other agents return early. */
 function classifyTodoWrite(
   tool: ToolCall,
+  profile: AgentProfile,
 ): { isTodoWrite: true; todos: TodoItem[] } | { isTodoWrite: false } {
   const title = tool.name?.trim() ?? "";
+  const prefixes = profile.specialTitles.todoPrefixes;
   const looksLikeTodo =
-    title.startsWith("Update TODOs") || title === "TodoWrite";
+    title === "TodoWrite" || prefixes.some((p) => title.startsWith(p));
   if (!looksLikeTodo) return { isTodoWrite: false };
   const args = parseJsonObject(tool.args_preview);
   if (!args) return { isTodoWrite: false };
@@ -982,10 +1057,12 @@ function TodoUpdateCard({ tool, result, todos }: TodoCardProps) {
  *  See #1062. */
 function classifySkill(
   tool: ToolCall,
+  profile: AgentProfile,
 ): { isSkill: true; name: string } | { isSkill: false } {
   if (tool.kind !== "other") return { isSkill: false };
   const title = tool.name?.trim().toLowerCase() ?? "";
-  if (title !== "skill" && title !== "claude-skill") return { isSkill: false };
+  const names = profile.specialTitles.skillNames;
+  if (!names.includes(title)) return { isSkill: false };
   const args = parseJsonObject(tool.args_preview);
   const name = pickStr(args, "skill", "name", "skill_name") ?? "skill";
   return { isSkill: true, name };
@@ -1472,6 +1549,91 @@ function MemoryCard({ tool, result, hit }: MemoryCardProps) {
   );
 }
 
+/* ── memory_recall (session-start memory load) ──────────────────── */
+
+/** Dedicated card for the session-start memory recall claude-agent-acp
+ *  routes through the tool channel in v0.37.0 (upstream
+ *  agentclientprotocol/claude-agent-acp#703). Two modes:
+ *
+ *  - recall: SDK loaded one or more memory files into the agent's
+ *    context. Render the list of paths so the user sees what the
+ *    agent already knows about them.
+ *  - synthesize: SDK summarised the memories into a single text body.
+ *    Render the body verbatim.
+ *
+ *  Replaces the aoe#1071 path-sniff workaround that inferred memory
+ *  loads from subsequent Read tool calls; that path only caught
+ *  user-driven reads of memory files, never the session-start load
+ *  the agent received before any prompt was sent. The structured tool
+ *  call now makes the load visible. */
+function MemoryRecallCard({ tool, result }: Props) {
+  const status = statusFor(result);
+  const recall = tool.memory_recall;
+  const [open, setOpen] = useState(false);
+
+  if (!recall) {
+    // Defensive: dispatcher only enters this branch when memory_recall
+    // is set, but type narrowing requires the check.
+    return <GenericToolCard tool={tool} result={result} />;
+  }
+  const paths = recall.paths ?? [];
+  const synthesized = recall.synthesized_text ?? "";
+  const isSynthesize = recall.mode === "synthesize";
+
+  const primary = isSynthesize ? (
+    <span>Synthesised memory</span>
+  ) : (
+    <>
+      <span>Recalled</span>
+      <span className="ml-2 text-text-dim">
+        · {paths.length} {paths.length === 1 ? "memory" : "memories"}
+      </span>
+    </>
+  );
+
+  const hasBody = isSynthesize ? synthesized.length > 0 : paths.length > 0;
+
+  return (
+    <CardChrome
+      status={status}
+      startedAt={tool.started_at}
+      endedAt={result?.at}
+      icon={<Brain className="h-3.5 w-3.5" />}
+      label="Memory recall"
+      primary={primary}
+      expanded={open || status === "err"}
+      onToggle={hasBody ? () => setOpen((v) => !v) : undefined}
+      body={
+        <ToolErrorBody status={status} errorText={result?.text}>
+          {status !== "err" && hasBody ? (
+            <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
+              {isSynthesize ? (
+                <pre
+                  data-testid="memory-recall-synthesized"
+                  className="whitespace-pre-wrap break-words text-[11px] text-text-secondary"
+                >
+                  {synthesized}
+                </pre>
+              ) : (
+                <ul
+                  data-testid="memory-recall-paths"
+                  className="space-y-0.5 text-[11px] text-text-secondary"
+                >
+                  {paths.map((p) => (
+                    <li key={p} className="break-all font-mono">
+                      {p}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          ) : null}
+        </ToolErrorBody>
+      }
+    />
+  );
+}
+
 /* ── schedule (ScheduleWakeup / Cron* family) ───────────────────── */
 
 /** Classify the Claude Agent SDK scheduling tools by their well-known
@@ -1486,6 +1648,7 @@ function MemoryCard({ tool, result, hit }: MemoryCardProps) {
  */
 function classifySchedule(
   tool: ToolCall,
+  profile: AgentProfile,
 ): { kind: "wakeup" | "cron_create" | "cron_list" | "cron_delete" | null } {
   if (tool.kind !== "other") return { kind: null };
   const args = parseJsonObject(tool.args_preview);
@@ -1493,6 +1656,8 @@ function classifySchedule(
   // `name` is usually the same value but matching both keeps us robust
   // to upstream relabels (e.g. claude-agent-acp future kind handling).
   const title = (pickStr(args, "_aoe_title") ?? tool.name ?? "").trim();
+  const allowed = profile.specialTitles.scheduleNames;
+  if (!allowed.includes(title)) return { kind: null };
   switch (title) {
     case "ScheduleWakeup":
       return { kind: "wakeup" };

@@ -11,6 +11,8 @@ import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import {
   applyEvent,
   emptyCockpitState,
+  isTurnActive,
+  normaliseTurnCounters,
   setActivityLimit,
   type ApprovalDecision,
   type CockpitFrame,
@@ -18,7 +20,12 @@ import {
   type QueuedPrompt,
 } from "../lib/cockpitTypes";
 import { useCockpitPrefs } from "../lib/cockpitPrefs";
+import { isClearAlias } from "../lib/agentProfiles";
+import { useAgentProfile } from "../lib/agentProfileContext";
+import { getOrCreateDeviceBindingSecret } from "../lib/deviceBinding";
+import { safeSetItem } from "../lib/safeStorage";
 import { getToken } from "../lib/token";
+import { setSessionArchive, setSessionSnooze } from "../lib/api";
 
 export type Action =
   | { kind: "frame"; frame: CockpitFrame }
@@ -32,16 +39,38 @@ export type Action =
   | { kind: "hydrate"; state: CockpitState }
   | { kind: "enqueue_prompt"; text: string }
   | { kind: "dequeue_prompt"; id: string }
+  | { kind: "dequeue_prompts_by_id"; ids: string[] }
   | { kind: "edit_queued_prompt"; id: string; text: string }
   | { kind: "clear_queue" }
-  | { kind: "dismiss_primer" };
+  | { kind: "dismiss_primer" }
+  | { kind: "dismiss_rejected_prompt"; id: string }
+  | { kind: "dismiss_mode_switch_failed" }
+  | { kind: "set_pending_config_option"; configId: string; value: string }
+  | { kind: "clear_pending_config_option" }
+  | {
+      /** Clear pendingConfigOption only when it still matches the
+       *  (configId, value) pair of the failed request. Prevents a
+       *  stale request A from wiping a newer request B's pending
+       *  state after the user clicked a second option mid-flight.
+       *  See #1403 (review feedback). */
+      kind: "clear_pending_config_option_if_match";
+      configId: string;
+      value: string;
+    }
+  | { kind: "dismiss_config_option_switch_failed" };
 
-// LRU-capped module cache keyed by cockpit session id. Survives
-// component unmount within the same page lifetime so the user can
-// navigate between cockpit sessions (or away from the dashboard and
-// back) and keep seeing the in-memory transcript while the
-// WebSocket reconnects in the background. Lost on full page reload
-// by design.
+// LRU-capped module cache keyed by cockpit session id. Mirrors the
+// per-session CockpitState into `localStorage` under
+// `aoe:cockpit-state:v1:<id>` so a full page reload (mobile OS evicts
+// the tab, user pulls down a Cloudflare re-auth, PWA cold start)
+// hydrates the reducer from the last-known state and only fetches
+// the seq-delta from the server instead of replaying the entire
+// transcript through the typewriter. See #1132.
+//
+// Versioned key prefix lets us invalidate stored entries when the
+// reducer schema changes meaningfully (bump to `v2:`); a TTL sweep
+// on first mount prunes entries older than STATE_TTL_MS so abandoned
+// sessions don't squat on the per-origin quota forever.
 //
 // The cap prevents long-running dashboards from accumulating state
 // for every cockpit session ever opened (Map.set with an existing
@@ -50,7 +79,178 @@ export type Action =
 // session-delete handler and logout flow can drop stale entries
 // instead of waiting for them to age out.
 const STATE_CACHE_CAP = 32;
+const STORAGE_KEY_PREFIX = "aoe:cockpit-state:v1:";
+const STATE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const stateCache = new Map<string, CockpitState>();
+
+interface PersistedEntry {
+  savedAt: number;
+  state: CockpitState;
+}
+
+function storageKey(sessionId: string): string {
+  return STORAGE_KEY_PREFIX + sessionId;
+}
+
+// Walk `aoe:cockpit-state:v1:*` keys and remove the single oldest one
+// (by `savedAt`), preferring corrupt entries when present. Returns true
+// when an entry was removed so the caller can retry the write. The
+// whitelist filter is load-bearing: it must never touch `cockpit:draft:*`
+// or any unrelated key. Drafts are authoritative client-side state and
+// cross-tab subscribers observe their removal immediately, so silently
+// evicting them would be data loss (see #1345 debate).
+function evictOldestPersistedCockpitState(currentKey: string): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    let oldestKey: string | null = null;
+    let oldestTime = Infinity;
+    let firstCorruptKey: string | null = null;
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const k = window.localStorage.key(i);
+      if (!k || !k.startsWith(STORAGE_KEY_PREFIX)) continue;
+      if (k === currentKey) continue;
+      const raw = window.localStorage.getItem(k);
+      if (raw === null) continue;
+      try {
+        const parsed = JSON.parse(raw) as PersistedEntry | null;
+        if (
+          !parsed ||
+          typeof parsed.savedAt !== "number" ||
+          Number.isNaN(parsed.savedAt)
+        ) {
+          if (firstCorruptKey === null) firstCorruptKey = k;
+          continue;
+        }
+        if (parsed.savedAt < oldestTime) {
+          oldestTime = parsed.savedAt;
+          oldestKey = k;
+        }
+      } catch {
+        if (firstCorruptKey === null) firstCorruptKey = k;
+      }
+    }
+    const victim = firstCorruptKey ?? oldestKey;
+    if (!victim) return false;
+    window.localStorage.removeItem(victim);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function persistState(sessionId: string, state: CockpitState): void {
+  const key = storageKey(sessionId);
+  const body = JSON.stringify({ savedAt: Date.now(), state } satisfies PersistedEntry);
+  if (safeSetItem(key, body)) return;
+  // Storage write failed (likely QuotaExceeded). Evict a single oldest
+  // cockpit cache entry and retry exactly once. On a second failure the
+  // cache is best-effort: the next reload replays from the server, so
+  // we stay silent here per the deliberate UX choice for cache writes.
+  if (!evictOldestPersistedCockpitState(key)) return;
+  safeSetItem(key, body);
+}
+
+// Test-only exports so the eviction policy can be exercised without
+// driving the full hook lifecycle. Not part of the public API.
+export const __test = {
+  persistState,
+  evictOldestPersistedCockpitState,
+  STORAGE_KEY_PREFIX,
+};
+
+function loadPersistedState(sessionId: string): CockpitState | undefined {
+  if (typeof window === "undefined") return undefined;
+  try {
+    const raw = window.localStorage.getItem(storageKey(sessionId));
+    if (!raw) return undefined;
+    const parsed = JSON.parse(raw) as PersistedEntry | null;
+    if (
+      !parsed ||
+      typeof parsed.savedAt !== "number" ||
+      typeof parsed.state !== "object" ||
+      parsed.state === null
+    ) {
+      return undefined;
+    }
+    if (Date.now() - parsed.savedAt > STATE_TTL_MS) {
+      window.localStorage.removeItem(storageKey(sessionId));
+      return undefined;
+    }
+    const state = parsed.state as Partial<CockpitState>;
+    if (
+      typeof state.lastSeq !== "number" ||
+      !Array.isArray(state.activity) ||
+      !Array.isArray(state.queuedPrompts)
+    ) {
+      window.localStorage.removeItem(storageKey(sessionId));
+      return undefined;
+    }
+    // Backfill the seq-counter pair introduced by #1170 for entries
+    // persisted before the schema change; see `normaliseTurnCounters`
+    // for the rules.
+    return normaliseTurnCounters(state as CockpitState);
+  } catch {
+    return undefined;
+  }
+}
+
+function dropPersistedState(sessionId: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem(storageKey(sessionId));
+  } catch {
+    // ignore
+  }
+}
+
+function dropAllPersistedState(): void {
+  if (typeof window === "undefined") return;
+  try {
+    const toRemove: string[] = [];
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const k = window.localStorage.key(i);
+      if (k && k.startsWith(STORAGE_KEY_PREFIX)) toRemove.push(k);
+    }
+    for (const k of toRemove) window.localStorage.removeItem(k);
+  } catch {
+    // ignore
+  }
+}
+
+let sweptStorage = false;
+function sweepExpiredStorage(): void {
+  if (sweptStorage) return;
+  sweptStorage = true;
+  if (typeof window === "undefined") return;
+  try {
+    const toRemove: string[] = [];
+    const now = Date.now();
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const k = window.localStorage.key(i);
+      if (!k || !k.startsWith(STORAGE_KEY_PREFIX)) continue;
+      const raw = window.localStorage.getItem(k);
+      if (!raw) {
+        toRemove.push(k);
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(raw) as PersistedEntry | null;
+        if (
+          !parsed ||
+          typeof parsed.savedAt !== "number" ||
+          now - parsed.savedAt > STATE_TTL_MS
+        ) {
+          toRemove.push(k);
+        }
+      } catch {
+        toRemove.push(k);
+      }
+    }
+    for (const k of toRemove) window.localStorage.removeItem(k);
+  } catch {
+    // ignore
+  }
+}
 
 function cacheGet(sessionId: string): CockpitState | undefined {
   const value = stateCache.get(sessionId);
@@ -59,8 +259,19 @@ function cacheGet(sessionId: string): CockpitState | undefined {
     // insertion order.
     stateCache.delete(sessionId);
     stateCache.set(sessionId, value);
+    return value;
   }
-  return value;
+  const persisted = loadPersistedState(sessionId);
+  if (persisted !== undefined) {
+    stateCache.set(sessionId, persisted);
+    while (stateCache.size > STATE_CACHE_CAP) {
+      const oldest = stateCache.keys().next().value;
+      if (oldest === undefined) break;
+      stateCache.delete(oldest);
+    }
+    return persisted;
+  }
+  return undefined;
 }
 
 function cacheSet(sessionId: string, value: CockpitState): void {
@@ -71,6 +282,7 @@ function cacheSet(sessionId: string, value: CockpitState): void {
     if (oldest === undefined) break;
     stateCache.delete(oldest);
   }
+  persistState(sessionId, value);
 }
 
 /** Drop a session's cached state (or the entire cache when called
@@ -87,8 +299,10 @@ const REPLAY_OVERLAP = 50;
 export function clearCockpitCache(sessionId?: string): void {
   if (sessionId === undefined) {
     stateCache.clear();
+    dropAllPersistedState();
   } else {
     stateCache.delete(sessionId);
+    dropPersistedState(sessionId);
   }
 }
 
@@ -138,6 +352,13 @@ function reducer(state: CockpitState, action: Action): CockpitState {
     return action.state;
   }
   if (action.kind === "user_prompt") {
+    // Bump `pendingUserPromptSeq` rather than touching `turnActive`
+    // directly. `turnActive` derives from `pendingUserPromptSeq >
+    // lastStoppedSeq`; the derived alias is recomputed here so any
+    // existing `state.turnActive` reads stay consistent without a
+    // selector hop. Without this the late `Stopped` from the prior
+    // turn could clobber the spinner mid follow-up. See #1170.
+    const pendingUserPromptSeq = state.pendingUserPromptSeq + 1;
     return {
       ...state,
       activity: state.activity.concat({
@@ -151,7 +372,11 @@ function reducer(state: CockpitState, action: Action): CockpitState {
       // they're trying again, so don't keep nagging them.
       startupError: null,
       lastError: null,
-      turnActive: true,
+      pendingUserPromptSeq,
+      turnActive: isTurnActive({
+        pendingUserPromptSeq,
+        lastStoppedSeq: state.lastStoppedSeq,
+      }),
     };
   }
   if (action.kind === "enqueue_prompt") {
@@ -166,6 +391,14 @@ function reducer(state: CockpitState, action: Action): CockpitState {
     return {
       ...state,
       queuedPrompts: state.queuedPrompts.filter((q) => q.id !== action.id),
+    };
+  }
+  if (action.kind === "dequeue_prompts_by_id") {
+    if (action.ids.length === 0) return state;
+    const drop = new Set(action.ids);
+    return {
+      ...state,
+      queuedPrompts: state.queuedPrompts.filter((q) => !drop.has(q.id)),
     };
   }
   if (action.kind === "edit_queued_prompt") {
@@ -186,6 +419,38 @@ function reducer(state: CockpitState, action: Action): CockpitState {
     // incident and shows again. See #1110.
     return { ...state, contextPrimerAvailable: null };
   }
+  if (action.kind === "dismiss_rejected_prompt") {
+    return {
+      ...state,
+      rejectedPrompts: state.rejectedPrompts.filter(
+        (r) => r.id !== action.id,
+      ),
+    };
+  }
+  if (action.kind === "dismiss_mode_switch_failed") {
+    return { ...state, modeSwitchFailed: null };
+  }
+  if (action.kind === "set_pending_config_option") {
+    return {
+      ...state,
+      pendingConfigOption: { configId: action.configId, value: action.value },
+    };
+  }
+  if (action.kind === "clear_pending_config_option") {
+    return { ...state, pendingConfigOption: null };
+  }
+  if (action.kind === "clear_pending_config_option_if_match") {
+    if (
+      state.pendingConfigOption?.configId === action.configId &&
+      state.pendingConfigOption?.value === action.value
+    ) {
+      return { ...state, pendingConfigOption: null };
+    }
+    return state;
+  }
+  if (action.kind === "dismiss_config_option_switch_failed") {
+    return { ...state, configOptionSwitchFailed: null };
+  }
   return emptyCockpitState();
 }
 
@@ -195,6 +460,23 @@ export type ConnectionStatus =
   | "closed"
   | "error";
 
+/** Reconnect backoff: 1s, 2s, 4s, 8s, 16s, 30s, 30s (cap). Seven
+ *  attempts cover the common mobile-background / Cloudflare-idle /
+ *  WiFi-flap recovery shapes without flooding the daemon when the
+ *  backend is genuinely down. After the cap, the UI surfaces a manual
+ *  "Tap to retry" affordance via `manualReconnect`. Mirrors the
+ *  retry envelope already used by `useTerminal` (#1009 / #1107). */
+const COCKPIT_MAX_RETRIES = 7;
+const COCKPIT_RETRY_BASE_MS = 1000;
+const COCKPIT_RETRY_CAP_MS = 30000;
+export function cockpitRetryDelayMs(attempt: number): number {
+  return Math.min(
+    COCKPIT_RETRY_CAP_MS,
+    COCKPIT_RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1),
+  );
+}
+export const COCKPIT_MAX_RETRIES_EXPORT = COCKPIT_MAX_RETRIES;
+
 export function useCockpit(
   sessionId: string | null,
   /** Live cockpit worker lifecycle from `SessionResponse.cockpit_worker_state`.
@@ -202,7 +484,20 @@ export function useCockpit(
    *  don't dispatch into a worker that isn't online yet. Defaults to
    *  `"running"` so non-cockpit / pre-#1088 call sites keep working. */
   workerState: "absent" | "resuming" | "running" = "running",
+  /** RFC3339 archived-at, or null. `sendPrompt` clears this server-side
+   *  (via PATCH /api/sessions/{id}/archive) before enqueueing so the
+   *  reconciler stops skipping the session and respawns the worker.
+   *  See #1581. */
+  archivedAt: string | null = null,
+  /** RFC3339 snoozed-until, or null. Same wake purpose as
+   *  `archivedAt`, via PATCH /api/sessions/{id}/snooze with
+   *  `{ minutes: null }`. See #1581. */
+  snoozedUntil: string | null = null,
 ) {
+  // Sweep stale persisted state entries on first hook mount in this
+  // module's lifetime. Idempotent (guarded by `sweptStorage`) so the
+  // cost is one full localStorage scan per page load.
+  sweepExpiredStorage();
   const [state, dispatch] = useReducer(reducer, sessionId, initialState);
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   // Mirror the worker state into a ref so the drain effect always sees
@@ -211,6 +506,18 @@ export function useCockpit(
   useEffect(() => {
     workerStateRef.current = workerState;
   }, [workerState]);
+  // Mirror the triage timestamps onto refs so `sendPrompt`'s wake
+  // step always sees the freshest value without forcing a re-create
+  // of the callback (the dep churn would also blow `dispatchPromptNow`
+  // away on every poll). See #1581.
+  const archivedAtRef = useRef(archivedAt);
+  const snoozedUntilRef = useRef(snoozedUntil);
+  useEffect(() => {
+    archivedAtRef.current = archivedAt;
+  }, [archivedAt]);
+  useEffect(() => {
+    snoozedUntilRef.current = snoozedUntil;
+  }, [snoozedUntil]);
   // Drain mode is sourced from the daemon's resolved `[cockpit]` config
   // and republished via `CockpitPrefsProvider` (App.tsx). Held in a ref
   // so the drain effect's pop logic always sees the latest value
@@ -220,6 +527,18 @@ export function useCockpit(
   useEffect(() => {
     drainModeRef.current = queueDrainMode;
   }, [queueDrainMode]);
+  // Clear-conversation aliases for the session's active agent. The drain
+  // effect needs them to slice the queued-prompt snapshot at clear-command
+  // boundaries so `/clear` (claude) / `/new` (codex, opencode) fires as a
+  // standalone POST instead of being glued into a multi-paragraph combined
+  // prompt; the server's `is_clear_command` is head-anchored on a trimmed
+  // prompt, and an agent SDK receiving `/clear\n\n<follow-up>` does not
+  // see a clean clear boundary. See #1356.
+  const agentProfile = useAgentProfile();
+  const clearAliasesRef = useRef(agentProfile.clearAliases);
+  useEffect(() => {
+    clearAliasesRef.current = agentProfile.clearAliases;
+  }, [agentProfile.clearAliases]);
   // Mirror the server-side retention cap onto the reducer's
   // in-memory activity buffer. Without this, a frontend-only 200-row
   // cap clipped the rendered transcript regardless of what the user
@@ -244,6 +563,30 @@ export function useCockpit(
     if (sessionId) cacheSet(sessionId, state);
   }, [sessionId, state]);
   const wsRef = useRef<WebSocket | null>(null);
+  // Auto-reconnect machinery (#1130). retryCountRef is the persistent
+  // attempt counter across `onclose` -> scheduled `connect()` cycles;
+  // retryTimerRef holds the pending setTimeout so manualReconnect can
+  // cancel a backed-off retry without leaking it. countdownTimerRef
+  // drives the per-second `retryCountdown` decrement that the banner
+  // renders. connectRef is the stable indirection so listeners
+  // installed outside the connection effect (visibilitychange, online,
+  // pageshow) can dial without re-creating the listeners.
+  //
+  // dialGenRef is a monotonic generation counter. Every connect() call
+  // bumps it; each in-flight IIFE captures its generation at entry and
+  // bails (or no-ops in its WS handlers) once the current generation
+  // moves past it. Without this, a visibilitychange / manualReconnect
+  // that fires while a prior IIFE is mid-`await fetchReplay` allocates
+  // a second WS, and the orphaned first WS's onclose still nulls
+  // wsRef.current and schedules a retry on top of a healthy socket.
+  const retryCountRef = useRef(0);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const connectRef = useRef<(() => void) | null>(null);
+  const dialGenRef = useRef(0);
+  const [reconnecting, setReconnecting] = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
+  const [retryCountdown, setRetryCountdown] = useState(0);
   // Track lastSeq in a ref so the snapshot fetcher always sees the
   // latest value without re-running the effect when it changes.
   // The ref is updated inside an effect (not during render) to keep
@@ -344,97 +687,247 @@ export function useCockpit(
     });
     statusRef.current = "connecting";
     setStatus("connecting");
+    retryCountRef.current = 0;
+    setReconnecting(false);
+    setRetryCount(0);
+    setRetryCountdown(0);
 
     // Set up cancellation so the cleanup function can stop a pending
     // open if the effect re-runs (sessionId change) before the WS dial
     // completed. Without this, a fast session-switch could leak a WS
     // that fires onmessage into a now-stale reducer.
     let cancelled = false;
-    let ws: WebSocket | null = null;
 
-    (async () => {
-      // Order: replay first, then open WS. Today the server's WS
-      // on-connect drain and the REST replay endpoint read the same
-      // disk store; awaiting the replay before the dial gives the
-      // reducer a known-correct `lastSeq` so the WS subscribes from a
-      // settled cursor instead of racing two delivery paths. Without
-      // this, an event landing during the dial window could be
-      // delivered by both paths in different orders, and the dedupe
-      // would drop later applies, which is exactly the "Stopped never
-      // reaches the reducer" failure mode in #1100.
-      await fetchReplay(sessionId);
+    const clearRetryTimers = () => {
+      if (retryTimerRef.current) {
+        clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
+      if (countdownTimerRef.current) {
+        clearInterval(countdownTimerRef.current);
+        countdownTimerRef.current = null;
+      }
+    };
+
+    const scheduleReconnect = () => {
       if (cancelled) return;
+      if (retryCountRef.current >= COCKPIT_MAX_RETRIES) {
+        setReconnecting(false);
+        setRetryCount(retryCountRef.current);
+        setRetryCountdown(0);
+        return;
+      }
+      retryCountRef.current += 1;
+      const attempt = retryCountRef.current;
+      const delayMs = cockpitRetryDelayMs(attempt);
+      let countdown = Math.ceil(delayMs / 1000);
+      setReconnecting(true);
+      setRetryCount(attempt);
+      setRetryCountdown(countdown);
+      clearRetryTimers();
+      countdownTimerRef.current = setInterval(() => {
+        countdown -= 1;
+        if (countdown > 0) setRetryCountdown(countdown);
+      }, 1000);
+      retryTimerRef.current = setTimeout(() => {
+        if (countdownTimerRef.current) {
+          clearInterval(countdownTimerRef.current);
+          countdownTimerRef.current = null;
+        }
+        connectRef.current?.();
+      }, delayMs);
+    };
 
-      const token = getToken();
-      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-      // Pass `?since=<lastSeq>` so the server's on-connect drain only
-      // resends events newer than what we already have. Without this,
-      // a long-running session resends its full transcript on every
-      // reconnect (page refresh / mobile flap), which can be tens of
-      // MB at the retention cap.
-      const since = lastSeqRef.current;
-      const url = `${protocol}://${window.location.host}/sessions/${encodeURIComponent(sessionId)}/cockpit/ws?since=${since}`;
-
-      ws = new WebSocket(url, token ? ["aoe-auth", token] : ["aoe-auth"]);
-      wsRef.current = ws;
-
-      // Set the ref synchronously alongside setState so sendPrompt's
-      // gate (which reads the ref) doesn't race the next render. Without
-      // this, a click landing in the same event-loop tick as `onclose`
-      // could see statusRef.current === "open" and dispatch an
-      // optimistic prompt against a closed socket.
-      ws.onopen = () => {
-        statusRef.current = "open";
-        setStatus("open");
-        setHasEverOpened(true);
-      };
-      ws.onerror = () => {
-        statusRef.current = "error";
-        setStatus("error");
-      };
-      ws.onclose = () => {
-        statusRef.current = "closed";
-        setStatus("closed");
-      };
-      ws.onmessage = (ev) => {
+    const connect = () => {
+      if (cancelled) return;
+      // Cancel any pending scheduled retry; a fresh dial supersedes it.
+      clearRetryTimers();
+      // Close any prior socket synchronously so its handlers fire (and
+      // get filtered out by the generation check below) before the new
+      // dial starts. Without this, the orphan's `onclose` can land
+      // after the new WS opens and re-arm scheduleReconnect on top of
+      // a healthy connection.
+      if (wsRef.current) {
         try {
-          const data = JSON.parse(ev.data) as
-            | CockpitFrame
-            | { kind: "lagged"; skipped?: number };
-          if (
-            typeof data === "object" &&
-            data !== null &&
-            "kind" in data &&
-            (data as { kind?: unknown }).kind === "lagged"
-          ) {
-            const skipped =
-              ((data as unknown) as { skipped?: number }).skipped ?? 0;
-            dispatch({ kind: "lagged", skipped });
-            // Try to recover via the snapshot endpoint.
-            fetchReplay(sessionId);
+          wsRef.current.close();
+        } catch {
+          // ignore
+        }
+        wsRef.current = null;
+      }
+      dialGenRef.current += 1;
+      const myGen = dialGenRef.current;
+      const isCurrentDial = () => !cancelled && dialGenRef.current === myGen;
+      statusRef.current = "connecting";
+      setStatus("connecting");
+      void (async () => {
+        // Order: replay first, then open WS. Today the server's WS
+        // on-connect drain and the REST replay endpoint read the same
+        // disk store; awaiting the replay before the dial gives the
+        // reducer a known-correct `lastSeq` so the WS subscribes from a
+        // settled cursor instead of racing two delivery paths. Without
+        // this, an event landing during the dial window could be
+        // delivered by both paths in different orders, and the dedupe
+        // would drop later applies, which is exactly the "Stopped never
+        // reaches the reducer" failure mode in #1100.
+        await fetchReplay(sessionId);
+        if (!isCurrentDial()) return;
+
+        const token = getToken();
+        const protocol =
+          window.location.protocol === "https:" ? "wss" : "ws";
+        // Pass `?since=<lastSeq>` so the server's on-connect drain only
+        // resends events newer than what we already have. Without this,
+        // a long-running session resends its full transcript on every
+        // reconnect (page refresh / mobile flap), which can be tens of
+        // MB at the retention cap.
+        const since = lastSeqRef.current;
+        const url = `${protocol}://${window.location.host}/sessions/${encodeURIComponent(sessionId)}/cockpit/ws?since=${since}`;
+
+        // Subprotocols carry both factors on a WS upgrade:
+        //   - `aoe-auth` is the legacy signalling protocol the server
+        //     expects to see.
+        //   - the bare `<token>` is the first-factor auth token
+        //     (kept for backward compatibility with PWA tabs that
+        //     loaded before the prefixed format landed).
+        //   - `aoe-device.<binding-secret>` is the device-binding
+        //     second factor introduced in #1131. The middleware
+        //     enforces this when passphrase login is configured.
+        let bindingSecret: string | null = null;
+        try {
+          bindingSecret = getOrCreateDeviceBindingSecret();
+        } catch {
+          // Storage / crypto unavailable; the server will reject this
+          // upgrade with 401 and the login page will surface the cause.
+        }
+        const protocols: string[] = ["aoe-auth"];
+        if (token) protocols.push(token);
+        if (bindingSecret) protocols.push(`aoe-device.${bindingSecret}`);
+        const ws = new WebSocket(url, protocols);
+        wsRef.current = ws;
+
+        // Set the ref synchronously alongside setState so sendPrompt's
+        // gate (which reads the ref) doesn't race the next render.
+        // Without this, a click landing in the same event-loop tick as
+        // `onclose` could see statusRef.current === "open" and dispatch
+        // an optimistic prompt against a closed socket.
+        //
+        // Every handler additionally checks `isCurrentDial()`: an
+        // orphaned WS from a superseded connect() must not flip status,
+        // null wsRef.current, or schedule a retry on top of the new
+        // healthy socket.
+        ws.onopen = () => {
+          if (!isCurrentDial()) {
+            try {
+              ws.close();
+            } catch {
+              // ignore
+            }
             return;
           }
-          if (
-            typeof data === "object" &&
-            data !== null &&
-            "session_id" in data &&
-            "event" in data
-          ) {
-            // Every incoming live frame is an "activity" tick for the
-            // force-end-turn watchdog: as long as the agent is
-            // streaming, the spinner stays "honest" and the escape
-            // hatch doesn't appear. See WorkingSpinner in CockpitView.
-            lastActivityRef.current = Date.now();
-            dispatch({ kind: "frame", frame: data as CockpitFrame });
+          statusRef.current = "open";
+          setStatus("open");
+          setHasEverOpened(true);
+          // A live socket is the right moment to reset the retry
+          // envelope: a future close from here is a genuinely new
+          // failure, not a continuation of the prior backoff chain.
+          retryCountRef.current = 0;
+          setReconnecting(false);
+          setRetryCount(0);
+          setRetryCountdown(0);
+        };
+        ws.onerror = () => {
+          if (!isCurrentDial()) return;
+          statusRef.current = "error";
+          setStatus("error");
+        };
+        ws.onclose = () => {
+          if (!isCurrentDial()) return;
+          statusRef.current = "closed";
+          setStatus("closed");
+          wsRef.current = null;
+          scheduleReconnect();
+        };
+        ws.onmessage = (ev) => {
+          if (!isCurrentDial()) return;
+          try {
+            const data = JSON.parse(ev.data) as
+              | CockpitFrame
+              | { kind: "lagged"; skipped?: number };
+            if (
+              typeof data === "object" &&
+              data !== null &&
+              "kind" in data &&
+              (data as { kind?: unknown }).kind === "lagged"
+            ) {
+              const skipped =
+                ((data as unknown) as { skipped?: number }).skipped ?? 0;
+              dispatch({ kind: "lagged", skipped });
+              // Try to recover via the snapshot endpoint.
+              fetchReplay(sessionId);
+              return;
+            }
+            if (
+              typeof data === "object" &&
+              data !== null &&
+              "session_id" in data &&
+              "event" in data
+            ) {
+              // Every incoming live frame is an "activity" tick for the
+              // force-end-turn watchdog: as long as the agent is
+              // streaming, the spinner stays "honest" and the escape
+              // hatch doesn't appear. See WorkingSpinner in CockpitView.
+              lastActivityRef.current = Date.now();
+              dispatch({ kind: "frame", frame: data as CockpitFrame });
+            }
+          } catch {
+            // Ignore malformed frames; the server should never send them.
           }
-        } catch {
-          // Ignore malformed frames; the server should never send them.
-        }
-      };
-    })();
+        };
+      })();
+    };
+    connectRef.current = connect;
+
+    // Trigger an immediate reconnect when the tab returns to the
+    // foreground / the OS rejoins the network / bfcache restores the
+    // page. Mobile Chrome / Safari close idle WSs in the background
+    // (~30-60s), and Cloudflare's tunnel kills them at 100s; the
+    // standard recovery signal is the visibility event firing on
+    // foreground. iOS Safari batches these so `pageshow` is the
+    // backup. See #1130.
+    const tryAutoReconnect = () => {
+      const ws = wsRef.current;
+      const ready = ws?.readyState;
+      if (
+        ready === WebSocket.OPEN ||
+        ready === WebSocket.CONNECTING
+      ) {
+        return;
+      }
+      retryCountRef.current = 0;
+      setRetryCount(0);
+      setRetryCountdown(0);
+      clearRetryTimers();
+      connectRef.current?.();
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") tryAutoReconnect();
+    };
+    const onOnline = () => tryAutoReconnect();
+    const onPageShow = () => tryAutoReconnect();
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("online", onOnline);
+    window.addEventListener("pageshow", onPageShow);
+
+    connect();
 
     return () => {
       cancelled = true;
+      // Bump the generation so any in-flight IIFE / pending WS handlers
+      // from this effect's lifetime see themselves as stale.
+      dialGenRef.current += 1;
+      clearRetryTimers();
+      const ws = wsRef.current;
       if (ws) {
         try {
           ws.close();
@@ -443,6 +936,10 @@ export function useCockpit(
         }
       }
       wsRef.current = null;
+      connectRef.current = null;
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("pageshow", onPageShow);
     };
   }, [sessionId, fetchReplay]);
 
@@ -479,16 +976,19 @@ export function useCockpit(
 
   // Dispatch a prompt immediately, no queueing. Internal helper used by
   // both sendPrompt (when the turn is idle) and the drain effect below
-  // (when popping the head of queuedPrompts on Stopped).
+  // (when popping the head of queuedPrompts on Stopped). Returns true
+  // when the POST succeeded so the drain effect knows whether to retire
+  // the items it just sent; false on any disconnect / non-OK response /
+  // network error so the queue stays intact for the next turn-end retry.
   const dispatchPromptNow = useCallback(
-    async (text: string) => {
-      if (!sessionId) return;
+    async (text: string): Promise<boolean> => {
+      if (!sessionId) return false;
       if (statusRef.current !== "open") {
         dispatch({
           kind: "error",
           message: "Cockpit disconnected; message not sent. Reconnect to retry.",
         });
-        return;
+        return false;
       }
       // Optimistically echo the user's message; the agent reply
       // streams back as session/update events on the WS. If the POST
@@ -514,49 +1014,79 @@ export function useCockpit(
             kind: "error",
             message: `Could not send prompt (${res.status}). ${detail}`.trim(),
           });
+          return false;
         }
+        return true;
       } catch (e) {
         dispatch({
           kind: "error",
           message: `Network error sending prompt: ${describeError(e)}`,
         });
+        return false;
       }
     },
     [sessionId],
   );
 
-  // Public sendPrompt. When the agent is already working we enqueue
-  // client-side; the drain effect dispatches the head once the current
-  // turn ends. When idle we dispatch immediately. Background: #1031.
+  // Public sendPrompt. Enqueues locally whenever the session is not in
+  // a state where an immediate POST would succeed; the drain effect
+  // below dispatches once the session resumes. Inactive states covered:
+  //   - WS not open (disconnected, reconnecting): #1359.
+  //   - turn already in flight: #1031.
+  //   - worker not in `running` (cold start, restart, stopped): #1088.
+  //   - worker stopped or restarting at the session level: #1359.
+  // Only when every gate clears does the prompt take the immediate POST
+  // path. The guard set mirrors the drain effect below so the moment
+  // the last gate flips the parked prompts fire. dispatchPromptNow keeps
+  // its own status guard for the drain effect, which can race the WS
+  // reopen window (see #1144).
   const sendPrompt = useCallback(
     async (text: string) => {
       if (!sessionId) return;
-      // The reducer sees the same `turnActive` the UI does. statusRef
-      // covers the WS-closed case separately so disconnected users
-      // still get the existing error banner even when typing into a
-      // running session.
-      if (statusRef.current !== "open") {
-        dispatch({
-          kind: "error",
-          message: "Cockpit disconnected; message not sent. Reconnect to retry.",
-        });
-        return;
+      // Auto-wake an archived or actively-snoozed session before
+      // routing. The tmux send path runs this via
+      // `Instance::touch_last_accessed` on the server side, but the
+      // cockpit composer enqueues locally while the worker is down
+      // (which is true precisely BECAUSE the row is sunk), so the
+      // server never sees the prompt and the flag stays set. Clear
+      // it client-side; the reconciler picks the session back up on
+      // its next ~2s tick and the queue drains as soon as a fresh
+      // `AcpSessionAssigned` lands. See #1581.
+      if (archivedAtRef.current || snoozedUntilRef.current) {
+        const wakeResult = archivedAtRef.current
+          ? await setSessionArchive(sessionId, false)
+          : await setSessionSnooze(sessionId, null);
+        if (!wakeResult) {
+          // Wake PATCH failed (network drop / 5xx / 4xx). Surfacing
+          // an error is the only safe move: enqueueing locally would
+          // park the prompt in a queue that never drains, because
+          // the reconciler keeps skipping the still-sunk session.
+          // Route through the reducer's `error` action so the
+          // existing `InteractionErrorBanner` renders it. See #1581.
+          dispatch({
+            kind: "error",
+            message:
+              "Could not wake this session. Please retry, or unarchive / unsnooze from the sidebar.",
+          });
+          return;
+        }
       }
-      if (state.turnActive) {
-        dispatch({ kind: "enqueue_prompt", text });
-        return;
-      }
-      // Worker still resuming (e.g. cold-start parallel reconciler
-      // hasn't reached this session yet). Queue locally rather than
-      // POSTing into a worker that isn't online; the drain effect
-      // fires once `workerState` transitions to `"running"`. See #1088.
-      if (workerStateRef.current !== "running") {
+      const wsClosed = statusRef.current !== "open";
+      const workerNotRunning = workerStateRef.current !== "running";
+      const shouldEnqueue = wsClosed || workerNotRunning || state.turnActive || state.workerStopped || state.workerRestarting;
+      if (shouldEnqueue) {
         dispatch({ kind: "enqueue_prompt", text });
         return;
       }
       await dispatchPromptNow(text);
     },
-    [sessionId, state.turnActive, dispatchPromptNow],
+    [
+      sessionId,
+      state.turnActive,
+      state.workerStopped,
+      state.workerRestarting,
+      dispatchPromptNow,
+    ],
   );
 
   // Drain effect: when the agent transitions to idle and the queue is
@@ -581,23 +1111,73 @@ export function useCockpit(
     // worker that's not online yet; the next REST poll flips
     // workerState to "running" and re-runs this effect. See #1088.
     if (workerStateRef.current !== "running") return;
+    // Reconnect race: connect() awaits fetchReplay BEFORE opening the
+    // WS, and replay can dispatch a Stopped frame that flips turnActive
+    // off. If we drain here while the WS is still in "connecting",
+    // dispatchPromptNow will bail (statusRef !== "open"), surface an
+    // error banner, and (under the prior optimistic-clear ordering)
+    // permanently drop the queued items. Park the drain until status
+    // flips to "open"; the `status` value is in the dep array below
+    // so this effect re-runs on transition. See #1144.
+    if (statusRef.current !== "open") return;
     if (state.queuedPrompts.length === 0) return;
     drainingRef.current = true;
     if (drainModeRef.current === "combined") {
-      const combined = combineQueuedPrompts(state.queuedPrompts);
-      dispatch({ kind: "clear_queue" });
-      void dispatchPromptNow(combined).finally(() => {
-        drainingRef.current = false;
-      });
+      // Slice the leading sub-batch out of the queue and POST only that.
+      // The boundary is each clear-command alias (`/clear`, `/new`); when
+      // the head is a clear alias it fires alone, otherwise the run of
+      // non-clear entries up to the next alias is joined into one
+      // combined POST. The remaining entries stay queued and the next
+      // `Stopped` re-runs this effect, dispatching the next sub-batch.
+      // Single-pass POST per drain matches the existing combined-mode
+      // contract (one prompt fires per turn cycle), and the agent sees a
+      // clean clear-command boundary instead of `/clear\n\n<text>`.
+      // See #1356.
+      //
+      // The user can enqueue MORE prompts during the await; on success
+      // we only clear the items in the snapshot so newly-typed entries
+      // survive into the next turn. On failure (POST non-OK / network
+      // blip / WS dropped mid-send) we leave the queue untouched so the
+      // next Stopped retries.
+      const queue = state.queuedPrompts;
+      const aliases = clearAliasesRef.current;
+      const headIsClear =
+        aliases.length > 0 && isClearAlias(queue[0]!.text, aliases);
+      let batchEnd = 1;
+      if (!headIsClear && aliases.length > 0) {
+        while (
+          batchEnd < queue.length &&
+          !isClearAlias(queue[batchEnd]!.text, aliases)
+        ) {
+          batchEnd += 1;
+        }
+      } else if (aliases.length === 0) {
+        batchEnd = queue.length;
+      }
+      const snapshot = queue.slice(0, batchEnd);
+      const combined = combineQueuedPrompts(snapshot);
+      const sentIds = snapshot.map((q) => q.id);
+      void dispatchPromptNow(combined)
+        .then((ok) => {
+          if (ok) dispatch({ kind: "dequeue_prompts_by_id", ids: sentIds });
+        })
+        .finally(() => {
+          drainingRef.current = false;
+        });
     } else {
       const head = state.queuedPrompts[0]!;
-      dispatch({ kind: "dequeue_prompt", id: head.id });
-      void dispatchPromptNow(head.text).finally(() => {
-        drainingRef.current = false;
-      });
+      const headId = head.id;
+      void dispatchPromptNow(head.text)
+        .then((ok) => {
+          if (ok) dispatch({ kind: "dequeue_prompt", id: headId });
+        })
+        .finally(() => {
+          drainingRef.current = false;
+        });
     }
   }, [
     sessionId,
+    status,
     workerState,
     state.turnActive,
     state.workerStopped,
@@ -620,6 +1200,71 @@ export function useCockpit(
 
   const dismissPrimer = useCallback(() => {
     dispatch({ kind: "dismiss_primer" });
+  }, []);
+
+  const dismissRejectedPrompt = useCallback((id: string) => {
+    dispatch({ kind: "dismiss_rejected_prompt", id });
+  }, []);
+
+  const dismissModeSwitchFailed = useCallback(() => {
+    dispatch({ kind: "dismiss_mode_switch_failed" });
+  }, []);
+
+  // Send `session/set_config_option` to the daemon (model / reasoning
+  // effort / future selector). Pessimistic: the current value stays put
+  // until the adapter pushes a confirming `ConfigOptionsUpdated`. The
+  // pending dispatch records the in-flight click so the UI can dim the
+  // just-clicked option without lying about active state. On HTTP
+  // failure the pending state clears and lastError surfaces a banner;
+  // adapter-side rejection comes back as a `ConfigOptionSwitchFailed`
+  // frame which clears pending in the reducer and renders a
+  // non-blocking notice. See #1403.
+  const setConfigOption = useCallback(
+    async (configId: string, value: string) => {
+      if (!sessionId) return;
+      dispatch({ kind: "set_pending_config_option", configId, value });
+      try {
+        const res = await fetch(
+          `/api/sessions/${encodeURIComponent(sessionId)}/cockpit/config-option`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ config_id: configId, value }),
+          },
+        );
+        if (!res.ok) {
+          const detail = await safeText(res);
+          // Guard against the user clicking a second option before this
+          // request's response landed: clear pending only when it
+          // still matches our (configId, value) pair. See #1403.
+          dispatch({
+            kind: "clear_pending_config_option_if_match",
+            configId,
+            value,
+          });
+          dispatch({
+            kind: "error",
+            message:
+              `Could not set ${configId} (${res.status}). ${detail}`.trim(),
+          });
+        }
+      } catch (e) {
+        dispatch({
+          kind: "clear_pending_config_option_if_match",
+          configId,
+          value,
+        });
+        dispatch({
+          kind: "error",
+          message: `Network error setting ${configId}: ${describeError(e)}`,
+        });
+      }
+    },
+    [sessionId],
+  );
+
+  const dismissConfigOptionSwitchFailed = useCallback(() => {
+    dispatch({ kind: "dismiss_config_option_switch_failed" });
   }, []);
 
   // Cancels the in-flight agent turn (ACP session/cancel). Must only
@@ -694,9 +1339,46 @@ export function useCockpit(
     dispatch({ kind: "clear_error" });
   }, []);
 
+  // Public manual-reconnect affordance. Surfaces in the SystemNotices
+  // banner once the auto-retry envelope is exhausted; resets the
+  // backoff counter and dials a fresh WS immediately. Idempotent
+  // against a live socket (the reconnect path checks readyState).
+  const manualReconnect = useCallback(() => {
+    if (retryTimerRef.current) {
+      clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+    if (countdownTimerRef.current) {
+      clearInterval(countdownTimerRef.current);
+      countdownTimerRef.current = null;
+    }
+    retryCountRef.current = 0;
+    setRetryCount(0);
+    setRetryCountdown(0);
+    setReconnecting(false);
+    connectRef.current?.();
+  }, []);
+
   return {
     state,
     status,
+    /** True between an `onclose` and the next successful dial / failure
+     *  to exhaust the retry envelope. Drives the banner's "Reconnecting
+     *  (N/MAX) in Xs" copy. See #1130. */
+    reconnecting,
+    /** Current attempt number; 0 while the live socket is healthy,
+     *  1..MAX while backing off. */
+    retryCount,
+    /** Seconds remaining before the next scheduled retry fires. The
+     *  banner reads this on each render to animate the countdown. */
+    retryCountdown,
+    /** Maximum retries before falling back to the manual reconnect
+     *  affordance. Exposed so the banner can render "N/MAX" without
+     *  re-importing the constant. */
+    maxRetries: COCKPIT_MAX_RETRIES,
+    /** User-triggered reconnect. Resets the retry counter and dials a
+     *  fresh socket immediately. */
+    manualReconnect,
     /** True once the WS has reached `onopen` at least once for the
      *  current session. Lets banner copy distinguish "first dial
      *  while the worker spawns" (no prior connection to recover) from
@@ -718,6 +1400,10 @@ export function useCockpit(
     removeQueuedPrompt,
     editQueuedPrompt,
     clearQueue,
+    dismissRejectedPrompt,
+    dismissModeSwitchFailed,
+    setConfigOption,
+    dismissConfigOptionSwitchFailed,
   };
 }
 

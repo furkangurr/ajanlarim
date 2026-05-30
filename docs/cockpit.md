@@ -33,12 +33,12 @@ The wizard greys out the cockpit option for tools not in this set.
 
 | aoe tool   | Substrate B (cockpit)                                      | Auth                                   |
 |------------|------------------------------------------------------------|----------------------------------------|
-| `claude`   | `claude-agent-acp` (Zed adapter for the Claude SDK)        | `claude /login` writes `~/.claude/credentials`; or `ANTHROPIC_API_KEY` |
+| `claude`   | `claude-agent-acp` (Zed adapter for the Claude SDK, requires >=0.38.0) | `claude /login` writes `~/.claude/credentials`; or `ANTHROPIC_API_KEY` |
 | `opencode` | `opencode acp` (native, SST)                               | `OPENCODE_API_KEY` env var; or provider-specific env (set up via `opencode auth`) |
 | `gemini`   | `gemini --acp` (native, Google)                            | `GEMINI_API_KEY` env var, OAuth via `gemini auth`, or Vertex `GOOGLE_API_KEY` |
 | `codex`    | `codex-acp` (Zed adapter, npm `@zed-industries/codex-acp`) | `OPENAI_API_KEY` env var, or ChatGPT login (local-only) |
 | `vibe`     | `vibe-acp` (native, Mistral)                               | Mistral API key; set up via `vibe` first |
-| `pi`       | `pi-acp` (adapter, requires `@mariozechner/pi-coding-agent`) | `pi-acp --terminal-login` for OAuth, or env vars per provider |
+| `pi`       | `pi-acp` (adapter, requires `@earendil-works/pi-coding-agent`) | `pi-acp --terminal-login` for OAuth, or env vars per provider |
 | `aoe-agent`| Bundled multi-provider agent (Vercel AI SDK 6)             | Whatever provider env vars Vercel AI SDK expects |
 | *aider, cursor, copilot, droid, settl, hermes* | not yet wired into the cockpit registry; fall back to terminal mode |
 
@@ -109,8 +109,8 @@ Configured agents:
     install: npm install -g @google/gemini-cli  (then `gemini --acp`)
 [!! ] opencode  (OpenCode (SST); native ACP via `opencode acp`)
     install: curl -fsSL https://opencode.ai/install | bash  (then `opencode acp`)
-[!! ] pi  (Hermes coding agent (`pi`) via the pi-acp adapter …)
-    install: npm install -g pi-acp  (also requires `npm i -g @mariozechner/pi-coding-agent`)
+[!! ] pi  (Pi coding agent (`pi`) via the pi-acp adapter …)
+    install: npm install -g pi-acp (also requires `npm install -g @earendil-works/pi-coding-agent`)
 [!! ] vibe  (Mistral Vibe; native ACP via the bundled `vibe-acp` binary)
     install: follow https://github.com/mistralai/mistral-vibe (ships the `vibe-acp` binary)
 
@@ -160,6 +160,8 @@ node_path = ""
 show_tool_durations = true  # per-tool elapsed-time label in the web UI
 queue_drain_mode = "combined"  # how the composer drains client-side queued prompts: "combined" | "serial" (#1031)
 force_end_turn_threshold_secs = 30  # seconds of streaming silence before the spinner offers a "Force end turn" button (#1100)
+silent_orphan_grace_secs = 120  # daemon-side watchdog grace when the adapter stops talking with no in-flight tool; 0 disables (#1240); bumped from 60 in #1360 for async-agent flows; nonzero values below 120 clamp up at runtime
+silent_orphan_fast_grace_secs = 20  # accelerated grace used once a cost-populated UsageUpdate has arrived for the current prompt (#1240); ignored while an async-agent wait is active (#1360)
 ```
 
 `max_concurrent_resumes` bounds how many cockpit workers the reconciler
@@ -269,6 +271,53 @@ status banner at the bottom of the screen shows the current focus.
 when the approval card itself has focus. Typing "always allow" into
 the composer will never silently approve a pending tool; the
 composer captures every keystroke, including those letters.
+
+### Web composer Enter behavior
+
+On desktop, Enter sends the prompt and Shift+Enter inserts a
+newline, matching the TUI convention above.
+
+On touch-primary devices (phones, tablets without an attached
+keyboard), plain Enter inserts a newline and the explicit Send
+button on the right of the composer is the only path to dispatch.
+This matches the conventions of WhatsApp, Slack, ChatGPT mobile,
+and Claude.ai mobile, and avoids the common foot-gun of accidentally
+firing a partial multi-line prompt by reaching for a line break.
+An iPad with a Bluetooth keyboard (or any device that reports both
+`(pointer: coarse)` and `(any-pointer: fine)` to the browser) keeps
+the desktop Enter-to-send convention so hardware-keyboard typing
+feels natural. See #1129.
+
+### Queued prompts (mid-turn + inactive session)
+
+The web composer keeps your messages around even when the session
+can't accept them yet. Two cases:
+
+1. **Mid-turn follow-up.** While the agent is producing the current
+   response, the Send button switches to a paper-plane with a small
+   pending-count badge. Click (or press Enter) and your text lands in
+   the **Queued (N)** strip above the composer. As soon as the agent
+   reports `Stopped`, the cockpit drains the queue per the
+   `cockpit.queue_drain_mode` setting (combined, the default, sends
+   every parked entry as one prompt; serial fires them one at a time).
+   See #1031 for the original feature.
+
+2. **Inactive session.** If the WebSocket is mid-reconnect, the worker
+   is stopped (`user_stopped`), or the worker is restarting
+   (`restart_pending`, `agent_unresponsive`, `prompt_orphaned`), the
+   composer still accepts submissions. The tooltip swaps to
+   `Queue message until session resumes`, the strip heading changes to
+   `Pending until session resumes (N)`, and the parked entry stays
+   editable. The moment the WS reopens AND the worker reaches
+   `running` AND the session-level `Stopped` flag clears (an
+   `AcpSessionAssigned` event), the same drain effect fires the
+   queue. See #1359.
+
+Queued entries persist in the per-origin localStorage snapshot at
+`aoe:cockpit-state:v1:<sid>`, so a page reload (and closing then
+reopening the tab on the same origin) keeps them across the reconnect
+window. Server-side durability is not currently implemented; clearing
+site data wipes the queue.
 
 ### Cross-machine attach
 
@@ -397,6 +446,17 @@ restoration (Claude today), the model itself also retains conversation
 context across restarts; so a follow-up like "what did we just
 decide?" still works after a daemon restart.
 
+The web dashboard mirrors each session's reduced state into
+`localStorage` under the `aoe:cockpit-state:v1:<session_id>` key so a
+full page reload (mobile OS evicting the tab, Cloudflare tunnel
+re-auth, PWA cold start) hydrates the chat surface instantly from the
+last-known state and only fetches the seq-delta from the server. Entries
+expire after seven days; an oversized session that exceeds the
+per-origin quota falls back to the full server replay path without
+warning. `clearCockpitCache` and the session-delete handler drop the
+matching entry so a freshly-recreated session id doesn't briefly show
+the prior transcript.
+
 If context restoration fails (e.g., the agent's stored session is no
 longer available), cockpit falls back to a fresh session and renders
 an amber "Conversation context reset" callout in the transcript so
@@ -416,7 +476,112 @@ gone until the next `session/load` failure. See #1004.
 The bundled `aoe-agent` doesn't yet support context restoration; its
 transcript still replays from disk, but the model starts fresh on each
 spawn. Tracked in
-[#1005](https://github.com/njbrake/agent-of-empires/issues/1005).
+[#1005](https://github.com/agent-of-empires/agent-of-empires/issues/1005).
+
+## Permission modes and YOLO
+
+Cockpit sessions run in one of the permission modes advertised by the
+ACP adapter. The composer's mode picker shows whatever the agent
+reports in its `NewSessionResponse.modes`; for `claude-agent-acp` the
+typical set is:
+
+| Mode id              | Meaning                                                                 |
+|----------------------|-------------------------------------------------------------------------|
+| `default`            | Every Write/Edit/Bash routes through an approval card.                  |
+| `acceptEdits`        | Edit-kind tools auto-approved; Bash and unknown tools still prompt.     |
+| `bypassPermissions`  | All tools auto-approved. The cockpit analogue of YOLO.                  |
+| `plan`               | Read-only; the agent drafts a plan but does not run side-effectful tools. |
+
+### YOLO mode maps to `bypassPermissions`
+
+When `[session] yolo_mode_default = true` (or the wizard's "Auto-approve
+actions" toggle is on), cockpit asks the adapter to start the session
+in `bypassPermissions` immediately after `session/new`. This mirrors
+what the tmux substrate does by appending
+`--dangerously-skip-permissions` to the Claude CLI argv.
+
+The wiring is best-effort: the cockpit fires `session/set_mode` after
+the handshake and continues regardless of the response. If the adapter
+accepts, the mode picker flips to `bypassPermissions` and you stop
+seeing approval cards. If it rejects (see next section), a non-blocking
+amber notice appears above the composer with the adapter's reason and
+the session keeps running in whichever mode it landed on.
+
+### `bypassPermissions` may not be available
+
+`claude-agent-acp` gates `bypassPermissions` on the `ALLOW_BYPASS`
+environment variable. If the daemon spawned the adapter without
+`ALLOW_BYPASS=1` in its env, `session/set_mode("bypassPermissions")`
+returns "Mode bypassPermissions is not available" and the session
+stays in `default`. Two ways out:
+
+1. Restart `aoe serve` with `ALLOW_BYPASS=1` so the adapter advertises
+   the mode. The cockpit then drives it automatically on every new
+   YOLO-mode session.
+2. Live with `default` and approve as you go, or pick `acceptEdits`
+   from the composer mode picker for edit-only auto-approval.
+
+The Auto-approve toggle in the wizard does not configure
+`ALLOW_BYPASS`; the env var is a daemon-process input set wherever
+`aoe serve` actually launches.
+
+## Model and reasoning effort
+
+Cockpit sessions render two extra selectors in the composer footer
+beside the mode pill when the ACP adapter advertises them: a model
+dropdown and a reasoning-effort selector. Both come from one wire
+mechanism, ACP `SessionUpdate::ConfigOptionUpdate`, stabilised
+upstream in `claude-agent-acp` v0.37.0 (Opus 4.8 added in v0.38.0).
+The adapter emits the full
+snapshot of every selector (mode, model, reasoning effort, future
+categories) whenever any one of them changes; the cockpit replaces
+its cached list in full.
+
+### When the pickers appear
+
+The pickers only render if the adapter publishes the matching
+category. `claude-agent-acp` v0.38.0+ advertises a model selector
+for every session, and adds a reasoning-effort selector when the
+current model reports `supportsEffort=true`. Older adapters that
+emit no `config_option_update` show neither picker; this is by
+design so non-Claude backends don't grow empty UI chrome.
+
+### Setting a value
+
+Clicking an option fires `POST /api/sessions/{id}/cockpit/config-option`
+with `{ config_id, value }` which the cockpit supervisor turns into
+ACP `session/set_config_option`. The UI is pessimistic: the chip
+still shows the previous current value while the request is in
+flight, with a subtle dim and a disabled re-click on the just-clicked
+option, until the adapter pushes a confirming `config_option_update`.
+This avoids "snap back" on slow networks (Cloudflare Tunnel can run
+300-800ms round trips).
+
+### The `Default` reasoning effort
+
+The reasoning-effort dropdown includes a `Default` option alongside
+adapter-supported levels like `Low | Medium | High`. `Default` is
+not a fixed effort; the SDK resolves it per current model. Picking
+it explicitly tells the adapter to drop any session-level effort
+pin so the model uses its default reasoning budget. See upstream
+PR agentclientprotocol/claude-agent-acp#701.
+
+### When a switch fails
+
+If the adapter rejects `session/set_config_option` (rate limit,
+missing capability, transient error), an amber non-blocking notice
+appears next to the composer with the configured selector name, the
+rejected value, and the adapter's reason. The notice auto-dismisses
+when a later snapshot reports the originally-requested value as
+current (the user retried and won, or the adapter applied the value
+asynchronously). The session keeps running in whichever value the
+adapter last confirmed.
+
+### Lifecycle clears
+
+The cached selector list clears on `AgentSwitched` (a Claude-to-Codex
+handoff invalidates Claude-specific models) but survives `/clear`:
+adapter capabilities are process-scoped, not conversation-scoped.
 
 ## Approvals
 
@@ -438,6 +603,26 @@ approval_timeout_secs = 300
 destructive_require_double_confirm = true
 ```
 
+### Notifications and sound
+
+When an approval lands, the cockpit fires two channels so a user away
+from the dashboard still sees the agent is blocked:
+
+- **Web push.** If the PWA is installed and notifications are
+  enabled, the daemon sends an OS-level push tagged
+  `cockpit-approval-<session>`. Tapping the notification deep-links
+  back to the cockpit. Unlike status-change pushes, approval pushes
+  are not suppressed when the dashboard or TUI is active; the service
+  worker routes focused clients to an in-app toast instead of an OS
+  banner. See [Push notifications](push-notifications.md).
+- **Browser sound.** The cockpit plays a chime in the dashboard tab
+  whenever pending approvals go from zero to non-zero. Configure the
+  file via `[sound] on_approval` in the daemon config or the Sound
+  category of the Settings TUI. The chime is independent of the
+  host-side audio used by the tmux status flow; the cockpit case
+  often runs `aoe serve` on a remote box and the host speaker would
+  be on the wrong side of the wire.
+
 ## Security
 
 - File system access uses ACP's `fs/read_text_file` and
@@ -445,13 +630,46 @@ destructive_require_double_confirm = true
   reads/writes on their behalf and enforces sandbox roots (the
   session's worktree + any explicit `--repo` paths).
 - Terminal commands use ACP's `terminal/*`. The shell command runs in
-  aoe's process, in the session's worktree (or sandboxed Docker
-  container if applicable).
+  aoe's process, in the session's worktree (or inside the sandbox
+  container when sandbox is enabled, via `docker exec`).
 - Approval nonces are server-generated and single-use. A compromised
   agent process cannot synthesise approvals; aoe never reveals the
   nonce to the agent.
 - Auth tokens (`AOE_TOKEN`) are explicitly *not* forwarded to the
   agent subprocess.
+
+### Sandbox containers
+
+Cockpit sessions honor the wizard's **Run in a safe container** toggle.
+When enabled, the ACP agent runs inside the same `aoe-sandbox-<id>`
+Docker container the tmux substrate uses. The daemon stays on the host
+and wraps the agent argv in `docker exec`, so the agent never sees host
+paths. `fs/*` requests are translated from container paths (e.g.
+`/workspace/proj/foo.rs`) back to host paths before the inside-roots
+check; `terminal/*` commands run via `docker exec`, so a `pwd` from the
+agent returns the container's working directory, not the host's.
+
+The unix socket between the daemon and the per-session runner stays on
+the host. The runner proxies the agent's stdio across the container
+boundary, so there is no bind-mount of the daemon's socket into the
+container. That path is reserved for a future agent that natively
+speaks the socket transport.
+
+The published `aoe-sandbox` image bundles the ACP adapters cockpit
+sessions need (`claude-agent-acp`, `codex-acp`, `pi-acp`) alongside the
+underlying CLIs whose binaries already provide ACP themselves (`opencode
+acp`, `gemini --acp`, `vibe-acp`). Custom sandbox images must include
+the same adapters or the `docker exec` invocation will fail with exit
+status 127 and the ACP handshake will time out after 30s.
+
+Known limitations:
+
+- `fs/*` path translation only covers the workspace mount(s) the
+  container was built with. Agent-config mounts (`/root/.claude`),
+  bind-mounted credentials, and user-configured `extra_volumes` are
+  not in the path map. In practice the inside-roots check (worktree-
+  only) already rejects those paths, so the safety property holds;
+  the failure mode is just a generic "outside session roots" error.
 
 ## Troubleshooting
 
@@ -475,13 +693,35 @@ manager (e.g., `brew reinstall aoe`).
 
 ### `aoe cockpit doctor` says claude-code adapter is missing
 
-Install the official adapter once:
+Install the official adapter once. aoe requires v0.37.0 or newer; the
+cockpit refuses to enter a session with an older adapter and surfaces a
+dedicated remediation screen with the exact install command:
 
 ```bash
-npm install -g @agentclientprotocol/claude-agent-acp
+npm install -g @agentclientprotocol/claude-agent-acp@latest
 ```
 
 Then run `claude login` if you haven't already.
+
+The minimum version is enforced at the ACP `initialize` handshake; the
+check reads `agent_info.version` from the adapter's initialize response
+and rejects anything below 0.37.0 with a structured `StartupError`
+event. Newer versions are accepted. The minimum exists because aoe
+relies on behavior that only landed in v0.37.0:
+
+- `memory_recall` tool calls (upstream
+  agentclientprotocol/claude-agent-acp#703), so session-start memory
+  loads render in the cockpit instead of disappearing into a dropped
+  SDK event.
+- Native `stopReason: "cancelled"` (upstream
+  agentclientprotocol/claude-agent-acp#694), so cancel acknowledgement
+  surfaces as a distinct turn outcome rather than collapsing into
+  `end_turn`.
+
+If you have an older version pinned by an internal mirror, set up the
+mirror to ship 0.37.0 or override the global install with
+`npm install -g @agentclientprotocol/claude-agent-acp@latest` before
+starting `aoe serve`.
 
 ### "Failed to start cockpit agent" while the adapter is installed
 
@@ -498,6 +738,29 @@ The session's working directory was renamed, moved, or deleted out from under `a
 
 Reinstalling the adapter does not help here; the adapter is fine, the cwd is gone.
 
+### Agent stopped responding to cancel
+
+If the agent ignores `session/cancel` mid-tool-call (most commonly a `block: true` TaskOutput against a wedged background shell), aoe escalates after a ~10s grace window: the daemon ends the ACP connection, SIGTERMs the wedged `aoe __cockpit-runner` subprocess, and the supervisor respawns a fresh worker via `session/load` so the transcript continues uninterrupted. The cockpit view shows "Agent stopped responding to cancel. Restarting worker; your transcript will be preserved" while the respawn is in flight; the banner clears automatically once the new worker comes online.
+
+Follow-up prompts the daemon refused while the original turn was still in flight no longer vanish silently. The composer shows them as amber "Rejected" pills with a Retry button; clicking Retry re-dispatches the prompt through the normal send path against the freshly-respawned worker.
+
+### Rate-limit recovery
+
+When the active ACP backend reports `errorKind: "rate_limit"` on `session/prompt` (Claude's adapter does this when the Anthropic account is over its limit), aoe treats this as a non-crash terminal state rather than as a worker crash:
+
+- The connection task emits a typed `RateLimit` event (which the dashboard banner reads to show the reset time) and a `Stopped { reason: "rate_limited" }` lifecycle event, then exits cleanly.
+- The supervisor drops the worker handle and does NOT respawn. Earlier behaviour respawned the runner inside the restart budget, then immediately hit the same limit on the next `session/prompt` and burned the budget. The session now sits parked until the user explicitly retries or hands off.
+- `aoe serve` restart while a session is parked respects the `Stopped { reason: "rate_limited" }` signal in the on-disk event log and does NOT auto-resume the worker; otherwise daemon restart at minute 30 of a 90-minute window would undo the fix.
+
+The rate-limit banner offers a primary "Continue in another agent" CTA. Clicking it opens a modal that lists the cockpit ACP registry (claude / codex / opencode / gemini / vibe / pi / aoe-agent by default, plus anything you've added via the settings TUI) and preselects `codex` when installed. Picking a target calls `POST /api/sessions/{id}/cockpit/switch-agent`, which:
+
+1. Stops the current worker and waits for the runner subprocess to release its socket.
+2. Spawns the target agent. On failure, the instance is left untouched.
+3. Persists `cockpit_agent = <target>` and clears `cockpit_acp_session_id` (the old session id belongs to a different vendor and would be rejected by the new adapter).
+4. Emits an `AgentSwitched { from, to, reason }` event so reducers drop transient state tied to the prior backend (rate-limit banner, in-flight tool, usage, mode pills, available commands) and the transcript shows a divider.
+
+After the switch, the modal fetches the context primer and pre-fills the composer with a framed recap of the prior conversation. If the user's last prompt is what triggered the rate-limit (it was published to the event log before the adapter rejected it), the primer endpoint surfaces it separately as `unprocessed_prompt`; the modal drops it into the composer as the user's pending request so they don't have to retype it. The composer is NOT auto-sent; review and submit manually.
+
 ### Cockpit feels "stuck" with no events
 
 - Check `aoe cockpit logs --follow` (when the worker supervisor lands)
@@ -513,6 +776,44 @@ Reinstalling the adapter does not help here; the adapter is fine, the cwd is gon
   longer holds events that far back, you'll see a `History
   truncated` notice and reloading is the cleanest way to resync.
 
+### Editing settings asks for the passphrase again
+
+When passphrase login is configured, the daily-use cockpit flows
+(sending prompts, cancelling turns, resolving approvals, switching
+mode, restarting workers, attaching terminals) do NOT prompt for the
+passphrase again. Your session cookie plus the device-binding
+secret are sufficient, the same way an SSH session stays open after
+the initial authentication. See #1137.
+
+Editing the persisted config IS gated. Saving the global settings
+panel, creating / deleting / renaming a profile, editing a profile's
+settings, or changing the default profile requires that your login
+session has been "elevated" within the last 15 minutes via `POST
+/api/login/elevate`. The first such action after a fresh page load
+surfaces an inline passphrase prompt; subsequent edits inside the
+same 15-minute window go through without re-prompting. The narrow
+scope catches the persisted-tamper attack (an attacker with stolen
+session + binding plants a malicious Docker image, worktree
+template, or profile, then waits for the owner to spawn a session
+that runs it) without putting friction on the conversation surface.
+
+### WebSocket auto-reconnect and keepalive
+
+Mobile browsers and Cloudflare tunnels both close idle WebSocket
+connections aggressively (Chrome / Safari at ~30 to 60 seconds in the
+background, Cloudflare at 100 seconds), so the cockpit pairs an
+application-level keepalive with a client-side reconnect envelope.
+The server sends a Ping every 30 seconds and reaps any socket that
+goes 90 seconds without a Pong reply. On the client, the
+`useCockpit` hook re-dials the WebSocket on close with exponential
+backoff (1s, 2s, 4s, 8s, 16s, 30s, 30s), reset on the next successful
+`onopen`. The reconnect resumes from `?since={lastSeq}` so the
+transcript stays continuous. The cockpit banner shows
+`Reconnecting (N/7) in Xs...` while the auto-retry is armed, and a
+manual **Reconnect** button after the seven attempts exhaust.
+`visibilitychange`, `online`, and `pageshow` listeners trigger an
+immediate reconnect when the tab returns to the foreground.
+
 ### Approval card vanished without resolving
 
 Approvals expire after `approval_timeout_secs` (default 300). The
@@ -524,12 +825,41 @@ context where approvals legitimately take longer.
 
 When you run `/clear` in a cockpit session, the model's context is
 wiped on the adapter side but the visible transcript is preserved.
-The cockpit now appends a "Conversation cleared" divider, drops the
-cached slash-command / mode / plan state (the model has forgotten
-them), and folds every row above the divider behind a disclosure
-banner: `Show N earlier turns (cleared, not in the model's memory)`.
-Click the banner to expand the older transcript for your own
-reference; the model still won't see those turns. See #1101.
+The cockpit appends a "Conversation cleared" divider, resets the
+active plan, the current mode, any in-flight approvals, and the
+session usage snapshot, then folds every row above the divider
+behind a disclosure banner: `Show N earlier turns (cleared, not in
+the model's memory)`. Click the banner to expand the older transcript
+for your own reference; the model still won't see those turns. See
+#1101.
+
+The slash-command palette and mode picker stay populated across a
+`/clear`. `claude-agent-sdk` caches the supported command surface at
+Query init and does not rotate it when conversation context is reset,
+so the cached list stays authoritative for the lifetime of the
+cockpit's underlying agent process. See #1128.
+
+A `/clear` queued mid-turn (or any agent's clear alias, e.g. codex /
+opencode `/new`) is honoured as a standalone POST when the turn ends,
+even under `combined` drain mode. The drain effect splits the queued
+prompts at each clear-command boundary, so an ordering like
+`foo`, `/clear`, `bar` fires as three separate POSTs (`foo`, then
+`/clear`, then `bar`) instead of one multi-paragraph prompt that would
+otherwise glue `/clear` past the server's head-anchored detection. The
+queued-prompt strip shows an amber `fires separately` divider between
+rows that will land in different sub-batches. See #1356.
+
+The session cost figure in the composer footer reads "since the most
+recent `/clear` (or `/compact`)" rather than session-lifetime
+cumulative. `claude-agent-acp` keeps reporting its cumulative cost
+across the ACP session's whole lifetime (the adapter does not rotate
+the ACP session id on `/clear`), so the cockpit captures the
+cumulative at each boundary and subtracts it from incoming
+`UsageUpdate` frames. Switching backends (`AgentSwitched`) or starting
+a fresh ACP session (`SessionContextReset`) clears the baseline, since
+the new backend reports its own cumulative starting at zero. The
+`used` / context-window figures stay raw because the adapter already
+reflects the post-boundary context size on its side. See #1354.
 
 ### "Force end turn" button under the spinner
 
@@ -541,6 +871,101 @@ local spinner immediately and asks the daemon to publish a synthetic
 recovery affordance for a missed-event race (#1100); during a healthy
 turn it never shows. Configure the inactivity threshold with
 `cockpit.force_end_turn_threshold_secs` (default 30s).
+
+While a tool is in flight (Write, Read, Task subagent, slow Bash,
+etc.) the spinner still flips to an elapsed-time label after the
+threshold ("Waiting on tool… 1m 23s") so the wait is visible, but the
+button stays hidden so clicking it cannot discard the in-flight
+tool's progress. The escape hatch is reserved for a silent model with
+no tool running. See #1176.
+
+### Silent-orphan watchdog
+
+The cockpit daemon also watches for the case where the agent adapter
+finishes streaming a turn but never sends the JSON-RPC
+`PromptResponse` that closes out `session/prompt`. The user-visible
+symptom is identical to the bug above (spinner stuck), but the cause
+is a protocol violation on the adapter side: the response was lost,
+not just delayed. Tracked upstream at
+[agentclientprotocol/claude-agent-acp#688](https://github.com/agentclientprotocol/claude-agent-acp/issues/688).
+
+When the daemon detects this, it sends `session/cancel`, waits the
+existing cancel-escalation grace (10s) for the adapter to respond,
+then SIGTERMs the runner and respawns via `session/load` so the
+transcript is preserved. The web UI shows a distinct banner ("Agent
+finished but didn't notify the daemon. Restarting worker; your
+transcript will be preserved.") so the user can tell this apart from
+the cancel-escalation path (`agent_unresponsive`). See #1240.
+
+The detector fires only when ALL hold for the current prompt:
+- `tool_calls_in_flight` is empty (no open tool call; long-running
+  npm install / Playwright / Task subagent runs are never affected
+  because their tool stays open until done).
+- At least one progress notification has already arrived for this
+  prompt (avoids false-firing on a slow first chunk).
+- No further progress notification has arrived for
+  `silent_orphan_grace_secs` (default 120), reduced to
+  `silent_orphan_fast_grace_secs` (default 20) for the rest of the
+  prompt once a cost-populated `UsageUpdate` has arrived. The
+  accelerated path lowers MTTR on the specific claude-agent-acp
+  failure shape without weakening the vendor-agnostic baseline.
+
+Out-of-band notifications (mode changes, available_commands_update,
+rate limit, usage updates without cost) explicitly do NOT reset the
+timer, so an adapter that emits periodic ambient state after the
+final transcript event still trips the watchdog.
+
+**Off-protocol work suppression (#1360, #1401):** several Claude SDK
+features intentionally make the agent quiet for long stretches, with
+no ACP-layer signaling the daemon can observe. The watchdog detects
+each and lifts the effective grace to `OFF_PROTOCOL_WORK_GRACE_FLOOR`
+(30 minutes) for the rest of the prompt:
+
+- `Agent` tool with `isAsync: true` (#1360). Sub-agent runs INSIDE the
+  claude binary. Detected from the completion text `Async agent
+  launched successfully` on the launch's `ToolCallUpdate`.
+- `Bash` tool with `run_in_background: true` (#1401). The visible
+  ToolCall completes immediately while a real subprocess keeps running
+  off-protocol; the agent polls later via `BashOutput`. Detected from
+  the `raw_input.run_in_background = true` flag at `ToolStarted` time
+  AND from the completion text `Command running in background with
+  ID:` (either signal alone is enough; defense in depth so a single
+  SDK string drift can't reintroduce the false-positive class).
+
+The off-protocol branch takes precedence over the cost-seen fast path
+(a cost-populated UsageUpdate mid-wait could be intermediate billing
+telemetry rather than turn termination). The grace stays finite by
+design so a real adapter wedge during off-protocol work still
+recovers, just slower. The async-agent path is a bandaid until
+upstream `agentclientprotocol/claude-agent-acp#336` forwards the
+SDK's `task_notification` / `task_started` system messages as proper
+ACP SessionUpdates.
+
+**Scheduled wakeup suppression (#1401):** when the agent calls the
+Claude SDK `ScheduleWakeup` tool with `delaySeconds: N`, the daemon
+suppresses the watchdog until `wakeup_at + silent_orphan_grace_secs`,
+computed as a monotonic `Instant` deadline at signal receipt so
+wall-clock jumps don't perturb suppression. Multiple wakeups in the
+same prompt extend (not shorten) the suppression, and the later deadline
+always wins. After the deadline passes the watchdog rearms with its
+normal grace; if the scheduled wake does not produce follow-up
+progress while the prompt loop is alive, the watchdog recovers
+after the tail grace. Daemon crashes during sleep tear down the
+in-memory prompt loop entirely, so the next attach starts fresh.
+
+Set `cockpit.silent_orphan_grace_secs = 0` to disable. Both knobs are
+editable per profile in the TUI Settings (`Cockpit` category) and in
+the web dashboard's Settings tab under `Cockpit`. Nonzero values
+below 120 are clamped up to 120 at runtime so a typo cannot drop the
+watchdog into a tight-loop false-positive regime; debug builds honour
+`AOE_SILENT_ORPHAN_GRACE_MS` to keep test cadences sub-second.
+
+In debug builds, set `AOE_COCKPIT_SIMULATE_ORPHAN_NEXT_PROMPT=1`
+before sending a cockpit prompt to manually reproduce the wedge: the
+daemon will discard the next prompt response, the watchdog will fire
+within the configured grace, and you can verify the end-to-end UX
+(banner, lockdown, SIGTERM, respawn). The env var is single-shot
+(cleared after one use) and compiled out in release builds.
 
 ### Sharing debug logs
 
@@ -580,5 +1005,6 @@ These are tracked for follow-up releases:
 - Default `cockpit.enabled = true`: once the default-cockpit-on-web
   flow has burned in for one release, the master switch flips on by
   default and the wizard shows the substrate picker out of the box.
-- Docker sandbox unix-socket transport for cockpit sessions running
-  inside containers.
+- Native unix-socket transport for in-container agents that natively
+  speak the socket protocol. Today the sandbox path uses `docker exec`
+  to keep stdio-only agents working without upstream changes.

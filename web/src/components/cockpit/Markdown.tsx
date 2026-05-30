@@ -22,17 +22,23 @@ import { useEffect, useState } from "react";
 import remarkGfm from "remark-gfm";
 
 import {
+  ensureThemeLoaded,
   getHighlighter,
   langKeyForExt,
   loadLanguage,
 } from "../../lib/highlighter";
+import { useShikiTheme } from "../../hooks/useShikiTheme";
 
 interface Props {
   text: string;
   /** Enable the char-budget reveal that paces in newly-streamed
-   *  agent tokens. Default on for assistant output. Pass `false` for
-   *  user prompts (which arrive complete in one shot, so smoothing
-   *  adds nothing and would briefly delay the bubble rendering). */
+   *  agent tokens. Default off: historical messages (loaded from the
+   *  per-session persisted cache on reload, or hydrated from server
+   *  replay on session switch) would otherwise type out character-by-
+   *  character, which on a long transcript becomes 5-15 seconds of
+   *  unusable UI. Only the live streaming tail (an assistant message
+   *  whose runtime status is `running`) should pass `smooth={true}`.
+   *  See #1132. */
   smooth?: boolean;
 }
 
@@ -40,7 +46,7 @@ interface Props {
  * Render markdown text. Used for both assistant chunks and user
  * prompts; the smoothing pace is the only knob exposed.
  */
-export function Markdown({ text, smooth = true }: Props) {
+export function Markdown({ text, smooth = false }: Props) {
   return (
     <MarkdownTextPrimitive
       preprocess={() => text}
@@ -111,15 +117,16 @@ function TableWithScroll({
 
 /**
  * Shiki-backed code block. Loads the language module on demand the
- * first time we see it, then re-renders with the `github-dark` theme.
- * Falls back to a plain <pre> while the language is loading or for
- * unknown languages.
+ * first time we see it, then renders against the current resolved
+ * theme (from useShikiTheme). Falls back to a plain <pre> while the
+ * language is loading or for unknown languages.
  */
 function ShikiSyntaxHighlighter({
   language,
   code,
 }: SyntaxHighlighterProps) {
   const [html, setHtml] = useState<string | null>(null);
+  const shiki = useShikiTheme();
   useEffect(() => {
     let cancelled = false;
     if (!language) return;
@@ -127,10 +134,14 @@ function ShikiSyntaxHighlighter({
       try {
         const langKey = langKeyForExt(language) ?? language;
         await loadLanguage(langKey);
+        const resolvedTheme = await ensureThemeLoaded(
+          shiki.theme,
+          shiki.appearance,
+        );
         const hl = await getHighlighter();
         if (cancelled) return;
         setHtml(
-          hl.codeToHtml(code, { lang: langKey, theme: "github-dark" }),
+          hl.codeToHtml(code, { lang: langKey, theme: resolvedTheme }),
         );
       } catch {
         // Unknown lang → fall through to plain rendering.
@@ -139,7 +150,7 @@ function ShikiSyntaxHighlighter({
     return () => {
       cancelled = true;
     };
-  }, [language, code]);
+  }, [language, code, shiki.theme, shiki.appearance]);
 
   if (html) {
     return (

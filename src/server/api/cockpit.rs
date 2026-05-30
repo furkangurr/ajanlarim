@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::cockpit::approvals::Nonce;
 use crate::cockpit::protocol::{
     ContextPrimerQuery, ContextPrimerResponse, PromptRequest, ReplayQuery, ReplayResponse,
-    ResolveApprovalRequest,
+    ResolveApprovalRequest, SwitchAgentRequest, SwitchAgentResponse,
 };
 use crate::cockpit::supervisor::SupervisorError;
 use crate::server::AppState;
@@ -91,11 +91,15 @@ pub(crate) fn cockpit_gate(state: &AppState) -> Result<(), (StatusCode, &'static
 pub async fn spawn_cockpit(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(req): Json<SpawnCockpitRequest>,
+    req: Result<Json<SpawnCockpitRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    let Json(req) = match req {
+        Ok(j) => j,
+        Err(rej) => return rej.into_response(),
+    };
     if let Err(reason) = cockpit_gate(&state) {
         return reason.into_response();
     }
@@ -122,7 +126,29 @@ pub async fn spawn_cockpit(
         .collect();
     let model = req.model.or_else(|| instance.cockpit_model.clone());
     let stored_acp_session_id = instance.cockpit_acp_session_id.clone();
+    let yolo_mode = instance.yolo_mode;
 
+    let inst_lock = state.instance_lock(&id).await;
+    let sandbox_info = match crate::cockpit::sandbox::ensure_container_for_session(
+        &state.instances,
+        &inst_lock,
+        &id,
+        false,
+    )
+    .await
+    {
+        Ok(info) => info,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("sandbox container ensure failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let source_profile = sandbox_info
+        .as_ref()
+        .map(|_| instance.source_profile.clone());
     let agent_for_response = agent.clone();
     match state
         .cockpit_supervisor
@@ -134,6 +160,9 @@ pub async fn spawn_cockpit(
             provider_env,
             model,
             stored_acp_session_id,
+            sandbox_info,
+            source_profile,
+            yolo_mode,
         })
         .await
     {
@@ -180,21 +209,320 @@ pub async fn shutdown_cockpit(
     }
 }
 
-pub async fn cockpit_prompt(
+/// One entry in the cockpit ACP registry. Names match the `target`
+/// field accepted by `/cockpit/switch-agent`. Used by the rate-limit
+/// recovery modal to list available backends. See #1282.
+#[derive(Debug, Serialize)]
+pub struct CockpitAgentInfo {
+    pub name: String,
+    pub description: String,
+    pub command: String,
+}
+
+/// `GET /api/cockpit/agents`: list the ACP registry entries the
+/// supervisor knows about. Distinct from `/api/agents` (which lists
+/// session-tool agents like claude/codex/cursor for the wizard);
+/// this returns the *cockpit* ACP backend registry so the recovery
+/// modal can show what the user can hand off to. See #1282.
+pub async fn list_cockpit_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let registry = state.cockpit_supervisor.registry_snapshot().await;
+    let mut entries: Vec<CockpitAgentInfo> = registry
+        .list()
+        .into_iter()
+        .map(|(name, spec)| CockpitAgentInfo {
+            name: name.clone(),
+            description: spec.description.clone(),
+            command: spec.command.clone(),
+        })
+        .collect();
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Json(entries).into_response()
+}
+
+/// Atomically move a cockpit session from one ACP backend to another.
+/// Used by the rate-limit recovery flow (#1282) so the user can
+/// continue a Claude-rate-limited session in `codex` (or another
+/// installed ACP backend) without losing the transcript.
+///
+/// Sequence:
+///   1. Validate `target` exists in the cockpit registry.
+///   2. Snapshot `before_seq` = highest seq in the event store, so the
+///      handoff `AgentSwitched` event lands at a known cursor and the
+///      frontend's primer fetch (`fetchContextPrimer(before_seq)`)
+///      excludes the handoff itself from the recap.
+///   3. `shutdown_and_wait` on the current worker so the runner
+///      subprocess actually exits and releases its socket before the
+///      new spawn binds the same path.
+///   4. Spawn the target agent. On failure: do NOT mutate the
+///      instance, return 5xx. The user keeps their prior
+///      `cockpit_agent` and can retry from the recovery banner.
+///   5. Persist `cockpit_agent = target`, clear
+///      `cockpit_acp_session_id` (the Claude session id is meaningless
+///      to Codex, so a future `session/load` against it would fail and
+///      surface a `SessionContextReset` we don't want).
+///   6. Emit `AgentSwitched { from, to, reason }` so the reducer
+///      clears agent-specific transient state and the UI renders a
+///      transcript divider.
+pub async fn switch_cockpit_agent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(req): Json<PromptRequest>,
+    Json(req): Json<SwitchAgentRequest>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    if let Err(reason) = cockpit_gate(&state) {
+        return reason.into_response();
+    }
+
+    let target = req.target.trim().to_string();
+    if target.is_empty() {
+        return (StatusCode::BAD_REQUEST, "target is required").into_response();
+    }
+    if !state.cockpit_supervisor.registry_has_agent(&target).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("unknown cockpit agent: {target}"),
+        )
+            .into_response();
+    }
+
+    let instance = {
+        let instances = state.instances.read().await;
+        match instances.iter().find(|i| i.id == id).cloned() {
+            Some(inst) => inst,
+            None => return (StatusCode::NOT_FOUND, "session not found").into_response(),
+        }
+    };
+    let from_agent = state
+        .cockpit_supervisor
+        .pick_agent_for_tool(&instance.tool, instance.cockpit_agent.as_deref())
+        .await;
+    if from_agent == target {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("session is already using {target}"),
+        )
+            .into_response();
+    }
+    let before_seq = state.cockpit_event_store.highest_seq(&id);
+
+    if let Err(e) = state
+        .cockpit_supervisor
+        .shutdown_and_wait(&id, std::time::Duration::from_secs(5))
+        .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("shutdown failed before agent switch: {e}"),
+        )
+            .into_response();
+    }
+
+    let cwd = PathBuf::from(&instance.project_path);
+    let inst_lock = state.instance_lock(&id).await;
+    let sandbox_info = match crate::cockpit::sandbox::ensure_container_for_session(
+        &state.instances,
+        &inst_lock,
+        &id,
+        false,
+    )
+    .await
+    {
+        Ok(info) => info,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("sandbox container ensure failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let source_profile = sandbox_info
+        .as_ref()
+        .map(|_| instance.source_profile.clone());
+
+    let model = req.model.clone().or(instance.cockpit_model.clone());
+    let spawn_result = state
+        .cockpit_supervisor
+        .spawn(crate::cockpit::supervisor::SpawnRequest {
+            session_id: id.clone(),
+            agent: target.clone(),
+            cwd,
+            additional_dirs: vec![],
+            provider_env: vec![],
+            model: model.clone(),
+            // Different ACP backend; the cached Claude session id would
+            // be rejected by codex / opencode.
+            stored_acp_session_id: None,
+            sandbox_info,
+            source_profile,
+            yolo_mode: instance.yolo_mode,
+        })
+        .await;
+    if let Err(e) = spawn_result {
+        return match e {
+            SupervisorError::UnknownAgent(name) => (
+                StatusCode::BAD_REQUEST,
+                format!("unknown cockpit agent: {name}"),
+            )
+                .into_response(),
+            SupervisorError::AlreadyRunning(_) => (
+                StatusCode::CONFLICT,
+                "cockpit worker already running for session",
+            )
+                .into_response(),
+            e @ SupervisorError::CapacityFull { .. } => {
+                (StatusCode::SERVICE_UNAVAILABLE, format!("{e}")).into_response()
+            }
+            e => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("spawn failed: {e}"),
+            )
+                .into_response(),
+        };
+    }
+
+    // Persist the agent change AFTER spawn succeeded. The new agent's
+    // session/new will emit a fresh AcpSessionAssigned which will then
+    // populate cockpit_acp_session_id via the existing listener.
+    let profile_for_save = instance.source_profile.clone();
+    let id_for_save = id.clone();
+    let target_for_save = target.clone();
+    {
+        let mut instances = state.instances.write().await;
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+            inst.cockpit_agent = Some(target_for_save.clone());
+            inst.cockpit_acp_session_id = None;
+            if let Some(m) = &model {
+                inst.cockpit_model = Some(m.clone());
+            }
+        }
+    }
+    if let Ok(storage) = crate::session::Storage::new(&profile_for_save) {
+        if let Err(e) = storage.update(|instances, _groups| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_save) {
+                inst.cockpit_agent = Some(target_for_save.clone());
+                inst.cockpit_acp_session_id = None;
+            }
+            Ok(())
+        }) {
+            tracing::error!(
+                target: "http.api.cockpit",
+                session = %id_for_save,
+                "failed to persist cockpit_agent after switch: {e}"
+            );
+        }
+    }
+
+    let switch_seq = state.cockpit_supervisor.publish_agent_switched(
+        &id,
+        from_agent.clone(),
+        target.clone(),
+        "rate_limited".into(),
+    );
+
+    Json(SwitchAgentResponse {
+        session_id: id,
+        agent: target,
+        before_seq,
+        switch_seq,
+        status: "running",
+    })
+    .into_response()
+}
+
+pub async fn cockpit_prompt(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    req: Result<Json<PromptRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    let Json(req) = match req {
+        Ok(j) => j,
+        Err(rej) => return rej.into_response(),
+    };
+    // Touch the instance before forwarding so an archived or
+    // currently-snoozed session auto-wakes the same way the tmux send
+    // path does (`/api/sessions/{id}/send`). `touch_last_accessed`
+    // clears `archived_at` and `snoozed_until` so the cockpit
+    // reconciler stops skipping the session on its next ~2s tick and
+    // respawns the worker; the frontend's queue drains as soon as the
+    // fresh `AcpSessionAssigned` lands. See #1581.
+    //
+    // The in-memory mutation and the disk persistence are both held
+    // under `state.instance_lock(&id)` so they serialize against
+    // other session-mutating endpoints (archive / snooze / pin /
+    // rename) on the same id. Without this guard, a concurrent
+    // archive PATCH could interleave with the touch and produce a
+    // lost write (archive sets archived_at = Some, touch clears it,
+    // archive's persist lands first, touch's persist lands second
+    // and overwrites the archive).
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
+    let triage_changed = {
+        let mut instances = state.instances.write().await;
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+            let was_sunk = inst.is_archived() || inst.is_snoozed();
+            if was_sunk {
+                inst.touch_last_accessed();
+            }
+            was_sunk
+        } else {
+            false
+        }
+    };
+    if triage_changed {
+        let profile = {
+            let instances = state.instances.read().await;
+            instances
+                .iter()
+                .find(|i| i.id == id)
+                .map(|i| i.source_profile.clone())
+                .unwrap_or_default()
+        };
+        if let Ok(storage) = crate::session::Storage::new(&profile) {
+            let id_clone = id.clone();
+            let session_id_for_log = id.clone();
+            match tokio::task::spawn_blocking(move || {
+                storage.update(|instances, _groups| {
+                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
+                        inst.touch_last_accessed();
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    target: "http.api.cockpit",
+                    session = %session_id_for_log,
+                    "failed to save after triage auto-wake: {e}"
+                ),
+                Err(join_err) => tracing::warn!(
+                    target: "http.api.cockpit",
+                    session = %session_id_for_log,
+                    "spawn_blocking join error during triage auto-wake save: {join_err}"
+                ),
+            }
+        }
+    }
+    // Drop the per-session lock before reaching out to the
+    // supervisor. publish_user_prompt and send_prompt take their own
+    // locks downstream; holding ours across the agent forward would
+    // serialize prompts unnecessarily and stall siblings.
+    drop(_guard);
     // Publish the user's prompt into the event stream BEFORE forwarding
     // to the agent so the replay buffer / on-disk store captures it
     // even if the agent forward fails. The frontend treats UserPromptSent
     // as authoritative and dedupes against its own optimistic row.
     state
         .cockpit_supervisor
-        .publish_user_prompt(&id, req.text.clone());
+        .publish_user_prompt(&id, req.text.clone())
+        .await;
     match state.cockpit_supervisor.send_prompt(&id, &req.text).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         Err(SupervisorError::UnknownSession(_)) => {
@@ -406,32 +734,74 @@ pub async fn cockpit_enable(
 
     // Persist before spawning so a crash mid-swap leaves us in the
     // declared end state, not a half-broken intermediate.
+    //
+    // The on-disk and in-memory updates mutate ONLY the cockpit-specific
+    // field (`cockpit_mode = true`). Wholesale replacement with a
+    // pre-lock snapshot would clobber concurrent writes to other
+    // fields (status, last_accessed, agent_session_id) made by the
+    // status poll loop or other handlers between the snapshot and the
+    // lock acquisition.
     {
         let mut instances = state.instances.write().await;
         if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
-            *slot = instance.clone();
+            slot.cockpit_mode = true;
         }
-        if let Ok(storage) = crate::session::Storage::new(&profile) {
-            let scoped: Vec<_> = instances
-                .iter()
-                .filter(|i| i.source_profile == profile)
-                .cloned()
-                .collect();
-            if let Err(e) = storage.save(&scoped) {
-                tracing::error!(target: "cockpit.switch", "save after enable: {e}");
+    }
+    let id_for_save = id.clone();
+    let profile_for_save = profile.clone();
+    let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let storage = crate::session::Storage::new(&profile_for_save)?;
+        storage.update(|all, _groups| {
+            if let Some(slot) = all.iter_mut().find(|i| i.id == id_for_save) {
+                slot.cockpit_mode = true;
             }
+            Ok(())
+        })?;
+        Ok(())
+    })
+    .await;
+    match save_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::error!(target: "cockpit.switch", "save after enable: {e}");
+        }
+        Err(join_err) => {
+            tracing::error!(target: "cockpit.switch", "save task panicked after enable: {join_err}");
         }
     }
 
     // Spawn the cockpit worker. If this fails the supervisor publishes
     // an AgentStartupError that the UI surfaces as the red banner; we
     // still return 200 because the substrate swap itself succeeded.
+    // Container ensure runs inside the spawned task so the HTTP
+    // response isn't held open through a docker pull/create.
     let cwd = std::path::PathBuf::from(&instance.project_path);
     let supervisor = state.cockpit_supervisor.clone();
     let session_id = id.clone();
     let model = instance.cockpit_model.clone();
     let stored_acp_session_id = instance.cockpit_acp_session_id.clone();
+    let yolo_mode = instance.yolo_mode;
+    let profile_for_spawn = profile.clone();
+    let state_for_spawn = state.clone();
     tokio::spawn(async move {
+        let inst_lock = state_for_spawn.instance_lock(&session_id).await;
+        let sandbox_info = match crate::cockpit::sandbox::ensure_container_for_session(
+            &state_for_spawn.instances,
+            &inst_lock,
+            &session_id,
+            false,
+        )
+        .await
+        {
+            Ok(info) => info,
+            Err(e) => {
+                let message = format!("container start failed: {e}");
+                tracing::warn!(target: "cockpit.switch", session = %session_id, "container ensure failed: {e}");
+                supervisor.publish_startup_error(&session_id, message);
+                return;
+            }
+        };
+        let source_profile = sandbox_info.as_ref().map(|_| profile_for_spawn);
         if let Err(e) = supervisor
             .spawn(crate::cockpit::supervisor::SpawnRequest {
                 session_id: session_id.clone(),
@@ -441,6 +811,9 @@ pub async fn cockpit_enable(
                 provider_env: vec![],
                 model,
                 stored_acp_session_id,
+                sandbox_info,
+                source_profile,
+                yolo_mode,
             })
             .await
         {
@@ -523,20 +896,40 @@ pub async fn cockpit_disable(
     // Persist + start tmux. start() now no longer short-circuits for
     // cockpit_mode, so it will create a fresh tmux session and run
     // the agent CLI in the pane.
+    //
+    // The on-disk and in-memory updates mutate ONLY the cockpit-specific
+    // fields (`cockpit_mode = false`, `cockpit_acp_session_id = None`).
+    // Wholesale replacement with a pre-lock snapshot would clobber
+    // concurrent writes to other fields made by the status poll loop or
+    // other handlers between the snapshot and the lock acquisition.
     {
         let mut instances = state.instances.write().await;
         if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
-            *slot = instance.clone();
+            slot.cockpit_mode = false;
+            slot.cockpit_acp_session_id = None;
         }
-        if let Ok(storage) = crate::session::Storage::new(&profile) {
-            let scoped: Vec<_> = instances
-                .iter()
-                .filter(|i| i.source_profile == profile)
-                .cloned()
-                .collect();
-            if let Err(e) = storage.save(&scoped) {
-                tracing::error!(target: "cockpit.switch", "save after disable: {e}");
+    }
+    let id_for_save = id.clone();
+    let profile_for_save = profile.clone();
+    let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let storage = crate::session::Storage::new(&profile_for_save)?;
+        storage.update(|all, _groups| {
+            if let Some(slot) = all.iter_mut().find(|i| i.id == id_for_save) {
+                slot.cockpit_mode = false;
+                slot.cockpit_acp_session_id = None;
             }
+            Ok(())
+        })?;
+        Ok(())
+    })
+    .await;
+    match save_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::error!(target: "cockpit.switch", "save after disable: {e}");
+        }
+        Err(join_err) => {
+            tracing::error!(target: "cockpit.switch", "save task panicked after disable: {join_err}");
         }
     }
 
@@ -568,11 +961,15 @@ pub struct SetModeRequest {
 pub async fn cockpit_set_mode(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(req): Json<SetModeRequest>,
+    req: Result<Json<SetModeRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    let Json(req) = match req {
+        Ok(j) => j,
+        Err(rej) => return rej.into_response(),
+    };
     match state.cockpit_supervisor.set_mode(&id, &req.mode_id).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         Err(SupervisorError::UnknownSession(_)) => {
@@ -586,14 +983,58 @@ pub async fn cockpit_set_mode(
     }
 }
 
-pub async fn resolve_approval(
+#[derive(Debug, Deserialize)]
+pub struct SetConfigOptionRequest {
+    pub config_id: String,
+    pub value: String,
+}
+
+/// Set a per-session selector (model, reasoning effort, etc.) via ACP
+/// `session/set_config_option`. The cockpit treats every category
+/// through this one endpoint; rejection surfaces as a non-blocking
+/// `Event::ConfigOptionSwitchFailed` notice on the broadcast bus. See
+/// #1403.
+pub async fn cockpit_set_config_option(
     State(state): State<Arc<AppState>>,
-    Path((id, nonce_str)): Path<(String, String)>,
-    Json(req): Json<ResolveApprovalRequest>,
+    Path(id): Path<String>,
+    req: Result<Json<SetConfigOptionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    let Json(req) = match req {
+        Ok(j) => j,
+        Err(rej) => return rej.into_response(),
+    };
+    match state
+        .cockpit_supervisor
+        .set_config_option(&id, &req.config_id, &req.value)
+        .await
+    {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(SupervisorError::UnknownSession(_)) => {
+            (StatusCode::NOT_FOUND, "session has no running cockpit").into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("set_config_option failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn resolve_approval(
+    State(state): State<Arc<AppState>>,
+    Path((id, nonce_str)): Path<(String, String)>,
+    req: Result<Json<ResolveApprovalRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    let Json(req) = match req {
+        Ok(j) => j,
+        Err(rej) => return rej.into_response(),
+    };
     let nonce = Nonce(nonce_str);
     match state
         .cockpit_supervisor
@@ -639,6 +1080,7 @@ pub async fn cockpit_context_primer(
         included_turn_count: primer.included_turn_count,
         truncated: primer.truncated,
         max_chars: primer.max_chars,
+        unprocessed_prompt: primer.unprocessed_prompt,
     })
     .into_response()
 }
@@ -707,7 +1149,7 @@ pub struct MasterStateResponse {
 /// gating endpoints pick up the new value without a server restart.
 pub async fn set_cockpit_master(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<SetMasterRequest>,
+    req: Result<Json<SetMasterRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return (
@@ -719,6 +1161,10 @@ pub async fn set_cockpit_master(
         )
             .into_response();
     }
+    let Json(req) = match req {
+        Ok(j) => j,
+        Err(rej) => return rej.into_response(),
+    };
     let new_value = req.enabled;
     // The atomic is the live source of truth — the reconciler and
     // every gating REST handler reads it. Flip it FIRST so an

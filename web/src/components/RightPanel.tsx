@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { DiffFileList } from "./diff/DiffFileList";
+import { CommentsBanner } from "./diff/comments/CommentsBanner";
 import { useTerminal } from "../hooks/useTerminal";
 import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
 import { BackToLiveButton } from "./BackToLiveButton";
 import { KeyboardFab } from "./KeyboardFab";
 import { ensureTerminal } from "../lib/api";
+import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import type { RepoBase, RichDiffFile, SessionResponse } from "../lib/types";
 import {
   FOCUS_TERMINAL_EVENT,
@@ -13,7 +15,7 @@ import {
   setPendingTerminalFocus,
   type FocusTerminalDetail,
 } from "../lib/terminalFocus";
-import "@wterm/dom/css";
+import "@xterm/xterm/css/xterm.css";
 
 const VSPLIT_STORAGE_KEY = "aoe-right-vsplit";
 const DEFAULT_TOP_RATIO = 0.5;
@@ -21,14 +23,10 @@ const MIN_TOP_PX = 80;
 const MIN_BOTTOM_PX = 120;
 
 function loadSavedRatio(): number {
-  try {
-    const saved = localStorage.getItem(VSPLIT_STORAGE_KEY);
-    if (saved) {
-      const r = parseFloat(saved);
-      if (r > 0 && r < 1) return r;
-    }
-  } catch {
-    // ignore
+  const saved = safeGetItem(VSPLIT_STORAGE_KEY);
+  if (saved) {
+    const r = parseFloat(saved);
+    if (r > 0 && r < 1) return r;
   }
   return DEFAULT_TOP_RATIO;
 }
@@ -43,6 +41,16 @@ interface Props {
   selectedFilePath: string | null;
   selectedRepoName: string | undefined;
   onSelectFile: (path: string, repoName?: string) => void;
+  /** Re-fetch the diff. Called after the user changes the per-session
+   *  base-branch override so the file list reflects the new comparison. */
+  onDiffRefresh: () => void;
+  /** Diff-comments banner state (#928). Hidden on tmux sessions. */
+  commentsEnabled: boolean;
+  commentsCount: number;
+  commentsSendEnabled: boolean;
+  commentsSendDisabledReason?: string;
+  onOpenSendDialog: () => void;
+  onDiscardAllComments: () => void;
 }
 
 type ShellMode = "host" | "container";
@@ -98,65 +106,19 @@ function PairedTerminal({
     };
   }, [sessionId, mode]);
 
-  // Scroll-to-bottom on keyboard height changes (same fix as TerminalView).
-  const resizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const scrollRafRef = useRef(0);
+  // Dispatch a window resize after keyboard transitions so anything else
+  // watching layout is nudged; the hook's ResizeObserver already refits
+  // the terminal grid automatically.
   useLayoutEffect(() => {
-    if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
-    cancelAnimationFrame(scrollRafRef.current);
-    scrollRafRef.current = requestAnimationFrame(() => {
-      scrollRafRef.current = requestAnimationFrame(() => {
-        const el = termRef.current?.element;
-        if (el) el.scrollTop = el.scrollHeight;
-      });
-    });
-    resizeTimerRef.current = setTimeout(() => {
-      resizeTimerRef.current = null;
+    const t = setTimeout(() => {
       window.dispatchEvent(new Event("resize"));
-      const el = termRef.current?.element;
-      if (el) el.scrollTop = el.scrollHeight;
     }, 150);
-    return () => {
-      if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
-      cancelAnimationFrame(scrollRafRef.current);
-    };
-  }, [keyboardHeight, keyboardOpen, termRef]);
-
-  // Pin scrollTop on wterm scrollTop=0 mid-session resets (same fix
-  // as TerminalView). See that file for the rationale; this mirror
-  // covers the side terminal pane in the diff viewer.
-  const isInScrollbackRef = useRef(state.isInScrollback);
-  useEffect(() => {
-    isInScrollbackRef.current = state.isInScrollback;
-  }, [state.isInScrollback]);
-  useEffect(() => {
-    let raf = 0;
-    const onScroll = (e: Event) => {
-      const el = termRef.current?.element;
-      if (!el) return;
-      const target = e.target as Node | null;
-      if (target !== el && !(target && el.contains(target))) return;
-      cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(() => {
-        if (isInScrollbackRef.current) return;
-        const elNow = termRef.current?.element;
-        if (!elNow) return;
-        const max = Math.max(0, elNow.scrollHeight - elNow.clientHeight);
-        if (elNow.scrollTop < max - 1) {
-          elNow.scrollTop = elNow.scrollHeight;
-        }
-      });
-    };
-    document.addEventListener("scroll", onScroll, { passive: true, capture: true });
-    return () => {
-      document.removeEventListener("scroll", onScroll, true);
-      cancelAnimationFrame(raf);
-    };
-  }, [termRef]);
+    return () => clearTimeout(t);
+  }, [keyboardHeight, keyboardOpen]);
 
   const toggleKeyboard = useCallback(() => {
     const term = termRef.current;
-    if (!term) return;
+    if (!term?.element) return;
     const ta = term.element.querySelector("textarea");
     if (keyboardOpen) {
       ta?.blur();
@@ -169,7 +131,7 @@ function PairedTerminal({
   // Returns true if focus was applied. Callers can fall back to the pending
   // latch when the textarea isn't in the DOM yet (PTY still booting).
   const focusSelf = useCallback(() => {
-    const ta = termRef.current?.element.querySelector("textarea");
+    const ta = termRef.current?.element?.querySelector("textarea");
     if (ta instanceof HTMLElement) {
       ta.focus();
       return true;
@@ -273,6 +235,13 @@ export function RightPanel({
   selectedFilePath,
   selectedRepoName,
   onSelectFile,
+  onDiffRefresh,
+  commentsEnabled,
+  commentsCount,
+  commentsSendEnabled,
+  commentsSendDisabledReason,
+  onOpenSendDialog,
+  onDiscardAllComments,
 }: Props) {
   const [shellMode, setShellMode] = useState<ShellMode>("host");
   const isSandboxed = session?.is_sandboxed ?? false;
@@ -308,11 +277,7 @@ export function RightPanel({
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
       setTopRatio((r) => {
-        try {
-          localStorage.setItem(VSPLIT_STORAGE_KEY, String(r));
-        } catch {
-          // quota exceeded or private mode; non-fatal
-        }
+        safeSetItem(VSPLIT_STORAGE_KEY, String(r));
         return r;
       });
       window.dispatchEvent(new Event("resize"));
@@ -361,6 +326,15 @@ export function RightPanel({
         style={{ flexBasis: `${topRatio * 100}%` }}
         className="flex flex-col min-h-0 overflow-hidden"
       >
+        {commentsEnabled && commentsCount > 0 && (
+          <CommentsBanner
+            count={commentsCount}
+            sendEnabled={commentsSendEnabled}
+            sendDisabledReason={commentsSendDisabledReason}
+            onSend={onOpenSendDialog}
+            onDiscardAll={onDiscardAllComments}
+          />
+        )}
         <DiffFileList
           files={files}
           perRepoBases={perRepoBases}
@@ -369,6 +343,10 @@ export function RightPanel({
           selectedRepoName={selectedRepoName}
           loading={filesLoading}
           onSelectFile={onSelectFile}
+          sessionId={sessionId}
+          repoPath={session?.main_repo_path ?? session?.project_path ?? null}
+          baseBranchOverride={session?.base_branch_override ?? null}
+          onBaseBranchChanged={onDiffRefresh}
         />
       </div>
 

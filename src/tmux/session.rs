@@ -84,7 +84,7 @@ impl Session {
 
         // Note: With -d flag, tmux new-session returns 0 even if the shell command fails.
         // Log args at debug level for troubleshooting.
-        tracing::debug!(
+        tracing::debug!(target: "tmux.command",
             "tmux new-session args: {:?}",
             args.iter()
                 .map(|a| crate::session::environment::redact_env_values(a))
@@ -374,7 +374,7 @@ impl Session {
         const PASTE_BYTE_THRESHOLD: usize = 2048;
         let use_paste_buffer = byte_len >= PASTE_BYTE_THRESHOLD || text.contains('\n');
 
-        tracing::debug!(
+        tracing::debug!(target: "tmux.command",
             "send_keys_with_delay: bytes={} lines={} max_line={} use_paste_buffer={} target={}",
             byte_len,
             line_count,
@@ -399,6 +399,24 @@ impl Session {
         Self::tmux_send(&target, &["Enter"])?;
 
         Ok(())
+    }
+
+    /// Restore automatic window sizing after live-send forced a manual
+    /// size. tmux's `resize-window -x -y` silently switches the window-
+    /// size option to `manual`, so without this call a later
+    /// `attach-session` from a full-size terminal would keep the window
+    /// at the small preview dimensions live-send left behind. Re-setting
+    /// the option to `latest` is the documented escape hatch and matches
+    /// the policy `append_window_size_args` installs at session create.
+    /// Best-effort: failures (session gone, tmux ENOENT) are swallowed
+    /// so a stuck pane never blocks the user's exit from live mode.
+    pub fn reset_size_to_latest_client(&self) {
+        if !self.exists() {
+            return;
+        }
+        let _ = Command::new("tmux")
+            .args(["set-option", "-t", &self.name, "window-size", "latest"])
+            .output();
     }
 
     /// Deliver `text` to `target` via tmux's load-buffer + paste-buffer.
@@ -516,6 +534,7 @@ fn build_create_args(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::TmuxTestSession;
     use super::*;
 
     /// Helper: check if tmux is available for tests that need it
@@ -535,7 +554,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_remain_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_remain");
+        let session_name = guard.name().to_string();
         // Chain set-option -p with new-session to avoid race condition
         let output = Command::new("tmux")
             .args([
@@ -580,11 +600,6 @@ mod tests {
             .map(|s| s.trim() == "1")
             .unwrap_or(false);
         assert!(pane_dead, "Pane should be dead after command exits");
-
-        // Clean up
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 
     #[test]
@@ -595,7 +610,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_alive_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_alive");
+        let session_name = guard.name().to_string();
 
         // Create a session with a long-running command
         let output = Command::new("tmux")
@@ -632,11 +648,6 @@ mod tests {
             .map(|s| s.trim() == "1")
             .unwrap_or(false);
         assert!(!pane_dead, "Pane should be alive while command is running");
-
-        // Clean up
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 
     /// Regression test for #435: with multiple tmux windows, pane health
@@ -650,7 +661,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_multiwin_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_multiwin");
+        let session_name = guard.name().to_string();
 
         // Create session with a long-running command in window 0
         let output = Command::new("tmux")
@@ -709,11 +721,6 @@ mod tests {
             !is_pane_dead(&session_name),
             "is_pane_dead should check the first window's pane, not the active window"
         );
-
-        // Clean up
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 
     /// Regression test: capture_pane must target the first window's pane
@@ -727,7 +734,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_capture_multiwin_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_capture_multiwin");
+        let session_name = guard.name().to_string();
 
         // Create session running sleep in the first window
         let output = Command::new("tmux")
@@ -783,11 +791,6 @@ mod tests {
             !session.is_pane_running_shell(),
             "is_pane_running_shell should check first window (sleep), not active window (sh)"
         );
-
-        // Clean up
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 
     /// Regression test: is_pane_running_shell must target the first window's
@@ -800,7 +803,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_shell_multiwin_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_shell_multiwin");
+        let session_name = guard.name().to_string();
 
         // Create session running sleep (not a shell) in the first window
         let output = Command::new("tmux")
@@ -845,11 +849,6 @@ mod tests {
             !is_pane_running_shell(&session_name),
             "is_pane_running_shell should target first window (sleep), not active window (sh)"
         );
-
-        // Clean up
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 
     /// Regression test for #488: when a user creates a split pane and makes it
@@ -863,7 +862,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_splitpane_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_splitpane");
+        let session_name = guard.name().to_string();
 
         // Create session with a long-running command (the "agent")
         let output = Command::new("tmux")
@@ -916,11 +916,6 @@ mod tests {
             !is_pane_running_shell(&session_name),
             "is_pane_running_shell should check pane 0 (sleep), not the active split pane (shell)"
         );
-
-        // Clean up
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 
     /// Regression test for #488: ensure status checks work correctly when both
@@ -933,7 +928,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_splitpbi_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_splitpbi");
+        let session_name = guard.name().to_string();
 
         // Create session with pane-base-index 0 pinned (as aoe does)
         let output = Command::new("tmux")
@@ -990,11 +986,6 @@ mod tests {
             !is_pane_running_shell(&session_name),
             "is_pane_running_shell should check pane 0 (sleep) with pane-base-index pinned to 0"
         );
-
-        // Clean up
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 
     #[test]
@@ -1066,7 +1057,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_shell_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_shell");
+        let session_name = guard.name().to_string();
 
         let output = Command::new("tmux")
             .args([
@@ -1090,10 +1082,6 @@ mod tests {
             is_pane_running_shell(&session_name),
             "Session running sh should be detected as a shell"
         );
-
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 
     #[test]
@@ -1104,7 +1092,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_noshell_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_noshell");
+        let session_name = guard.name().to_string();
 
         let output = Command::new("tmux")
             .args([
@@ -1129,10 +1118,6 @@ mod tests {
             !is_pane_running_shell(&session_name),
             "Session running 'sleep' should not be detected as a shell"
         );
-
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 
     /// Regression test for the dead-pane restart bug: a session whose pane
@@ -1146,7 +1131,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_respawn_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_respawn");
+        let session_name = guard.name().to_string();
 
         // Start a session with a command that exits immediately and
         // remain-on-exit set, so we end up with a dead pane. Pin
@@ -1209,10 +1195,6 @@ mod tests {
             !respawned_again,
             "respawn_dead_pane should report no-op on live pane"
         );
-
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 
     /// respawn_dead_pane on a non-existent session is a safe no-op.

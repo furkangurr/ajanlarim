@@ -16,6 +16,8 @@ pub mod process;
 pub mod server;
 pub mod session;
 pub mod sound;
+mod status_hooks;
+pub mod task_util;
 pub mod terminal;
 pub mod tmux;
 pub mod tui;

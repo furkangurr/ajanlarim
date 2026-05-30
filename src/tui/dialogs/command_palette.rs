@@ -14,6 +14,7 @@ use tui_input::Input;
 use unicode_width::UnicodeWidthStr;
 
 use super::DialogResult;
+use crate::tui::components::set_prefixed_input_cursor_position;
 use crate::tui::styles::Theme;
 
 /// Group buckets, rendered in this order. Mirrors `web/src/components/command-palette/groups.ts`.
@@ -56,6 +57,22 @@ pub enum PaletteAction {
     Key(KeyEvent),
     /// Move the cursor to a position in `flat_items` (used for session/group jump items).
     JumpToCursor(usize),
+    /// Open a tool session by name (lazygit, yazi, etc.)
+    ToolSession(String),
+    /// Enter live-send mode on the selected session. A dedicated variant
+    /// (rather than synthesizing the keypress) so the palette routes
+    /// correctly in strict mode, where the `m` binding is intentionally
+    /// defanged for the typing-guard.
+    EnterLiveSend,
+    /// Open the sort-order picker. Dedicated variant for the same reason as
+    /// `EnterLiveSend`: in strict mode, bare lowercase `o` is defanged for
+    /// the typing-guard, so a synthesized `Char('o')` would not fire.
+    OpenSortPicker,
+    /// Open the group-by picker. Dedicated variant because bare `g` is
+    /// defanged in strict mode (typing-guard) and `Char('G')` is bound to
+    /// End, so no single synthesized key reaches the show helper in both
+    /// modes.
+    OpenGroupPicker,
 }
 
 /// One entry in the palette. `payload` is what gets returned when the user picks it.
@@ -128,6 +145,28 @@ pub fn builtin_commands(serve_enabled: bool, strict_hotkeys: bool) -> Vec<Palett
             payload: PaletteAction::Key(key('m')),
         },
         PaletteCommand {
+            id: "live-send",
+            title: "Live send: pass keys straight to the agent".to_string(),
+            group: PaletteGroup::Actions,
+            keywords: vec![
+                "live",
+                "passthrough",
+                "attach",
+                "keys",
+                "escape",
+                "arrow",
+                "tab",
+                "interrupt",
+            ],
+            // Tab is the direct binding in both modes (settings / cockpit
+            // / dialogs own their own Tab handlers, the home view's top
+            // level was free). Palette routing uses the dedicated
+            // variant so synthesizing a Tab keypress never accidentally
+            // re-fires this entry from inside a sub-handler.
+            hotkey: "Tab",
+            payload: PaletteAction::EnterLiveSend,
+        },
+        PaletteCommand {
             id: "stop",
             title: "Stop session".to_string(),
             group: PaletteGroup::Actions,
@@ -152,6 +191,38 @@ pub fn builtin_commands(serve_enabled: bool, strict_hotkeys: bool) -> Vec<Palett
             payload: PaletteAction::Key(key('r')),
         },
         PaletteCommand {
+            id: "favorite",
+            title: "Toggle favorite".to_string(),
+            group: PaletteGroup::Actions,
+            keywords: vec!["star", "pin", "fav"],
+            hotkey: hotkey_label("f", "F", strict_hotkeys),
+            payload: PaletteAction::Key(key('f')),
+        },
+        PaletteCommand {
+            id: "archive",
+            title: "Toggle archive".to_string(),
+            group: PaletteGroup::Actions,
+            keywords: vec!["park", "stash", "done", "zzz"],
+            hotkey: hotkey_label("z", "Z", strict_hotkeys),
+            payload: PaletteAction::Key(key('z')),
+        },
+        PaletteCommand {
+            id: "snooze",
+            title: "Toggle snooze".to_string(),
+            group: PaletteGroup::Actions,
+            keywords: vec!["later", "defer", "wait"],
+            hotkey: hotkey_label("h", "H", strict_hotkeys),
+            payload: PaletteAction::Key(key('h')),
+        },
+        PaletteCommand {
+            id: "restart",
+            title: "Restart session".to_string(),
+            group: PaletteGroup::Actions,
+            keywords: vec!["reload", "respawn", "reset"],
+            hotkey: hotkey_label("e", "E", strict_hotkeys),
+            payload: PaletteAction::Key(key('e')),
+        },
+        PaletteCommand {
             id: "diff",
             title: "Open diff view".to_string(),
             group: PaletteGroup::Views,
@@ -168,20 +239,20 @@ pub fn builtin_commands(serve_enabled: bool, strict_hotkeys: bool) -> Vec<Palett
             payload: PaletteAction::Key(key('t')),
         },
         PaletteCommand {
-            id: "cycle-sort",
-            title: "Cycle sort order".to_string(),
+            id: "pick-sort",
+            title: "Sort order".to_string(),
             group: PaletteGroup::Views,
-            keywords: vec!["order", "sort"],
+            keywords: vec!["order", "sort", "pick"],
             hotkey: hotkey_label("o", "O", strict_hotkeys),
-            payload: PaletteAction::Key(key('o')),
+            payload: PaletteAction::OpenSortPicker,
         },
         PaletteCommand {
-            id: "cycle-group-by",
-            title: "Cycle group by".to_string(),
+            id: "pick-group-by",
+            title: "Group by".to_string(),
             group: PaletteGroup::Views,
-            keywords: vec!["group", "project"],
+            keywords: vec!["group", "project", "pick"],
             hotkey: hotkey_label("g", "Ctrl+G", strict_hotkeys),
-            payload: PaletteAction::Key(key('g')),
+            payload: PaletteAction::OpenGroupPicker,
         },
         PaletteCommand {
             id: "next-waiting",
@@ -190,6 +261,14 @@ pub fn builtin_commands(serve_enabled: bool, strict_hotkeys: bool) -> Vec<Palett
             keywords: vec!["jump", "next", "waiting", "idle"],
             hotkey: "w",
             payload: PaletteAction::Key(key('w')),
+        },
+        PaletteCommand {
+            id: "toggle-preview-info",
+            title: "Toggle preview info header".to_string(),
+            group: PaletteGroup::Views,
+            keywords: vec!["hide", "show", "info", "header", "preview"],
+            hotkey: hotkey_label("i", "I", strict_hotkeys),
+            payload: PaletteAction::Key(key('i')),
         },
         PaletteCommand {
             id: "settings",
@@ -255,6 +334,14 @@ pub struct CommandPaletteDialog {
     matches: Vec<usize>,
     /// Cursor within `matches`.
     selected: usize,
+    /// Captured by `render`: the screen row of each visible (non-header)
+    /// item along with its `matches` index. Drives click + hover routing
+    /// without having to re-derive the scroll math.
+    visible_item_rows: Vec<(u16, usize)>,
+    /// Rect of the rendered dialog frame. Used by click routing to
+    /// distinguish "inside dialog but missed a row" (no-op) from
+    /// "outside dialog" (cancel).
+    dialog_area: Rect,
 }
 
 impl CommandPaletteDialog {
@@ -264,9 +351,54 @@ impl CommandPaletteDialog {
             entries,
             matches: Vec::new(),
             selected: 0,
+            visible_item_rows: Vec::new(),
+            dialog_area: Rect::default(),
         };
         dialog.recompute_matches();
         dialog
+    }
+
+    pub fn handle_click(&mut self, col: u16, row: u16) -> DialogResult<PaletteAction> {
+        if !self
+            .dialog_area
+            .contains(ratatui::layout::Position::from((col, row)))
+        {
+            return DialogResult::Cancel;
+        }
+        // Hit-test the visible item rows.
+        let Some(display_idx) = self
+            .visible_item_rows
+            .iter()
+            .find(|(r, _)| *r == row)
+            .map(|(_, idx)| *idx)
+        else {
+            return DialogResult::Continue;
+        };
+        self.selected = display_idx;
+        let Some(&entry_idx) = self.matches.get(self.selected) else {
+            return DialogResult::Continue;
+        };
+        let cmd = self.entries.swap_remove(entry_idx);
+        DialogResult::Submit(cmd.payload)
+    }
+
+    pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {
+        if col == 0 && row == 0 {
+            return false;
+        }
+        let Some(display_idx) = self
+            .visible_item_rows
+            .iter()
+            .find(|(r, _)| *r == row)
+            .map(|(_, idx)| *idx)
+        else {
+            return false;
+        };
+        if self.selected == display_idx {
+            return false;
+        }
+        self.selected = display_idx;
+        true
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<PaletteAction> {
@@ -348,10 +480,12 @@ impl CommandPaletteDialog {
         self.selected = 0;
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.visible_item_rows.clear();
         let dialog_width: u16 = area.width.saturating_sub(8).clamp(40, 70);
         let dialog_height: u16 = area.height.saturating_sub(6).clamp(10, 20);
         let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
+        self.dialog_area = dialog_area;
 
         frame.render_widget(Clear, dialog_area);
 
@@ -386,6 +520,7 @@ impl CommandPaletteDialog {
             Span::styled("_", Style::default().fg(theme.accent)),
         ]);
         frame.render_widget(Paragraph::new(input_line), chunks[0]);
+        set_prefixed_input_cursor_position(frame, chunks[0], "> ", &self.input);
 
         // Separator
         let sep = "─".repeat(chunks[1].width as usize);
@@ -400,27 +535,21 @@ impl CommandPaletteDialog {
         // List
         let list_area = chunks[2];
         let visible = list_area.height as usize;
-        let scroll_offset = if self.selected >= visible {
-            self.selected - visible + 1
-        } else {
-            0
-        };
 
         let mut lines: Vec<Line> = Vec::new();
+        // Parallel to `lines`: None for a group-header line, Some(idx)
+        // for an item line where idx is the `matches` index.
+        let mut line_to_display_idx: Vec<Option<usize>> = Vec::new();
+        let mut selected_line: usize = 0;
         if self.matches.is_empty() {
             lines.push(Line::from(Span::styled(
                 "  No matches",
                 Style::default().fg(theme.dimmed),
             )));
+            line_to_display_idx.push(None);
         } else {
             let mut last_group: Option<PaletteGroup> = None;
-            for (display_idx, &entry_idx) in self
-                .matches
-                .iter()
-                .enumerate()
-                .skip(scroll_offset)
-                .take(visible)
-            {
+            for (display_idx, &entry_idx) in self.matches.iter().enumerate() {
                 let cmd = &self.entries[entry_idx];
 
                 // Show group header on transition (only when no query, since
@@ -431,10 +560,14 @@ impl CommandPaletteDialog {
                         cmd.group.label(),
                         Style::default().fg(theme.accent).bold(),
                     )));
+                    line_to_display_idx.push(None);
                     last_group = Some(cmd.group);
                 }
 
                 let is_selected = display_idx == self.selected;
+                if is_selected {
+                    selected_line = lines.len();
+                }
                 let prefix = if is_selected { "▶ " } else { "  " };
                 let title_style = if is_selected {
                     Style::default().fg(theme.title).bold()
@@ -466,9 +599,19 @@ impl CommandPaletteDialog {
                     spans.push(Span::styled(cmd.hotkey, Style::default().fg(theme.hint)));
                 }
                 lines.push(Line::from(spans));
+                line_to_display_idx.push(Some(display_idx));
             }
         }
-        frame.render_widget(Paragraph::new(lines), list_area);
+        let start = selected_line.saturating_sub(visible.saturating_sub(1));
+        let end = (start + visible).min(lines.len());
+        // Capture screen rows for visible item lines so a click can map
+        // directly back to the `matches` display index.
+        for (i, line_idx) in (start..end).enumerate() {
+            if let Some(idx) = line_to_display_idx.get(line_idx).copied().flatten() {
+                self.visible_item_rows.push((list_area.y + i as u16, idx));
+            }
+        }
+        frame.render_widget(Paragraph::new(lines[start..end].to_vec()), list_area);
 
         // Hint footer
         let footer_left = Line::from(vec![
@@ -528,6 +671,7 @@ fn sort_indices_by_group(entries: &[PaletteCommand]) -> Vec<usize> {
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
+    use std::collections::{HashMap, HashSet};
 
     fn ke(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -558,6 +702,52 @@ mod tests {
             top.title.to_lowercase().contains("rename"),
             "got: {}",
             top.title
+        );
+    }
+
+    #[test]
+    fn live_send_entry_is_bound_to_tab_with_dedicated_payload() {
+        // Regression guard: the live-send palette entry must keep its
+        // hotkey label and dedicated payload variant. A future rebinding
+        // (e.g., moving Tab elsewhere) or accidentally regressing the
+        // payload to `Key(Tab)` would break strict-mode users who reach
+        // live-send only through the palette.
+        let cmds = builtin_commands(false, false);
+        let entry = cmds
+            .iter()
+            .find(|c| c.id == "live-send")
+            .expect("builtin commands must include 'live-send'");
+        assert_eq!(entry.hotkey, "Tab");
+        assert!(
+            matches!(&entry.payload, PaletteAction::EnterLiveSend),
+            "live-send entry must dispatch PaletteAction::EnterLiveSend"
+        );
+    }
+
+    #[test]
+    fn picker_entries_use_dedicated_payload_variants() {
+        // Regression guard: the sort and group picker palette entries must
+        // route through the dedicated `OpenSortPicker` / `OpenGroupPicker`
+        // payloads rather than synthesizing `Key('o')` / `Key('g')`. The
+        // synthesized lowercase keys are gated by `if !strict_hotkeys` in
+        // `dispatch_action_key`, so a palette pick in strict mode would
+        // silently no-op without the dedicated routing.
+        let cmds = builtin_commands(false, true);
+        let sort = cmds
+            .iter()
+            .find(|c| c.id == "pick-sort")
+            .expect("builtin commands must include 'pick-sort'");
+        assert!(
+            matches!(&sort.payload, PaletteAction::OpenSortPicker),
+            "sort-picker entry must dispatch PaletteAction::OpenSortPicker"
+        );
+        let group = cmds
+            .iter()
+            .find(|c| c.id == "pick-group-by")
+            .expect("builtin commands must include 'pick-group-by'");
+        assert!(
+            matches!(&group.payload, PaletteAction::OpenGroupPicker),
+            "group-picker entry must dispatch PaletteAction::OpenGroupPicker"
         );
     }
 
@@ -688,6 +878,136 @@ mod tests {
             DialogResult::Submit(PaletteAction::JumpToCursor(idx)) => assert_eq!(idx, 7),
             _ => panic!("expected JumpToCursor"),
         }
+    }
+
+    /// Char-class single-key bindings in `home/input.rs` that intentionally
+    /// don't get a palette entry. Pure navigation, dismissal, and meta keys.
+    /// Compared case-insensitively against the chars scanned out of input.rs,
+    /// so listing the lowercase form covers both `j`/`J`, `q`/`Q`, etc.
+    ///
+    /// If you add a new home-view hotkey that shouldn't appear in the palette
+    /// (vim-style nav, search-state-only, modal dismiss), add the lowercase
+    /// char here with a one-line note. Otherwise add a PaletteCommand to
+    /// `builtin_commands` above and the drift test will pass automatically.
+    const PALETTE_EXEMPT: &[(char, &str)] = &[
+        ('j', "vim-style move down"),
+        ('k', "vim-style move up"),
+        ('l', "vim-style move right / expand"),
+        ('q', "quit; Esc and the global quit path cover this"),
+        ('u', "update-banner dismiss; meta key, not an action"),
+        (';', "Tool view escape; only meaningful while in Tool view"),
+        ('/', "search activation; modal trigger, not an action"),
+        ('c', "host/container terminal mode toggle; only valid on a sandboxed session in Terminal view"),
+        ('{', "vim-style page-up (10 rows); pure navigation"),
+        ('}', "vim-style page-down (10 rows); pure navigation"),
+        ('<', "shrink list pane width; layout tweak, not an action"),
+        ('>', "grow list pane width; layout tweak, not an action"),
+    ];
+
+    /// Scan `home/input.rs` for `KeyCode::Char('X')` patterns and return the
+    /// case-folded set of bound chars. Shared by the two drift tests below.
+    /// The test module at the bottom of input.rs constructs synthetic
+    /// KeyEvents in assertions, which would inflate the set with chars that
+    /// aren't real bindings, so we truncate at the first `#[cfg(test)]`.
+    fn home_input_bound_chars() -> HashSet<char> {
+        let src = include_str!("../home/input.rs");
+        let scan_region = match src.find("#[cfg(test)]") {
+            Some(idx) => &src[..idx],
+            None => src,
+        };
+
+        let pat = b"KeyCode::Char('";
+        let bytes = scan_region.as_bytes();
+        let mut bound = HashSet::new();
+        let mut i = 0;
+        while i + pat.len() + 2 <= bytes.len() {
+            if &bytes[i..i + pat.len()] == pat {
+                let c = bytes[i + pat.len()];
+                let close = bytes[i + pat.len() + 1];
+                if close == b'\'' && c.is_ascii_graphic() {
+                    bound.insert((c as char).to_ascii_lowercase());
+                }
+                i += pat.len();
+            } else {
+                i += 1;
+            }
+        }
+        bound
+    }
+
+    /// Guard against the palette drifting from the input dispatcher. Asserts
+    /// every char bound in `home/input.rs` is either covered by a palette
+    /// entry or in `PALETTE_EXEMPT`. Catches the "added a hotkey and forgot
+    /// the palette" failure mode at test time instead of at user-bug-report
+    /// time.
+    #[test]
+    fn home_view_hotkeys_appear_in_palette_or_exempt() {
+        let bound = home_input_bound_chars();
+
+        // Build palette char set with serve toggled on so serve-only commands
+        // still count as covered. `OpenSortPicker` / `OpenGroupPicker` are
+        // dedicated payload variants that exist precisely to route around
+        // strict-mode key gating; they count as covering their canonical
+        // hotkey ('o' and 'g' respectively). `EnterLiveSend` is bound to Tab,
+        // so it does not cover any letter char.
+        let mut palette_chars: HashSet<char> = HashSet::new();
+        for cmd in builtin_commands(true, false) {
+            match cmd.payload {
+                PaletteAction::Key(ke) => {
+                    if let KeyCode::Char(c) = ke.code {
+                        palette_chars.insert(c.to_ascii_lowercase());
+                    }
+                }
+                PaletteAction::OpenSortPicker => {
+                    palette_chars.insert('o');
+                }
+                PaletteAction::OpenGroupPicker => {
+                    palette_chars.insert('g');
+                }
+                PaletteAction::EnterLiveSend
+                | PaletteAction::JumpToCursor(_)
+                | PaletteAction::ToolSession(_) => {}
+            }
+        }
+
+        let exempt: HashMap<char, &str> = PALETTE_EXEMPT.iter().copied().collect();
+
+        let missing: Vec<char> = bound
+            .iter()
+            .filter(|c| !palette_chars.contains(c) && !exempt.contains_key(c))
+            .copied()
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "Hotkeys bound in src/tui/home/input.rs but missing from the command palette \
+             (and not in PALETTE_EXEMPT):\n  {:?}\n\n\
+             Either add a PaletteCommand to builtin_commands() in command_palette.rs, \
+             or add the key to PALETTE_EXEMPT in this test with a note explaining \
+             why it shouldn't appear in the palette.",
+            missing
+        );
+    }
+
+    /// Catch the reverse drift: a PALETTE_EXEMPT entry that's no longer bound
+    /// anywhere in input.rs. Without this, stale exemptions silently mask new
+    /// real bindings that happen to reuse the same key.
+    #[test]
+    fn palette_exempt_entries_are_still_bound() {
+        let bound = home_input_bound_chars();
+
+        let stale: Vec<char> = PALETTE_EXEMPT
+            .iter()
+            .map(|(c, _)| *c)
+            .filter(|c| !bound.contains(c))
+            .collect();
+
+        assert!(
+            stale.is_empty(),
+            "PALETTE_EXEMPT lists keys no longer bound in src/tui/home/input.rs: {:?}. \
+             Remove them from PALETTE_EXEMPT.",
+            stale
+        );
     }
 
     #[test]

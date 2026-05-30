@@ -1,18 +1,24 @@
 //! Misc system endpoints: agents, settings, themes, profiles, filesystem,
 //! groups, docker status, devices, about.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
-use super::{validate_profile_name, ALLOWED_SETTINGS_SECTIONS, SESSION_BLOCKED_FIELDS};
+use super::{
+    body_requires_elevation, validate_profile_name, ALLOWED_GLOBAL_SETTINGS_SECTIONS,
+    ALLOWED_PROFILE_SETTINGS_SECTIONS, SESSION_BLOCKED_FIELDS,
+};
+use crate::server::auth::AuthenticatedSession;
 
 // --- Agents ---
 
 #[derive(Serialize)]
 pub struct AgentInfo {
+    pub kind: String,
     pub name: String,
     pub binary: String,
     pub host_only: bool,
@@ -20,23 +26,53 @@ pub struct AgentInfo {
     pub install_hint: String,
 }
 
-pub async fn list_agents() -> Json<Vec<AgentInfo>> {
-    let result = tokio::task::spawn_blocking(|| {
+fn build_custom_agent_infos(custom_agents: &HashMap<String, String>) -> Vec<AgentInfo> {
+    let mut entries: Vec<_> = custom_agents
+        .iter()
+        .filter(|(name, command)| {
+            !name.trim().is_empty()
+                && !command.trim().is_empty()
+                && crate::agents::get_agent(name).is_none()
+        })
+        .map(|(name, _command)| AgentInfo {
+            kind: "custom".to_string(),
+            name: name.clone(),
+            binary: name.clone(),
+            host_only: false,
+            installed: true,
+            install_hint: "Configured custom agent".to_string(),
+        })
+        .collect();
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    entries
+}
+
+pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentInfo>> {
+    let profile = state.profile.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let config = crate::session::profile_config::resolve_config_or_warn(&profile);
+        let custom_agents = config.session.custom_agents;
         let tools = crate::tmux::AvailableTools::detect();
         let available = tools.available_list();
-        crate::agents::AGENTS
+        let mut agents = crate::agents::AGENTS
             .iter()
             .map(|a| AgentInfo {
+                kind: "builtin".to_string(),
                 name: a.name.to_string(),
                 binary: a.binary.to_string(),
                 host_only: a.host_only,
                 installed: available.iter().any(|s| s == a.name),
                 install_hint: a.install_hint.to_string(),
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        agents.extend(build_custom_agent_infos(&custom_agents));
+        agents
     })
     .await
-    .unwrap_or_default();
+    .unwrap_or_else(|e| {
+        tracing::error!("list_agents task failed: {e}");
+        Vec::new()
+    });
     Json(result)
 }
 
@@ -60,7 +96,7 @@ pub async fn get_settings(
         Ok(config) => match serde_json::to_value(&config) {
             Ok(val) => (StatusCode::OK, Json(val)).into_response(),
             Err(e) => {
-                tracing::error!("Settings serialization failed: {}", e);
+                tracing::error!(target: "http.api.system", "Settings serialization failed: {}", e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": "serialize_failed", "message": "Failed to serialize settings"})),
@@ -69,7 +105,7 @@ pub async fn get_settings(
             }
         },
         Err(e) => {
-            tracing::error!("Settings load failed: {}", e);
+            tracing::error!(target: "http.api.system", "Settings load failed: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "load_failed", "message": "Failed to load settings"})),
@@ -81,7 +117,7 @@ pub async fn get_settings(
 
 pub async fn update_settings(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<serde_json::Value>,
+    body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return (
@@ -92,10 +128,15 @@ pub async fn update_settings(
         )
             .into_response();
     }
-    // Validate that only allowed sections are being updated
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+    // Validate that only allowed sections are being updated. Use the
+    // narrower global allowlist here (no `description`, which is profile-only).
     if let Some(obj) = body.as_object() {
         for key in obj.keys() {
-            if !ALLOWED_SETTINGS_SECTIONS.contains(&key.as_str()) {
+            if !ALLOWED_GLOBAL_SETTINGS_SECTIONS.contains(&key.as_str()) {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({
@@ -146,7 +187,7 @@ pub async fn update_settings(
             match serde_json::to_value(&config) {
                 Ok(val) => (StatusCode::OK, Json(val)).into_response(),
                 Err(e) => {
-                    tracing::error!("Settings serialization failed: {}", e);
+                    tracing::error!(target: "http.api.system", "Settings serialization failed: {}", e);
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(serde_json::json!({"error": "serialize_failed", "message": "Failed to serialize settings"})),
@@ -156,7 +197,7 @@ pub async fn update_settings(
             }
         }
         Ok(Err(e)) => {
-            tracing::warn!("Settings update failed: {}", e);
+            tracing::warn!(target: "http.api.system", "Settings update failed: {}", e);
             (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": "update_failed", "message": "Failed to update settings"})),
@@ -164,7 +205,7 @@ pub async fn update_settings(
                 .into_response()
         }
         Err(e) => {
-            tracing::error!("Settings update panicked: {}", e);
+            tracing::error!(target: "http.api.system", "Settings update panicked: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
@@ -194,39 +235,119 @@ pub async fn list_themes() -> Json<Vec<String>> {
     )
 }
 
+/// Upper bound on the `:name` path segment for `/api/themes/:name`.
+/// Builtin names are <= 20 chars and custom theme filenames are
+/// inherently capped by the host filesystem; 128 is far past any
+/// real theme name. Past the cap we resolve Empire without logging
+/// the body to keep tracing output sane under fuzzing.
+const MAX_THEME_NAME_LEN: usize = 128;
+
+/// `GET /api/themes/:name` returns the resolved theme projection (web
+/// CSS vars, terminal CSS vars, syntax highlighter selection,
+/// appearance) for the named theme. Unknown names resolve to the
+/// `default` builtin with `source: "fallback"`, mirroring
+/// `load_theme`'s behaviour.
+///
+/// Wrapped in `spawn_blocking`: the resolver does sync file I/O
+/// (`discover_custom_themes` directory scan + TOML parse) which must
+/// not run on a tokio worker thread.
+pub async fn get_resolved_theme(
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Json<crate::tui::styles::ResolvedTheme> {
+    if name.len() > MAX_THEME_NAME_LEN {
+        tracing::warn!(
+            len = name.len(),
+            "GET /api/themes/{{name}} rejected: name exceeds {} bytes",
+            MAX_THEME_NAME_LEN,
+        );
+        return Json(crate::tui::styles::resolve_theme("default"));
+    }
+    tracing::debug!(theme = %name, "GET /api/themes/{{name}}");
+    let resolved = tokio::task::spawn_blocking(move || crate::tui::styles::resolve_theme(&name))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "theme resolve task panicked, falling back to default");
+            crate::tui::styles::resolve_theme("default")
+        });
+    Json(resolved)
+}
+
+/// `GET /api/theme/current` returns the resolved theme for the active
+/// profile (the picker's current selection). Resolved through
+/// `profile_config::resolve_config_or_warn` so per-profile theme
+/// overrides land in the right place. Sync work runs in
+/// `spawn_blocking`.
+pub async fn get_current_theme(
+    State(state): State<Arc<AppState>>,
+) -> Json<crate::tui::styles::ResolvedTheme> {
+    let profile = state.profile.clone();
+    tracing::debug!(profile = %profile, "GET /api/theme/current");
+    let resolved = tokio::task::spawn_blocking(move || {
+        let cfg = crate::session::profile_config::resolve_config_or_warn(&profile);
+        let name = if cfg.theme.name.is_empty() {
+            "default".to_string()
+        } else {
+            cfg.theme.name
+        };
+        crate::tui::styles::resolve_theme(&name)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "current theme resolve task panicked, falling back to default");
+        crate::tui::styles::resolve_theme("default")
+    });
+    Json(resolved)
+}
+
 // --- Wizard support ---
 
 #[derive(Serialize)]
 pub struct ProfileInfo {
     pub name: String,
     pub is_default: bool,
+    /// Optional short description, surfaced as helper text in the wizard
+    /// profile picker. `None` (and therefore omitted from JSON) when the
+    /// profile has no description configured. See #949.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 pub async fn list_profiles(State(state): State<Arc<AppState>>) -> Json<Vec<ProfileInfo>> {
-    let profiles = crate::session::list_profiles().unwrap_or_default();
-    // Treat empty profile (server launched without --profile) as "default"
-    let active = if state.profile.is_empty() {
-        "default"
-    } else {
-        &state.profile
-    };
-    let mut result: Vec<ProfileInfo> = profiles
-        .into_iter()
-        .map(|name| {
-            let is_default = name == active;
-            ProfileInfo { name, is_default }
-        })
-        .collect();
-    // Ensure the active profile appears even if list_profiles missed it
-    if !active.is_empty() && !result.iter().any(|p| p.name == active) {
-        result.insert(
-            0,
-            ProfileInfo {
-                name: active.to_string(),
-                is_default: true,
-            },
-        );
-    }
+    // Profile enumeration plus per-profile description lookups all hit disk;
+    // do that off the async runtime so a slow filesystem (network home, fuse,
+    // etc.) cannot stall Tokio workers for every API client. See CodeRabbit
+    // feedback on #1274.
+    let active_profile = state.profile.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        // Resolve the active profile *before* enumerating. A server launched
+        // without --profile carries an empty profile; resolution then picks
+        // the first profile, bootstrapping `main` on a genuine first run.
+        // That bootstrap creates the profile directory as a side effect, so
+        // it must run before `list_profiles()` or the freshly bootstrapped
+        // profile would be absent from the returned list.
+        let active: String = if active_profile.is_empty() {
+            crate::session::config::resolve_default_profile()
+        } else {
+            active_profile
+        };
+        let profiles = crate::session::list_profiles().unwrap_or_default();
+        profiles
+            .into_iter()
+            .map(|name| {
+                let is_default = name == active;
+                let description = crate::session::load_profile_config(&name)
+                    .ok()
+                    .and_then(|c| c.description);
+                ProfileInfo {
+                    name,
+                    is_default,
+                    description,
+                }
+            })
+            .collect::<Vec<ProfileInfo>>()
+    })
+    .await
+    .unwrap_or_default();
     Json(result)
 }
 
@@ -234,6 +355,7 @@ pub async fn list_profiles(State(state): State<Arc<AppState>>) -> Json<Vec<Profi
 pub struct BrowseQuery {
     pub path: String,
     pub limit: Option<usize>,
+    pub filter: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -270,6 +392,7 @@ pub async fn browse_filesystem(
 ) -> impl IntoResponse {
     let result = tokio::task::spawn_blocking(move || {
         let limit = query.limit.unwrap_or(100);
+        let filter = query.filter.map(|f| f.trim().to_lowercase());
         let path = std::path::Path::new(&query.path);
         let canonical = path.canonicalize().map_err(|_| "Path does not exist")?;
 
@@ -296,6 +419,11 @@ pub async fn browse_filesystem(
             let is_dir = entry_path.is_dir();
             if !is_dir {
                 continue;
+            }
+            if let Some(filter) = filter.as_deref() {
+                if !filter.is_empty() && !name.to_lowercase().contains(filter) {
+                    continue;
+                }
             }
             let is_git_repo = entry_path.join(".git").exists();
             entries.push(DirEntry {
@@ -394,6 +522,13 @@ pub struct ServerAbout {
     pub version: String,
     pub auth_required: bool,
     pub passphrase_enabled: bool,
+    /// Resolved value of `--auth`: `"token"`, `"passphrase"`, or
+    /// `"none"`. The frontend Security panel renders the explicit mode
+    /// label off this so `--auth=passphrase` is not mislabeled as
+    /// `--no-auth`. Derived from `token_manager.is_no_auth()` plus
+    /// `login_manager.is_enabled()` because the CLI mode is not
+    /// retained in `AppState` (only its effects are).
+    pub auth_mode: &'static str,
     pub read_only: bool,
     pub behind_tunnel: bool,
     pub profile: String,
@@ -430,10 +565,25 @@ pub struct ServerAbout {
     /// honours the user's chosen ceiling instead of clipping at a
     /// hard-coded constant. See #1111.
     pub cockpit_replay_events: u32,
+    /// `"debug"` when built with `debug_assertions`, `"release"`
+    /// otherwise. The web UI renders a "DEV" badge in the topbar
+    /// when this is `"debug"` so users can tell concurrently-running
+    /// debug (port 8081) and release (port 8080) instances apart at
+    /// a glance, including PWA installs where the port disappears
+    /// from the window chrome. See #1055.
+    pub build_flavor: &'static str,
 }
 
 pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> {
     let auth_required = !state.token_manager.is_no_auth().await;
+    let passphrase_enabled = state.login_manager.is_enabled();
+    let auth_mode = if auth_required {
+        "token"
+    } else if passphrase_enabled {
+        "passphrase"
+    } else {
+        "none"
+    };
     let cockpit_master_enabled = state
         .cockpit_master_enabled
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -447,7 +597,8 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
     Json(ServerAbout {
         version: env!("CARGO_PKG_VERSION").to_string(),
         auth_required,
-        passphrase_enabled: state.login_manager.is_enabled(),
+        passphrase_enabled,
+        auth_mode,
         read_only: state.read_only,
         behind_tunnel: state.behind_tunnel,
         profile: state.profile.clone(),
@@ -457,19 +608,26 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         cockpit_max_concurrent_resumes,
         cockpit_force_end_turn_threshold_secs,
         cockpit_replay_events,
+        build_flavor: if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
     })
 }
 
 // --- Update status ---
 
-/// Web-facing snapshot of `update::check_for_update`. `check_enabled`
-/// mirrors `updates.check_enabled` so the frontend can hide its banner
-/// without separately fetching settings. `web_poll_interval_minutes`
-/// echoes the configured frontend re-poll cadence so the dashboard
-/// doesn't need a second settings round-trip. See #984.
+/// Web-facing snapshot of `update::check_for_update`. `update_check_mode`
+/// mirrors `updates.update_check_mode` so the frontend can hide its banner
+/// (mode = `off`) or skip nagging while a background install runs
+/// (mode = `auto`) without separately fetching settings.
+/// `web_poll_interval_minutes` echoes the configured frontend re-poll cadence
+/// so the dashboard doesn't need a second settings round-trip. See #984 and
+/// #1140.
 #[derive(Serialize)]
 pub struct UpdateStatusResponse {
-    pub check_enabled: bool,
+    pub update_check_mode: crate::session::config::UpdateCheckMode,
     pub current_version: String,
     pub latest_version: Option<String>,
     pub update_available: bool,
@@ -485,10 +643,11 @@ pub struct UpdateStatusResponse {
 pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<UpdateStatusResponse> {
     let cfg = crate::session::profile_config::resolve_config_or_warn(&state.profile);
     let current = env!("CARGO_PKG_VERSION").to_string();
+    let mode = cfg.updates.update_check_mode;
 
-    if !cfg.updates.check_enabled {
+    if !mode.is_enabled() {
         return Json(UpdateStatusResponse {
-            check_enabled: false,
+            update_check_mode: mode,
             current_version: current,
             latest_version: None,
             update_available: false,
@@ -506,7 +665,7 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
                 Some(crate::update::release_page_url(&info.latest_version))
             };
             Json(UpdateStatusResponse {
-                check_enabled: true,
+                update_check_mode: mode,
                 current_version: info.current_version,
                 latest_version: if info.latest_version.is_empty() {
                     None
@@ -520,7 +679,7 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
             })
         }
         Err(e) => Json(UpdateStatusResponse {
-            check_enabled: true,
+            update_check_mode: mode,
             current_version: current,
             latest_version: None,
             update_available: false,
@@ -540,7 +699,7 @@ pub struct CreateProfileBody {
 
 pub async fn create_profile(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<CreateProfileBody>,
+    body: Result<Json<CreateProfileBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return (
@@ -551,6 +710,10 @@ pub async fn create_profile(
         )
             .into_response();
     }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
     if let Err(e) = validate_profile_name(&body.name) {
         return (
             StatusCode::BAD_REQUEST,
@@ -623,7 +786,7 @@ pub struct RenameProfileBody {
 pub async fn rename_profile(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
-    Json(body): Json<RenameProfileBody>,
+    body: Result<Json<RenameProfileBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return (
@@ -634,6 +797,10 @@ pub async fn rename_profile(
         )
             .into_response();
     }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
     if let Err(e) = validate_profile_name(&name) {
         return (
             StatusCode::BAD_REQUEST,
@@ -672,7 +839,7 @@ pub struct DefaultProfileBody {
 
 pub async fn default_profile(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<DefaultProfileBody>,
+    body: Result<Json<DefaultProfileBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return (
@@ -683,6 +850,10 @@ pub async fn default_profile(
         )
             .into_response();
     }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
     if let Err(e) = validate_profile_name(&body.name) {
         return (
             StatusCode::BAD_REQUEST,
@@ -752,7 +923,8 @@ pub async fn get_profile_settings(
 pub async fn update_profile_settings(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
-    Json(body): Json<serde_json::Value>,
+    session: Option<axum::Extension<AuthenticatedSession>>,
+    body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return (
@@ -763,6 +935,10 @@ pub async fn update_profile_settings(
         )
             .into_response();
     }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
     if let Err(e) = validate_profile_name(&name) {
         return (
             StatusCode::BAD_REQUEST,
@@ -770,10 +946,11 @@ pub async fn update_profile_settings(
         )
             .into_response();
     }
-    // Validate allowed sections
+    // Validate allowed sections. Use the per-profile allowlist here, which
+    // is the global list plus `description` (a profile-only field).
     if let Some(obj) = body.as_object() {
         for key in obj.keys() {
-            if !ALLOWED_SETTINGS_SECTIONS.contains(&key.as_str()) {
+            if !ALLOWED_PROFILE_SETTINGS_SECTIONS.contains(&key.as_str()) {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({
@@ -783,6 +960,39 @@ pub async fn update_profile_settings(
                 )
                     .into_response();
             }
+        }
+    }
+
+    // Body-shape elevation gate. The path-shape gate in
+    // `requires_elevation` exempts this endpoint so safe preference
+    // fields save without a passphrase re-prompt; tamper-surface fields
+    // (sandbox image, worktree templates, dangerous session entries)
+    // re-impose the elevation requirement here. Mirrors the 403
+    // payload shape the path-shape gate returns so the client's
+    // existing `elevation_required` handling (web/src/lib/
+    // fetchInterceptor.ts) fires `ElevationPrompt` unchanged. See
+    // #1510.
+    if state.login_manager.is_enabled() && body_requires_elevation(&body) {
+        let elevated = match session.as_ref() {
+            Some(axum::Extension(AuthenticatedSession(id))) => {
+                state.login_manager.is_elevated(id).await
+            }
+            None => false,
+        };
+        if !elevated {
+            tracing::info!(
+                target: "auth.passphrase",
+                profile = %name,
+                "update_profile_settings: tamper-surface keys in patch without elevation; returning 403"
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "elevation_required",
+                    "message": "Re-enter the passphrase to continue"
+                })),
+            )
+                .into_response();
         }
     }
 
@@ -887,4 +1097,173 @@ pub async fn update_profile_settings(
 
 pub async fn list_sounds() -> Json<Vec<String>> {
     Json(crate::sound::list_available_sounds())
+}
+
+/// Serve a sound file by name so the cockpit's browser-side approval
+/// player can fetch it from the same origin as the dashboard. The name
+/// is validated against `list_available_sounds()` to block path
+/// traversal: an attacker who can hit `/api/sounds/file/<x>` cannot
+/// read arbitrary disk paths, only files already present in the user's
+/// `sounds/` directory.
+pub async fn serve_sound_file(
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    // The validation step (directory enumeration) stays on the blocking
+    // pool because `list_available_sounds` does sync `read_dir`. The
+    // file read itself uses `tokio::fs::read` so the larger I/O cost
+    // does not block a runtime worker.
+    let lookup_name = name.clone();
+    let validated = tokio::task::spawn_blocking(move || {
+        if !crate::sound::list_available_sounds().contains(&lookup_name) {
+            return None;
+        }
+        crate::sound::get_sounds_dir().map(|dir| dir.join(&lookup_name))
+    })
+    .await;
+
+    let path = match validated {
+        Ok(Some(p)) => p,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let content_type = match std::path::Path::new(&name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("ogg") => "audio/ogg",
+        _ => "audio/wav",
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, content_type),
+            (axum::http::header::CACHE_CONTROL, "private, max-age=3600"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use std::collections::HashMap;
+
+    fn custom_agents(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(name, command)| ((*name).to_string(), (*command).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn custom_agent_entries_use_safe_placeholders() {
+        let entries = build_custom_agent_infos(&custom_agents(&[(
+            "remote-claude",
+            "ssh -t prod.example claude",
+        )]));
+
+        assert_eq!(entries.len(), 1);
+        let agent = &entries[0];
+        assert_eq!(agent.kind, "custom");
+        assert_eq!(agent.name, "remote-claude");
+        assert_eq!(agent.binary, "remote-claude");
+        assert!(!agent.host_only);
+        assert!(agent.installed);
+        assert_eq!(agent.install_hint, "Configured custom agent");
+    }
+
+    #[test]
+    fn custom_agent_entries_never_serialize_command_values() {
+        let entries = build_custom_agent_infos(&custom_agents(&[(
+            "remote-agent",
+            "ssh -t prod.example claude",
+        )]));
+
+        let json = serde_json::to_string(&entries).unwrap();
+        assert!(json.contains("remote-agent"));
+        assert!(!json.contains("ssh"));
+        assert!(!json.contains("prod.example"));
+        assert!(!json.contains("claude"));
+    }
+
+    #[test]
+    fn serialized_custom_agent_response_contains_no_command_or_detect_as_data() {
+        let entries = build_custom_agent_infos(&custom_agents(&[(
+            "remote-agent",
+            "ssh -t prod.example claude",
+        )]));
+        let value = serde_json::to_value(&entries).unwrap();
+
+        assert_eq!(value[0]["kind"], "custom");
+        assert_eq!(value[0]["name"], "remote-agent");
+        assert_eq!(value[0]["binary"], "remote-agent");
+        assert_eq!(value[0]["installed"], true);
+        assert_eq!(value[0]["host_only"], false);
+        assert_eq!(value[0]["install_hint"], "Configured custom agent");
+
+        let serialized = value.to_string();
+        assert!(!serialized.contains("ssh -t prod.example claude"));
+        assert!(!serialized.contains("prod.example"));
+        assert!(!serialized.contains("agent_detect_as"));
+    }
+
+    #[test]
+    fn custom_agent_entries_filter_empty_values_and_builtin_collisions() {
+        let entries = build_custom_agent_infos(&custom_agents(&[
+            ("", "codex"),
+            ("empty-command", ""),
+            ("   ", "codex"),
+            ("whitespace-command", "   "),
+            ("claude", "ssh -t prod.example claude"),
+            ("remote-codex", "ssh -t prod.example codex"),
+        ]));
+
+        let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["remote-codex"]);
+        assert!(entries.iter().all(|entry| entry.kind == "custom"));
+    }
+
+    #[test]
+    fn custom_agent_entries_are_sorted_by_name() {
+        let entries = build_custom_agent_infos(&custom_agents(&[
+            ("zeta", "zeta-cmd"),
+            ("alpha", "alpha-cmd"),
+            ("middle", "middle-cmd"),
+        ]));
+
+        let names: Vec<_> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "middle", "zeta"]);
+    }
+
+    #[tokio::test]
+    async fn serve_sound_file_rejects_unknown_name() {
+        let resp = serve_sound_file(axum::extract::Path("does-not-exist-xyz.wav".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn serve_sound_file_rejects_path_traversal() {
+        let resp = serve_sound_file(axum::extract::Path("../../../etc/passwd".to_string()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // A NOT_FOUND that somehow still streamed a body would be a
+        // worse failure than the wrong status, so assert the body is
+        // empty rather than just "not /etc/passwd".
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert!(body.is_empty(), "unexpected body bytes: {body:?}");
+    }
 }

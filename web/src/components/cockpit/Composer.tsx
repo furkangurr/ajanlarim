@@ -27,8 +27,108 @@ import {
 } from "lucide-react";
 
 import { useFilesIndex, fuzzyFilter } from "./useFilesIndex";
+import { SessionConfigControls } from "./SessionConfigControls";
 import type { CockpitState } from "../../lib/cockpitTypes";
 import { getDraft, setDraft } from "../../lib/cockpitDrafts";
+import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
+import { useAgentProfile } from "../../lib/agentProfileContext";
+
+/** Decision returned by {@link decideEnterAction} for an Enter
+ *  keystroke on the cockpit composer textarea.
+ *  - `newline`: insert a newline natively, suppress the primitive's
+ *    Send. Used on touch-primary devices so multi-line drafting
+ *    matches WhatsApp / Slack / ChatGPT mobile conventions (#1129).
+ *  - `send`: dispatch via our custom send path; covers the
+ *    mid-turn queue branch (#1031) where ComposerPrimitive.Input
+ *    hard-blocks Enter on its own.
+ *  - `default`: let the primitive run its built-in keymap (desktop
+ *    Enter-to-send, Shift+Enter for newline, etc.). */
+export type EnterAction = "newline" | "send" | "default";
+
+/** Pure decision helper for the composer's Enter keystroke. Extracted
+ *  so the decision matrix can be unit-tested without mounting the
+ *  whole composer + assistant-ui runtime. The textarea handler reads
+ *  the same matrix at runtime. See #1129. */
+export function decideEnterAction(
+  event: {
+    key: string;
+    shiftKey: boolean;
+    ctrlKey: boolean;
+    metaKey: boolean;
+    isComposing: boolean;
+  },
+  ctx: { isMobile: boolean; turnActive: boolean },
+): EnterAction {
+  if (event.key !== "Enter") return "default";
+  if (event.isComposing) return "default";
+  if (event.shiftKey || event.ctrlKey || event.metaKey) return "default";
+  if (ctx.isMobile) return "newline";
+  if (ctx.turnActive) return "send";
+  return "default";
+}
+
+/** Decision returned by {@link decideBeforeInputAction} for a
+ *  `beforeinput` event on the cockpit composer textarea.
+ *  - `newline`: caller should preventDefault, stop propagation, and
+ *    manually insert a literal "\n" at the caret. Used on touch-primary
+ *    devices where the on-screen keyboard's Enter fires
+ *    `beforeinput` with `insertLineBreak` / `insertParagraph` instead
+ *    of a `keydown` (Android Chrome's GBoard / Samsung Keyboard / many
+ *    others). Without this, assistant-ui's bubble-phase Send wins.
+ *  - `default`: do nothing, let the primitive run. */
+export type BeforeInputAction = "newline" | "default";
+
+/** Pure decision helper for the composer's `beforeinput` event.
+ *  Extracted so the matrix is unit-testable without mounting the
+ *  composer. The textarea handler reads the same matrix at runtime.
+ *  See #1174. */
+export function decideBeforeInputAction(
+  inputType: string,
+  isComposing: boolean,
+  ctx: { isMobile: boolean },
+): BeforeInputAction {
+  if (!ctx.isMobile) return "default";
+  if (isComposing) return "default";
+  if (inputType !== "insertLineBreak" && inputType !== "insertParagraph") {
+    return "default";
+  }
+  return "newline";
+}
+
+/** Wrapper class + inline style for the composer's outer <div>. When the
+ *  soft keyboard is open we drop the bottom padding and apply a negative
+ *  bottom margin equal to the App root's safe-area-inset-bottom so the
+ *  composer sits flush with the top of the keyboard instead of leaving a
+ *  visible gap (the home-indicator inset is physically occluded by the
+ *  keyboard anyway). Extracted as a pure helper so the layout decision
+ *  can be unit-tested without mounting the whole composer. See #1143. */
+export function composerWrapperLayout(opts: { keyboardOpen: boolean }): {
+  className: string;
+  style: React.CSSProperties | undefined;
+} {
+  return {
+    className: [
+      "border-t border-surface-800 bg-surface-900 px-4 pt-3",
+      opts.keyboardOpen ? "pb-0" : "pb-3",
+    ].join(" "),
+    style: opts.keyboardOpen
+      ? { marginBottom: "calc(-1 * env(safe-area-inset-bottom))" }
+      : undefined,
+  };
+}
+
+/** True when the current device is touch-primary AND no precise
+ *  pointer (mouse / trackpad / stylus tip) is also attached. An iPad
+ *  with a Bluetooth keyboard + Magic Keyboard trackpad reports both
+ *  `(pointer: coarse)` (touchscreen) and `(any-pointer: fine)`
+ *  (trackpad); treating that as desktop preserves Enter-to-send for
+ *  hardware-keyboard typing. See #1129 open questions. */
+function detectMobileInput(): boolean {
+  if (typeof window === "undefined" || !window.matchMedia) return false;
+  const coarse = window.matchMedia("(pointer: coarse)").matches;
+  const anyFine = window.matchMedia("(any-pointer: fine)").matches;
+  return coarse && !anyFine;
+}
 
 interface Props {
   sessionId: string;
@@ -37,6 +137,18 @@ interface Props {
   /** Legacy enum-based mode used as fallback when the agent does not
    *  advertise modes via NewSessionResponse. */
   legacyMode: CockpitState["mode"];
+  /** Per-session selectors advertised by the adapter (model,
+   *  reasoning effort, future categories). Empty when the adapter
+   *  does not emit `ConfigOptionUpdate`. See #1403. */
+  configOptions: CockpitState["configOptions"];
+  /** In-flight config-option click; drives the pending affordance
+   *  on the just-clicked option. */
+  pendingConfigOption: CockpitState["pendingConfigOption"];
+  /** Send `session/set_config_option` for the given pair. */
+  setConfigOption: (
+    configId: string,
+    value: string,
+  ) => void | Promise<void>;
   /** Latest agent-reported context-window usage. Null until the agent
    *  has emitted at least one ACP `UsageUpdate`. */
   sessionUsage: CockpitState["sessionUsage"];
@@ -44,11 +156,13 @@ interface Props {
    *  AvailableCommandsUpdate. Includes plugins/skills/MCP commands.
    *  Empty until the agent emits the first list. */
   availableCommands: CockpitState["availableCommands"];
-  /** True when the cockpit WS is open. When false the composer
-   *  refuses new submissions: prompts dispatched while disconnected
-   *  would be lost (the POST /cockpit/prompt would fail with no way
-   *  to retry). TODO(post-disconnect): queue locally and flush on
-   *  reconnect instead of blocking. */
+  /** True when the cockpit WS is open and the worker is healthy
+   *  (running, not stopped, not restarting). When false the Send /
+   *  QueueSend buttons stay clickable, but submissions take the
+   *  enqueue path in `sendPrompt` so they fire on resume rather than
+   *  POSTing into a non-running session. The tooltip swaps to name
+   *  the queue behavior so users understand the click is not lost.
+   *  See #1359. */
   connected: boolean;
   /** True while the agent is producing the current turn. When true the
    *  composer keeps its textarea editable and surfaces a queue-send
@@ -77,6 +191,9 @@ export function Composer({
   availableModes,
   currentModeId,
   legacyMode,
+  configOptions,
+  pendingConfigOption,
+  setConfigOption,
   sessionUsage,
   availableCommands,
   connected,
@@ -87,6 +204,31 @@ export function Composer({
 }: Props) {
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const { files } = useFilesIndex(sessionId);
+
+  // When the soft keyboard is up the App root's safe-area-inset-bottom
+  // padding reserves space for the iOS home indicator that the keyboard
+  // already physically occludes, leaving a visible gap between the
+  // composer and the top of the keyboard. Cancel that reservation and
+  // drop our own bottom padding while the keyboard is open. See #1143.
+  const { keyboardOpen } = useMobileKeyboard();
+
+  // Touch-primary device flag for the Enter-key decision matrix.
+  // Re-evaluated on `(pointer: coarse)` / `(any-pointer: fine)`
+  // changes so plugging in a Bluetooth keyboard on an iPad flips
+  // behavior live without a refresh. See #1129.
+  const [isMobile, setIsMobile] = useState<boolean>(() => detectMobileInput());
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    const coarseMql = window.matchMedia("(pointer: coarse)");
+    const fineMql = window.matchMedia("(any-pointer: fine)");
+    const onChange = () => setIsMobile(detectMobileInput());
+    coarseMql.addEventListener("change", onChange);
+    fineMql.addEventListener("change", onChange);
+    return () => {
+      coarseMql.removeEventListener("change", onChange);
+      fineMql.removeEventListener("change", onChange);
+    };
+  }, []);
 
   // Adapter for the @ file picker. We deliberately skip the
   // category step (return []) so the popover lands directly in
@@ -110,21 +252,38 @@ export function Composer({
     [files],
   );
 
-  // Slash commands: built from the agent's AvailableCommandsUpdate.
-  // Each item carries `acceptsInput` so onExecute knows whether to
-  // leave the cursor parked after the name (for commands with args)
-  // or to prepare for an immediate Enter-to-send.
-  const slashItems: Unstable_TriggerItem[] = useMemo(
-    () =>
-      availableCommands.map((c) => ({
-        id: c.name,
-        type: "command",
-        label: `/${c.name}`,
-        description: c.description,
-        acceptsInput: c.accepts_input,
-      })),
-    [availableCommands],
-  );
+  // Slash commands: built from the agent's AvailableCommandsUpdate, plus
+  // any profile-declared clear aliases the agent doesn't advertise
+  // itself (codex / opencode emit `/new` as a UI affordance but their
+  // ACP servers don't list it in `available_commands_update`, so the
+  // palette would otherwise be missing the very command we detect
+  // server-side as a session-clear boundary). See #1133 + multi-agent
+  // parity follow-up.
+  const profile = useAgentProfile();
+  const slashItems: Unstable_TriggerItem[] = useMemo(() => {
+    const advertised = new Set(availableCommands.map((c) => c.name));
+    const items: Unstable_TriggerItem[] = availableCommands.map((c) => ({
+      id: c.name,
+      type: "command",
+      label: `/${c.name}`,
+      description: c.description,
+      acceptsInput: c.accepts_input,
+    }));
+    for (const alias of profile.clearAliases ?? []) {
+      const name = alias.startsWith("/") ? alias.slice(1) : alias;
+      if (!name || advertised.has(name)) continue;
+      const item = {
+        id: name,
+        type: "command" as const,
+        label: `/${name}`,
+        description: "clear conversation",
+        acceptsInput: false,
+      } as Unstable_TriggerItem;
+      items.push(item);
+      advertised.add(name);
+    }
+    return items;
+  }, [availableCommands, profile]);
   const slashAdapter: Unstable_TriggerAdapter = useMemo(
     () => ({
       categories: () => [],
@@ -197,27 +356,50 @@ export function Composer({
 
     let writeTimer: number | null = null;
     const flush = () => {
-      writeTimer = null;
+      if (writeTimer !== null) {
+        window.clearTimeout(writeTimer);
+        writeTimer = null;
+      }
       setDraft(sessionId, composerRuntime.getState().text);
     };
     const unsub = composerRuntime.subscribe(() => {
       if (writeTimer !== null) window.clearTimeout(writeTimer);
       writeTimer = window.setTimeout(flush, 250);
     });
+    // Page-unload flush. Effect cleanup runs on React unmount (sidebar
+    // navigation) but not on a full reload, PWA cold start, or mobile
+    // OS evicting the tab. Without these listeners, whatever sits in
+    // writeTimer at the moment the page dies is lost; on a fast typer
+    // that's the last sentence or two of the draft (#1358).
+    // visibilitychange covers iOS Safari, which fires pagehide only on
+    // real unload, not on app-switch.
+    const onHidden = () => {
+      if (document.visibilityState === "hidden") flush();
+    };
+    window.addEventListener("beforeunload", flush);
+    window.addEventListener("pagehide", flush);
+    document.addEventListener("visibilitychange", onHidden);
     return () => {
       unsub();
-      if (writeTimer !== null) {
-        window.clearTimeout(writeTimer);
-        flush();
-      }
+      window.removeEventListener("beforeunload", flush);
+      window.removeEventListener("pagehide", flush);
+      document.removeEventListener("visibilitychange", onHidden);
+      flush();
     };
   }, [composerRuntime, sessionId]);
 
-  // wterm's async init() in the right pane focuses its hidden textarea
-  // ~200-500ms after mount and steals focus from us. Re-claim a couple
-  // of times so the agent input wins; only when focus is on body or
-  // inside .wterm so an intentional click into the host shell sticks.
+  // xterm.js's autoFocus path in the right pane focuses its hidden
+  // textarea ~200-500ms after mount and steals focus from us. Re-claim
+  // a couple of times so the agent input wins; only when focus is on
+  // body or inside .xterm so an intentional click into the host shell
+  // sticks.
+  //
+  // Mobile skips this entirely (#1178): auto-focusing the textarea pops
+  // the soft keyboard on every session open / switch, which is the wrong
+  // default for the read-traffic that dominates mobile usage. Users tap
+  // the composer when they want to type.
   useEffect(() => {
+    if (isMobile) return;
     const el = taRef.current;
     if (!el) return;
     el.focus();
@@ -227,7 +409,7 @@ export function Composer({
         el.focus();
         return;
       }
-      if (active.closest?.(".wterm")) {
+      if (active.closest?.(".xterm")) {
         el.focus();
       }
     };
@@ -237,10 +419,11 @@ export function Composer({
       window.clearTimeout(t1);
       window.clearTimeout(t2);
     };
-  }, []);
+  }, [isMobile]);
 
+  const wrapperLayout = composerWrapperLayout({ keyboardOpen });
   return (
-    <div className="border-t border-surface-800 bg-surface-900 px-4 pt-3 pb-3">
+    <div className={wrapperLayout.className} style={wrapperLayout.style}>
       <div className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl">
         <ComposerPrimitive.Unstable_TriggerPopoverRoot>
           <ComposerPrimitive.Root
@@ -282,35 +465,93 @@ export function Composer({
             <ComposerPrimitive.Input
               ref={taRef}
               rows={2}
+              // assistant-ui's default Escape binding cancels the active
+              // run (see ComposerPrimitive.Input's `cancelOnEscape`
+              // default). The cockpit deliberately keeps cancel behind
+              // an explicit gesture, the Stop button, because Claude
+              // Code CLI also hijacks Escape for cancel and a stray
+              // press would lose work the user did not mean to abort.
+              cancelOnEscape={false}
               placeholder={
                 turnActive
                   ? "Queue a follow-up… (sent when current turn ends)"
                   : "Send a message…  Type @ for files, / for commands"
               }
               onInput={onInput}
+              onFocus={() => {
+                // Defensive scrollIntoView for mobile soft-keyboard cycles.
+                // The App root no longer pins height for cockpit (#1177),
+                // so `h-dvh` shrinks with the keyboard and the composer
+                // should naturally lift into view; this is a belt-and-
+                // braces hop after the keyboard animation completes so
+                // any UA that lags the layout-viewport update still ends
+                // up scrolled to the composer.
+                if (!isMobile) return;
+                window.setTimeout(() => {
+                  taRef.current?.scrollIntoView({
+                    block: "end",
+                    behavior: "smooth",
+                  });
+                }, 300);
+              }}
+              onBeforeInput={(e) => {
+                // Android Chrome's GBoard / Samsung Keyboard often fire
+                // `beforeinput` with `insertLineBreak` / `insertParagraph`
+                // for the on-screen Enter key WITHOUT a usable `keydown`
+                // (key is "Unidentified" or keyCode 229). The keydown
+                // matrix below misses those, so assistant-ui's bubble-
+                // phase Send wins and sends the message. Intercept here
+                // for mobile, insert a literal newline at the caret, and
+                // let the keydown matrix handle the platforms that do
+                // fire a real Enter keydown. See #1174.
+                const ne = e.nativeEvent as InputEvent;
+                const action = decideBeforeInputAction(
+                  ne.inputType,
+                  ne.isComposing,
+                  { isMobile },
+                );
+                if (action === "default") return;
+                e.preventDefault();
+                e.stopPropagation();
+                insertNewlineAtCaret(taRef);
+              }}
               onKeyDown={(e) => {
-                // Intercept Enter while the agent is running so the
-                // textarea can queue follow-ups; ComposerPrimitive.Input
-                // hard-blocks Enter when `thread.isRunning && !queue`
-                // (see ComposerInput.js in @assistant-ui/react). Without
-                // this the textarea would do nothing on Enter mid-turn.
-                // Capture-phase so our handler wins over the primitive's
-                // bubble-phase listener.
-                if (
-                  !turnActive ||
-                  e.key !== "Enter" ||
-                  e.shiftKey ||
-                  e.ctrlKey ||
-                  e.metaKey ||
-                  e.nativeEvent.isComposing
-                ) {
+                // Three-way Enter dispatch. See decideEnterAction for
+                // the full matrix; the inline branches below handle
+                // each outcome:
+                //   - "newline": touch-primary device, plain Enter.
+                //     Stop assistant-ui's bubble-phase Send and let
+                //     the textarea insert a newline natively (no
+                //     preventDefault). Mobile users tap the Send
+                //     button to dispatch.
+                //   - "send": desktop, mid-turn, plain Enter.
+                //     ComposerPrimitive.Input hard-blocks Enter while
+                //     thread.isRunning && !queue (#1031), so we
+                //     intercept and route through our queue path.
+                //   - "default": modifier keys, IME compose, non-Enter
+                //     keys, or desktop idle Enter; let the primitive's
+                //     built-in keymap run.
+                const action = decideEnterAction(
+                  {
+                    key: e.key,
+                    shiftKey: e.shiftKey,
+                    ctrlKey: e.ctrlKey,
+                    metaKey: e.metaKey,
+                    isComposing: e.nativeEvent.isComposing,
+                  },
+                  { isMobile, turnActive },
+                );
+                if (action === "default") return;
+                if (action === "newline") {
+                  e.stopPropagation();
                   return;
                 }
+                // action === "send"
                 e.preventDefault();
                 e.stopPropagation();
                 void sendFromTextarea(taRef, composerRuntime, enqueuePrompt);
               }}
-              autoFocus
+              autoFocus={!isMobile}
               className={[
                 "min-h-[56px] max-h-[200px] resize-none bg-transparent",
                 "px-4 pt-3 pb-1 text-sm leading-6 text-text-primary",
@@ -340,6 +581,11 @@ export function Composer({
                   currentModeId={currentModeId}
                   legacyMode={legacyMode}
                 />
+                <SessionConfigControls
+                  configOptions={configOptions}
+                  pendingConfigOption={pendingConfigOption}
+                  onSetConfigOption={setConfigOption}
+                />
               </div>
 
               <div className="flex items-center gap-2">
@@ -348,13 +594,13 @@ export function Composer({
                   <>
                     <StopButton />
                     <QueueSendButton
-                      disabled={!connected}
+                      connected={connected}
                       queuedCount={queuedCount}
                       onSend={() => sendFromTextarea(taRef, composerRuntime, enqueuePrompt)}
                     />
                   </>
                 ) : (
-                  <SendButton disabled={!connected} />
+                  <SendButton connected={connected} />
                 )}
               </div>
             </div>
@@ -409,17 +655,19 @@ function PopoverItems({ trigger }: { trigger: string }) {
 /** Insert the picked slash command into the composer text. The Action
  *  popover already stripped the user's `/<typed>` from the input via
  *  `removeOnExecute`, so we set the canonical `/<name>` form and add
- *  a trailing space when the agent advertised that the command takes
- *  free-form arguments. The user is then free to type args and hit
- *  Enter to send, or hit Enter immediately for a no-arg command. */
-function insertSlashCommand(
+ *  a trailing space. The trailing space halts assistant-ui's
+ *  `detectTrigger` backward scan (which keys off whitespace as the
+ *  trigger boundary) so the popover does not immediately re-open on
+ *  the inserted `/<name>` and consume the next Enter as a re-pick;
+ *  it also positions the cursor for free-form arg typing when the
+ *  agent advertised the command as `acceptsInput=true`. See #1512. */
+export function insertSlashCommand(
   runtime: ReturnType<typeof useComposerRuntime>,
   item: Unstable_TriggerItem,
 ) {
   if (!runtime) return;
-  const accepts = (item as { acceptsInput?: boolean }).acceptsInput === true;
   const current = runtime.getState().text;
-  const suffix = accepts ? " " : "";
+  const suffix = " ";
   // Preserve any text that was already in the buffer (e.g. user typed
   // a long prompt then ran `/foo` mid-message). We just append the
   // command at the end; the typed `/typed` token has already been
@@ -428,10 +676,51 @@ function insertSlashCommand(
   runtime.setText(`${current}${sep}/${item.id}${suffix}`);
 }
 
+/** Insert a literal "\n" at the textarea's caret. Used by the
+ *  `beforeinput` interception path for mobile Enter (#1174): when
+ *  Android's on-screen keyboard fires `beforeinput` with
+ *  `insertLineBreak` / `insertParagraph` (and possibly no usable
+ *  `keydown`), we preventDefault on the synthetic line-break and
+ *  insert one ourselves so the cursor lands one position past the
+ *  newline. Skips the trigger-detection whitespace padding that
+ *  `insertAtCaret` does for `@` / `/`; a newline doesn't need it. */
+export function insertNewlineAtCaret(
+  ref: React.RefObject<HTMLTextAreaElement | null>,
+): void {
+  const ta = ref.current;
+  if (!ta) return;
+  const start = ta.selectionStart ?? ta.value.length;
+  const end = ta.selectionEnd ?? start;
+  const before = ta.value.slice(0, start);
+  const after = ta.value.slice(end);
+  const next = `${before}\n${after}`;
+  const setter = Object.getOwnPropertyDescriptor(
+    HTMLTextAreaElement.prototype,
+    "value",
+  )?.set;
+  setter?.call(ta, next);
+  ta.dispatchEvent(
+    new InputEvent("input", {
+      bubbles: true,
+      inputType: "insertLineBreak",
+    }),
+  );
+  const pos = before.length + 1;
+  ta.setSelectionRange(pos, pos);
+}
+
 /** Insert `text` at the textarea's caret and re-focus. The toolbar
  *  buttons use this to inject `@` or `/` so the trigger popover opens
- *  without forcing the user to grab the keyboard. */
-function insertAtCaret(
+ *  without forcing the user to grab the keyboard.
+ *
+ *  Exported for tests. We dispatch a real `InputEvent` (not a generic
+ *  `Event`) so assistant-ui's `Unstable_TriggerPopover` sees the
+ *  `inputType: "insertText"` + `data: text` fields it relies on for
+ *  trigger detection. Without those, the popover library treats the
+ *  toolbar-injected character as untracked text and a subsequent
+ *  `removeOnExecute` cannot find the trigger to strip, leaving a
+ *  duplicate `@@` / `//` in the input (#1149). */
+export function insertAtCaret(
   ref: React.RefObject<HTMLTextAreaElement | null>,
   text: string,
 ) {
@@ -450,7 +739,13 @@ function insertAtCaret(
     "value",
   )?.set;
   setter?.call(ta, next);
-  ta.dispatchEvent(new Event("input", { bubbles: true }));
+  ta.dispatchEvent(
+    new InputEvent("input", {
+      bubbles: true,
+      inputType: "insertText",
+      data: text,
+    }),
+  );
   const pos = before.length + needsSpace.length + text.length;
   ta.focus();
   ta.setSelectionRange(pos, pos);
@@ -711,24 +1006,27 @@ function formatCost(amount: number, currency: string): string {
 
 /* ── Send / Stop ─────────────────────────────────────────────────── */
 
-function SendButton({ disabled = false }: { disabled?: boolean }) {
-  // When the WS is closed we surface the offline state via `disabled`
-  // and a swapped tooltip; ComposerPrimitive.Send would still try to
-  // dispatch otherwise (it only knows about thread-runtime state, not
-  // our connection status). TODO: queue prompts locally and flush on
-  // reconnect instead of dropping them.
+function SendButton({ connected = true }: { connected?: boolean }) {
+  // When the session is inactive (WS closed, worker stopped, worker
+  // restarting) we leave the button clickable: `sendPrompt` routes the
+  // text into the local queue and the drain effect fires it on resume.
+  // The tooltip swaps so users can tell the click queued rather than
+  // sent. ComposerPrimitive.Send still drives the assistant-ui submit
+  // flow; it does not look at our `connected` flag. See #1359.
+  const title = connected
+    ? "Send, Enter"
+    : "Session not active, will send on resume";
+  const label = connected ? "Send message" : "Queue message until session resumes";
   return (
     <ComposerPrimitive.Send asChild>
       <button
         type="submit"
-        aria-label="Send message"
-        title={disabled ? "Disconnected — reconnect to send" : "Send · Enter"}
-        disabled={disabled}
+        aria-label={label}
+        title={title}
         className={[
           "group/send inline-flex items-center justify-center gap-1",
           "rounded-lg bg-brand-600 px-2.5 py-1.5 text-white shadow-sm",
           "hover:bg-brand-500 active:scale-[0.98]",
-          "disabled:cursor-not-allowed disabled:bg-surface-700 disabled:text-text-dim disabled:shadow-none",
           "transition-all duration-100",
         ].join(" ")}
       >
@@ -744,7 +1042,7 @@ function StopButton() {
     <button
       type="button"
       aria-label="Stop"
-      title="Stop the agent · Esc"
+      title="Stop the agent"
       onClick={() => runtime.cancelRun()}
       className={[
         "inline-flex items-center justify-center gap-1.5",
@@ -764,35 +1062,36 @@ function StopButton() {
  *  Bypasses ComposerPrimitive.Send (which is disabled by the SDK when
  *  the thread is running). Shows a small badge with the current queue
  *  length so users can see at a glance how many follow-ups are stacked
- *  up. See #1031. */
+ *  up. See #1031. Inactive sessions (WS closed, worker stopped /
+ *  restarting) keep the button clickable and swap the tooltip; the
+ *  click routes through `sendPrompt`'s enqueue branch instead of
+ *  POSTing. See #1359. */
 function QueueSendButton({
-  disabled,
+  connected,
   queuedCount,
   onSend,
 }: {
-  disabled: boolean;
+  connected: boolean;
   queuedCount: number;
   onSend: () => void;
 }) {
-  const title = disabled
-    ? "Disconnected, reconnect to send"
+  const title = !connected
+    ? queuedCount > 0
+      ? `Queue follow-up (${queuedCount} pending), will send on resume, Enter`
+      : "Queue follow-up, will send on resume, Enter"
     : queuedCount > 0
-      ? `Queue follow-up (${queuedCount} pending) · Enter`
-      : "Queue follow-up (sent when current turn ends) · Enter";
+      ? `Queue follow-up (${queuedCount} pending), Enter`
+      : "Queue follow-up (sent when current turn ends), Enter";
   return (
     <button
       type="button"
       aria-label="Queue follow-up message"
       title={title}
-      disabled={disabled}
-      onClick={() => {
-        if (!disabled) onSend();
-      }}
+      onClick={onSend}
       className={[
         "group/send relative inline-flex items-center justify-center gap-1",
         "rounded-lg bg-brand-600 px-2.5 py-1.5 text-white shadow-sm",
         "hover:bg-brand-500 active:scale-[0.98]",
-        "disabled:cursor-not-allowed disabled:bg-surface-700 disabled:text-text-dim disabled:shadow-none",
         "transition-all duration-100",
       ].join(" ")}
     >
@@ -802,7 +1101,7 @@ function QueueSendButton({
           aria-hidden
           className={[
             "absolute -right-1.5 -top-1.5 inline-flex h-4 min-w-[16px] items-center justify-center",
-            "rounded-full bg-amber-500 px-1 text-[10px] font-semibold text-surface-900",
+            "rounded-full bg-sky-500 px-1 text-[10px] font-semibold text-surface-900",
             "ring-2 ring-surface-900",
           ].join(" ")}
         >

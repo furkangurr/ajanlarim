@@ -165,7 +165,7 @@ impl TuiTestHarness {
         std::fs::create_dir_all(&config_dir).expect("create config dir");
         let config_content = format!(
             r#"[updates]
-check_enabled = false
+update_check_mode = "off"
 
 [app_state]
 has_seen_welcome = true
@@ -293,6 +293,40 @@ last_seen_version = "{}"
         std::thread::sleep(Duration::from_millis(50));
     }
 
+    /// Send a synthetic mouse event into the inner pane as an SGR
+    /// escape sequence. crossterm's mouse capture (enabled by aoe at
+    /// startup) parses the bytes the same way it would parse them
+    /// from a real terminal, so click / scroll routing in the TUI
+    /// runs the production code path. `button` is the SGR button code:
+    /// 0 = left, 1 = middle, 2 = right; +32 = drag (rarely needed for
+    /// click tests). `col` / `row` are 1-indexed terminal cells. Sends
+    /// both the press (M) and release (m) so listeners that only fire
+    /// on `Down(...)` (the click handlers) see a complete cycle.
+    pub fn send_mouse_click(&self, button: u8, col: u16, row: u16) {
+        assert!(self.spawned, "must call spawn_tui() or spawn() first");
+        // XTerm SGR 1006 format: `CSI < Pb ; Px ; Py M` for press,
+        // `... m` for release. No semicolon between Py and the final
+        // M/m byte; crossterm parses the trailing-semicolon variant
+        // leniently but spec-compliant terminals don't.
+        let seq = format!("\x1b[<{button};{col};{row}M\x1b[<{button};{col};{row}m");
+        let output = Command::new("tmux")
+            .arg("-S")
+            .arg(&self.socket_path)
+            .arg("send-keys")
+            .arg("-t")
+            .arg(&self.session_name)
+            .arg("-l")
+            .arg(&seq)
+            .output()
+            .expect("failed to send mouse click");
+        assert!(
+            output.status.success(),
+            "send_mouse_click failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
     /// Send literal text (prevents "Enter" in text from being interpreted as
     /// the Enter key).
     pub fn type_text(&self, text: &str) {
@@ -403,9 +437,11 @@ last_seen_version = "{}"
     /// isolation. Returns the `Output` (stdout, stderr, status).
     ///
     /// Clears `AGENT_OF_EMPIRES_DEBUG` and `AOE_LOG_LEVEL` from the inherited
-    /// env so tests run with a deterministic logging configuration: when
-    /// either is set, `aoe` truncates `debug.log` on startup, which would
-    /// silently destroy any fixture that an `aoe logs` test seeded.
+    /// env so tests run with a deterministic logging configuration. (aoe
+    /// itself appends to `debug.log` now rather than truncating, but a
+    /// child that opts in to file logging would still emit a marker line
+    /// and an "aoe started" event under the test fixture, perturbing
+    /// content-sensitive assertions.)
     pub fn run_cli(&self, args: &[&str]) -> Output {
         Command::new(&self.binary_path)
             .args(args)

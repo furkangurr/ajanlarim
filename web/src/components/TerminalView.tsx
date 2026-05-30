@@ -1,10 +1,4 @@
-import {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useEffect, useLayoutEffect, useState } from "react";
 import { useTerminal } from "../hooks/useTerminal";
 import { useMobileKeyboard } from "../hooks/useMobileKeyboard";
 import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
@@ -14,6 +8,7 @@ import { SwitchSubstrateAction } from "./cockpit/SwitchSubstrateAction";
 import { ViewportFullscreenFab } from "./ViewportFullscreenFab";
 import { ensureSession } from "../lib/api";
 import { ACP_CAPABLE_TOOLS } from "../lib/acpCapableTools";
+import { safeSetItem } from "../lib/safeStorage";
 import type { SessionResponse } from "../lib/types";
 import {
   FOCUS_TERMINAL_EVENT,
@@ -21,10 +16,11 @@ import {
   setPendingTerminalFocus,
   type FocusTerminalDetail,
 } from "../lib/terminalFocus";
-import "@wterm/dom/css";
+import "@xterm/xterm/css/xterm.css";
 
 interface Props {
   session: SessionResponse;
+  active?: boolean;
   /** When false (the default) the switch-to-cockpit pill is hidden
    *  entirely so users with the master switch off aren't tempted
    *  by a button that the server will reject. */
@@ -34,7 +30,11 @@ interface Props {
 const SCROLL_HINT_SEEN_KEY = "aoe-mobile-scroll-hint-seen";
 const SCROLL_HINT_TIMEOUT_MS = 8000;
 
-export function TerminalView({ session, cockpitMasterEnabled = false }: Props) {
+export function TerminalView({
+  session,
+  active = true,
+  cockpitMasterEnabled = false,
+}: Props) {
   const [ensureState, setEnsureState] = useState<"pending" | "ready" | "error">(
     "pending",
   );
@@ -53,17 +53,19 @@ export function TerminalView({ session, cockpitMasterEnabled = false }: Props) {
   } = useTerminal(
     ensureState === "ready" ? session.id : null,
     "ws",
-    true,
+    active,
     session.claude_fullscreen,
+    active,
   );
   const { isMobile, keyboardOpen, keyboardHeight, reservedKeyboardHeight } =
     useMobileKeyboard();
   const [ctrlActive, setCtrlActive] = useState(false);
   const [termFocused, setTermFocused] = useState(false);
   // Default behavior on mobile: pad the viewport by reservedKeyboardHeight
-  // so the wterm container stays the same size whether the soft keyboard
-  // is up or not. Toggle this on (via the FAB) to release the reservation
-  // and use the full viewport. Each toggle is one explicit PTY resize.
+  // so the terminal container stays the same size whether the soft
+  // keyboard is up or not. Toggle this on (via the FAB) to release the
+  // reservation and use the full viewport. Each toggle is one explicit
+  // PTY resize.
   const [viewportFullscreen, setViewportFullscreen] = useState(false);
   const toggleViewportFullscreen = useCallback(() => {
     setViewportFullscreen((v) => !v);
@@ -76,10 +78,10 @@ export function TerminalView({ session, cockpitMasterEnabled = false }: Props) {
     : reservedKeyboardHeight;
 
   // Sync React state → hook ref in an effect. The mobile toolbar toggles
-  // `ctrlActive` but the wterm native onData callback reads the ref to
-  // decide whether to transform the next keystroke. Writing refs during
-  // render trips react-hooks/refs; a commit-phase effect does the same
-  // work without tripping the lint.
+  // `ctrlActive` but the onData callback reads the ref to decide whether
+  // to transform the next keystroke. Writing refs during render trips
+  // react-hooks/refs; a commit-phase effect does the same work without
+  // tripping the lint.
   useEffect(() => {
     ctrlActiveRef.current = ctrlActive;
   });
@@ -130,97 +132,22 @@ export function TerminalView({ session, cockpitMasterEnabled = false }: Props) {
   });
   const showScrollHint = isMobile && state.connected && !hintDismissed;
 
-  // The terminal container shrinks when appliedKeyboardPadding changes
-  // (first keyboard open of the session, orientation flip, or fullscreen
-  // toggle). wterm's ResizeObserver fires and checks _isScrolledToBottom()
-  // BEFORE the DOM has reflowed, sees the reduced clientHeight while
-  // scrollTop/scrollHeight are stale, and concludes "not at bottom." This
-  // makes it skip _scrollToBottom() after the resize, leaving the cursor
-  // off-screen.
-  //
-  // Fix: force a scroll-to-bottom via double-rAF (fires after wterm's own
-  // rAF render) on every padding change, plus a debounced final scroll
-  // after the animation settles. Note we depend on appliedKeyboardPadding
-  // (which is sticky), not the live keyboardHeight, so this no longer
-  // fires on every soft-keyboard show/hide.
-  const resizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const scrollRafRef = useRef(0);
+  // Padding changes on the parent (first keyboard open, orientation
+  // flip, fullscreen toggle) shrink the terminal container. The hook's
+  // ResizeObserver picks the new size up and refits the grid; a debounced
+  // window resize event nudges anything else that's watching layout.
   useLayoutEffect(() => {
-    if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
-
-    // Immediate: double-rAF ensures we fire AFTER wterm's scheduled render
-    // (which also uses rAF). This keeps the cursor visible during the
-    // keyboard animation, not just after it settles.
-    cancelAnimationFrame(scrollRafRef.current);
-    scrollRafRef.current = requestAnimationFrame(() => {
-      scrollRafRef.current = requestAnimationFrame(() => {
-        const el = termRef.current?.element;
-        if (el) el.scrollTop = el.scrollHeight;
-      });
-    });
-
-    // Debounced: final correction after the keyboard animation fully settles.
-    resizeTimerRef.current = setTimeout(() => {
-      resizeTimerRef.current = null;
+    const t = setTimeout(() => {
       window.dispatchEvent(new Event("resize"));
-      const el = termRef.current?.element;
-      if (el) el.scrollTop = el.scrollHeight;
     }, 150);
-    return () => {
-      if (resizeTimerRef.current) clearTimeout(resizeTimerRef.current);
-      cancelAnimationFrame(scrollRafRef.current);
-    };
-  }, [appliedKeyboardPadding, termRef]);
-
-  // wterm sometimes resets scrollTop=0 mid-session when its renderer
-  // redraws (observed on backspace), and its post-render scroll-to-
-  // bottom skips because _isScrolledToBottom() reads stale dimensions
-  // on the same task. Result: scrollHeight grows past clientHeight
-  // while scrollTop stays at 0, so the cursor falls below the visible
-  // region until the next keyboard open/close kicks the fix above.
-  //
-  // The reset fires a scroll event, so listen at document level
-  // (capture phase, since scroll events don't bubble) and resolve
-  // termRef.current.element at scroll time. State.connected can flip
-  // true before wterm finishes init, and the scroll's target may be a
-  // descendant of wterm's root, so attach-time element resolution
-  // misses both cases. The rAF debounce lets wterm's own scroll
-  // handler flip isInScrollback first when the user actually scrolls,
-  // so we don't fight legitimate scrollback entry.
-  const isInScrollbackRef = useRef(state.isInScrollback);
-  useEffect(() => {
-    isInScrollbackRef.current = state.isInScrollback;
-  }, [state.isInScrollback]);
-  useEffect(() => {
-    let raf = 0;
-    const onScroll = (e: Event) => {
-      const el = termRef.current?.element;
-      if (!el) return;
-      const target = e.target as Node | null;
-      if (target !== el && !(target && el.contains(target))) return;
-      cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(() => {
-        if (isInScrollbackRef.current) return;
-        const elNow = termRef.current?.element;
-        if (!elNow) return;
-        const max = Math.max(0, elNow.scrollHeight - elNow.clientHeight);
-        if (elNow.scrollTop < max - 1) {
-          elNow.scrollTop = elNow.scrollHeight;
-        }
-      });
-    };
-    document.addEventListener("scroll", onScroll, { passive: true, capture: true });
-    return () => {
-      document.removeEventListener("scroll", onScroll, true);
-      cancelAnimationFrame(raf);
-    };
-  }, [termRef]);
+    return () => clearTimeout(t);
+  }, [appliedKeyboardPadding]);
 
   // Returns true if focus was applied. Mirrors PairedTerminal so the same
-  // pending-latch fallback covers both terminals when the wterm hasn't
+  // pending-latch fallback covers both terminals when the terminal hasn't
   // mounted yet (ensureSession round-trip on a fresh session).
   const focusSelf = useCallback(() => {
-    const ta = termRef.current?.element.querySelector("textarea");
+    const ta = termRef.current?.element?.querySelector("textarea");
     if (ta instanceof HTMLElement) {
       ta.focus();
       return true;
@@ -244,21 +171,14 @@ export function TerminalView({ session, cockpitMasterEnabled = false }: Props) {
     if (consumePendingTerminalFocus("agent")) focusSelf();
   }, [ensureState, focusSelf]);
 
-  // On initial connect, auto-open the keyboard.
   useEffect(() => {
-    if (!isMobile || !state.connected) return;
-    const term = termRef.current;
-    if (!term) return;
-    // Retry a few times: wterm's textarea may not exist immediately.
-    const delays = [50, 200, 500];
-    const timers = delays.map((ms) =>
-      setTimeout(() => {
-        const ta = term.element.querySelector("textarea");
-        if (ta instanceof HTMLElement) ta.focus();
-      }, ms),
-    );
-    return () => timers.forEach(clearTimeout);
-  }, [isMobile, state.connected, termRef]);
+    if (active && ensureState === "ready") activate();
+  }, [active, ensureState, activate]);
+
+  // Auto-keyboard-open on initial connect removed (#1178): the
+  // KeyboardFab is always visible and lets the user open the keyboard
+  // explicitly. Popping the soft keyboard on every session open is the
+  // wrong default for navigation, especially read-only check-ins.
 
   // Toggle keyboard: focus/blur MUST be the first thing in this handler
   // so iOS considers it part of the user-gesture chain. Anything before
@@ -266,7 +186,7 @@ export function TerminalView({ session, cockpitMasterEnabled = false }: Props) {
   // Claim primary after the focus so the PTY resizes to this viewport.
   const toggleKeyboard = useCallback(() => {
     const term = termRef.current;
-    if (!term) return;
+    if (!term?.element) return;
     const ta = term.element.querySelector("textarea");
     if (keyboardOpen) {
       ta?.blur();
@@ -281,11 +201,7 @@ export function TerminalView({ session, cockpitMasterEnabled = false }: Props) {
     if (!showScrollHint) return;
     const markSeen = () => {
       setHintDismissed(true);
-      try {
-        localStorage.setItem(SCROLL_HINT_SEEN_KEY, "1");
-      } catch {
-        // ignore
-      }
+      safeSetItem(SCROLL_HINT_SEEN_KEY, "1");
     };
     const t = setTimeout(markSeen, SCROLL_HINT_TIMEOUT_MS);
     const c = containerRef.current;

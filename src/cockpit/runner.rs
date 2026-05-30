@@ -23,7 +23,8 @@
 //!
 //! Logging: the runner appends to
 //! `<app_dir>/cockpit-workers/<session_id>.log` so `aoe cockpit logs
-//! --session <id> --follow` can tail it independently of `serve.log`.
+//! --session <id> --follow` can tail it independently of the shared
+//! `debug.log` that all aoe processes append to.
 //!
 //! ## Why a shim and not "let the agent bind the socket"
 //!
@@ -75,6 +76,14 @@ pub struct CockpitRunnerArgs {
     pub session_id: String,
     #[arg(long)]
     pub agent_name: String,
+    /// Registry key for the agent (e.g. `claude`, `codex`,
+    /// `opencode`). Persisted on the WorkerRecord so the daemon's
+    /// attach path resolves the right `AgentProfile` after a restart;
+    /// `agent_name` carries the binary command and is not a valid
+    /// profile key. Defaulted to empty so legacy daemons rolling out
+    /// the new field don't immediately break runners already in flight.
+    #[arg(long, default_value = "")]
+    pub agent_key: String,
     #[arg(long)]
     pub cwd: PathBuf,
     #[arg(long)]
@@ -87,10 +96,18 @@ pub struct CockpitRunnerArgs {
     #[arg(long, value_delimiter = ',', default_value = "")]
     pub provider_env_keys: Vec<String>,
     /// Cached ACP session id, written by the daemon and read on
-    /// reattach. The runner doesn't itself use this field — it surfaces
+    /// reattach. The runner doesn't itself use this field; it surfaces
     /// in the registry for the daemon's restart path.
     #[arg(long)]
     pub stored_acp_session_id: Option<String>,
+    /// Profile the session was created under. Persisted on the
+    /// `WorkerRecord` so reattached `terminal/create` requests re-resolve
+    /// sandbox env against the same profile the session originally used.
+    /// Defaulted to empty so legacy daemons whose runner predates this
+    /// field still load; an absent value resolves to the global default
+    /// profile, matching pre-persistence behavior.
+    #[arg(long, default_value = "")]
+    pub source_profile: String,
     /// Agent program + args after `--`.
     #[arg(last = true, required = true)]
     pub agent_argv: Vec<String>,
@@ -149,11 +166,17 @@ pub async fn run(args: CockpitRunnerArgs) -> Result<()> {
         our_pid,
         args.socket.clone(),
         args.agent_name.clone(),
+        args.agent_key.clone(),
         args.cwd.clone(),
         args.model.clone(),
         args.additional_dirs.clone(),
         args.provider_env_keys.clone(),
         args.stored_acp_session_id.clone(),
+        if args.source_profile.is_empty() {
+            None
+        } else {
+            Some(args.source_profile.clone())
+        },
     );
     worker_registry::save(&record).context("writing registry record")?;
 
@@ -650,7 +673,6 @@ fn init_runner_logging(session_id: &str) -> Result<()> {
     let per_session = worker_registry::log_path_for(session_id)?;
     open_log_file(&per_session)?;
 
-    let shared_path = crate::session::get_app_dir()?.join("debug.log");
     // Same precedence as main.rs: env > [logging] in config.toml > info
     // baseline. The notify watcher on runtime_filter still takes over
     // for live swaps once the daemon writes one.
@@ -659,12 +681,22 @@ fn init_runner_logging(session_id: &str) -> Result<()> {
         .or_else(crate::logging::load_persisted_filter)
         .unwrap_or_else(crate::logging::serve_default_filter);
 
-    let init = crate::logging::init_subscriber(
-        crate::logging::SubscriberTarget::File(shared_path),
-        filter,
-    );
+    let app_dir = crate::session::get_app_dir()?;
+    let log_cfg = crate::session::load_config()
+        .ok()
+        .flatten()
+        .map(|c| c.logging)
+        .unwrap_or_default();
+    let resolution =
+        crate::logging::resolve_sink(&log_cfg, &app_dir, crate::logging::ProcessContext::Runner);
+
+    let init =
+        crate::logging::init_subscriber_with_options(resolution.target, filter, log_cfg.show_spans);
     if let Some(c) = init.controller {
         crate::logging::install_controller(c);
+    }
+    if let Some(w) = resolution.warning {
+        tracing::warn!(target: "log.runtime", "{}", w);
     }
     Ok(())
 }

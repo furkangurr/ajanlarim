@@ -1,30 +1,95 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  createContext,
+  memo,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MutableRefObject,
+} from "react";
 import { createPortal } from "react-dom";
-import { Link } from "react-router-dom";
-import { Pencil } from "lucide-react";
+import { Archive, Clock, ListOrdered, Moon, Pencil, Pin } from "lucide-react";
+import {
+  DndContext,
+  MouseSensor,
+  TouchSensor,
+  useSensor,
+  useSensors,
+  closestCenter,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  useSortable,
+  verticalListSortingStrategy,
+  arrayMove,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import type {
   RepoGroup,
   SessionResponse,
   SessionStatus,
   Workspace,
 } from "../lib/types";
-import { MULTI_REPO_GROUP_ID } from "../hooks/useRepoGroups";
+import { MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID } from "../hooks/useRepoGroups";
+import { safeGetItem, safeSetItem } from "../lib/safeStorage";
+import {
+  REPO_COLOR_OPTIONS,
+  type RepoAppearanceUpdate,
+  type RepoColor,
+} from "../lib/repoAppearance";
 import {
   STATUS_DOT_CLASS,
   getStatusTextClass,
   isSessionActive,
 } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
-import { renameSession, setSessionNotifications } from "../lib/api";
+import {
+  renameSession,
+  setSessionArchive,
+  setSessionNotifications,
+  setSessionPin,
+  setSessionSnooze,
+} from "../lib/api";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
 import { useHasDraftForSessions } from "../lib/cockpitDrafts";
+import { reportError } from "../lib/toastBus";
+import {
+  resolveEffectiveSnoozedUntil,
+  snoozeTimestampCloseEnough,
+  triageMenuShape,
+  triageStateOf,
+  workspaceIsPinned,
+  workspaceIsSunk,
+  type SidebarSortMode,
+} from "../lib/sidebarSort";
 import { StatusGlyph } from "./StatusGlyph";
 import { OwnerAvatar } from "./OwnerAvatar";
 
 const SIDEBAR_WIDTH_KEY = "aoe-sidebar-width";
+const SUNK_EXPANDED_KEY = "aoe-sidebar-sunk-expanded";
 const DEFAULT_WIDTH = 280;
 const MIN_WIDTH = 200;
 const MAX_WIDTH = 480;
+
+/** Snooze duration presets surfaced by the sidebar context menu. Order
+ *  and values mirror the TUI dialog presets at
+ *  `src/tui/dialogs/snooze_duration.rs`, so the two surfaces describe
+ *  the same set of choices. The TUI extends past these via a manual
+ *  numeric entry; the web sidebar omits that path in v1 (the menu
+ *  stays flat). See #1581. */
+export const SNOOZE_PRESETS: readonly { label: string; minutes: number }[] = [
+  { label: "1 hour", minutes: 60 },
+  { label: "2 hours", minutes: 120 },
+  { label: "3 hours", minutes: 180 },
+  { label: "4 hours", minutes: 240 },
+  { label: "5 hours", minutes: 300 },
+  { label: "6 hours", minutes: 360 },
+  { label: "1 day", minutes: 1440 },
+  { label: "1 week", minutes: 10080 },
+];
 
 // Module-level bus for closing any open SessionRow context menu when a
 // new one opens. Each SessionRow manages its own menu state; without
@@ -39,17 +104,21 @@ function closeOtherContextMenus() {
 
 interface Props {
   groups: RepoGroup[];
+  onReorderWorkspaces: (newOrder: string[]) => void;
   activeId: string | null;
   open: boolean;
   onToggle: () => void;
   onSelect: (workspaceId: string) => void;
   onToggleRepo: (repoId: string) => void;
+  onUpdateRepoAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   onNew: () => void;
   onCreateSession: (repoPath: string) => void;
   onSettings: () => void;
   onProjects: () => void;
   onDeleteSession?: (workspaceId: string) => void;
   readOnly?: boolean;
+  sortMode: SidebarSortMode;
+  onSortModeChange: (mode: SidebarSortMode) => void;
 }
 
 function bestSession(
@@ -99,16 +168,23 @@ function detectNotifyPreset(
 }
 
 function loadSavedWidth(): number {
-  try {
-    const saved = localStorage.getItem(SIDEBAR_WIDTH_KEY);
-    if (saved) {
-      const w = parseInt(saved, 10);
-      if (w >= MIN_WIDTH && w <= MAX_WIDTH) return w;
-    }
-  } catch {
-    // ignore
+  const saved = safeGetItem(SIDEBAR_WIDTH_KEY);
+  if (saved) {
+    const w = parseInt(saved, 10);
+    if (w >= MIN_WIDTH && w <= MAX_WIDTH) return w;
   }
   return DEFAULT_WIDTH;
+}
+
+/** Hydrate the single global "Snoozed & archived" footer expanded
+ *  state from localStorage. Defaults to collapsed (TUI parity with
+ *  the `toggle_archived_section` keybind starting collapsed). An
+ *  earlier iteration kept a per-group dict here; any leftover dict
+ *  is treated as collapsed. */
+function loadSunkExpanded(): boolean {
+  const raw = safeGetItem(SUNK_EXPANDED_KEY);
+  if (raw === "true") return true;
+  return false;
 }
 
 /** One-line sidebar affordance showing plan progress for cockpit
@@ -201,18 +277,170 @@ function formatDurationSecondsShort(seconds: number): string {
   return remM === 0 ? `${h}h` : `${h}h ${remM}m`;
 }
 
-function isPlainLeftClick(event: React.MouseEvent<HTMLAnchorElement>): boolean {
+/** Wall-clock target for an optimistic snooze: `Date.now() + minutes
+ *  * 60_000` as an RFC3339 ISO string. Sits outside the component so
+ *  the `Date.now()` call doesn't trip
+ *  `react-hooks/purity`; the event handler that calls it is itself a
+ *  closure, not a render. The exact value is throwaway (the server's
+ *  response on the next poll is the source of truth), so a few ms
+ *  of jitter is harmless. See #1581. */
+export function makeOptimisticSnoozedUntil(minutes: number): string {
+  return new Date(Date.now() + minutes * 60_000).toISOString();
+}
+
+/** Compact "time remaining" label for the snooze chip computed once at
+ *  render time (no per-second timer, by design: snooze rows poll the
+ *  sessions API at the existing cadence and the static label is more
+ *  battery-friendly than a 1s ticker on phones, see #1581 design
+ *  discussion). Bucket sizes:
+ *   - < 1 minute : "<1m"
+ *   - < 1 hour   : "Nm"
+ *   - < 1 day    : "Nh" (rounded down)
+ *   - else       : "Nd" (rounded down)
+ *  Past timestamps return "soon" since the wake-up has expired but the
+ *  next poll has not yet cleared the row. */
+export function formatSnoozeRemainingShort(snoozedUntilIso: string): string {
+  const target = Date.parse(snoozedUntilIso);
+  if (!Number.isFinite(target)) return "snoozed";
+  const remainingMs = target - Date.now();
+  if (remainingMs <= 0) return "soon";
+  const minutes = Math.floor(remainingMs / 60_000);
+  if (minutes < 1) return "<1m";
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
+}
+
+// Wraps a SessionRow with @dnd-kit sortable plumbing. The row itself
+// is the drag handle: a short tap/click navigates as before, but a
+// press-and-hold (sensor delay) lifts the row so the user can reorder.
+// See #1169.
+
+// "Drag just ended" timestamp shared by every sortable row and the
+// document-level click suppressor. Lives as a ref on the sidebar so
+// HMR resets don't leave it in a weird state and so siblings can't
+// see each other through a module-scoped global. The document
+// listener checks `ref.current` on every click; rows write to it
+// while dragging and on release.
+export const DragSuppressContext = createContext<MutableRefObject<number> | null>(null);
+function useDragSuppressRef(): MutableRefObject<number> {
+  const ref = useContext(DragSuppressContext);
+  if (!ref) {
+    throw new Error("DragSuppressContext used outside provider");
+  }
+  return ref;
+}
+
+const REPO_COLOR_TOKENS: Record<RepoColor, string> = {
+  amber: "--color-status-waiting",
+  teal: "--color-terminal-active",
+  sky: "--color-sandbox",
+  violet: "--color-diff-header",
+  rose: "--color-status-error",
+  slate: "--color-surface-700",
+};
+
+function repoColorStyle(color: RepoColor | null): React.CSSProperties | undefined {
+  if (!color) return undefined;
+  const token = REPO_COLOR_TOKENS[color];
+  return {
+    backgroundColor: `color-mix(in srgb, var(${token}) 14%, transparent)`,
+  };
+}
+
+function repoSwatchStyle(color: RepoColor): React.CSSProperties {
+  return { backgroundColor: `var(${REPO_COLOR_TOKENS[color]})` };
+}
+
+function useSuppressClickAfterDrag(ref: MutableRefObject<number>) {
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (Date.now() < ref.current) {
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+      }
+    };
+    // The click Chromium dispatches after a drag-release can bypass
+    // React's event delegation and land on the inner row without firing
+    // any wrapping capture handler. A document-level capture listener
+    // catches it before row activation kicks in.
+    document.addEventListener("click", handler, true);
+    return () => document.removeEventListener("click", handler, true);
+  }, [ref]);
+}
+
+function SortableSessionRow(props: {
+  workspace: Workspace;
+  isActive: boolean;
+  onClick: () => void;
+  onDelete?: (workspaceId: string) => void;
+  readOnly?: boolean;
+  dragDisabled?: boolean;
+}) {
+  const dragSuppressRef = useDragSuppressRef();
+  // `disabled` no-ops the sensor listeners. `readOnly` covers viewers
+  // who can't write, `dragDisabled` covers modes where the visible order
+  // is computed (e.g. last-activity sort), so a drag would have no
+  // meaning. Skipping the sortable wiring entirely would also drop the
+  // click suppressor; that's harmless in either case since nothing else
+  // triggers a drag.
+  const dragOff = !!props.readOnly || !!props.dragDisabled;
+  const { listeners, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id: props.workspace.id, disabled: dragOff });
+  useEffect(() => {
+    if (isDragging) {
+      // Keep extending the window while dragging so a slow drag still
+      // suppresses the trailing click on release.
+      dragSuppressRef.current = Date.now() + 1000;
+    } else if (dragSuppressRef.current > Date.now()) {
+      // Drag just ended; the click is on its way. Hold the suppression
+      // for ~250ms after release (enough to swallow the synthetic click,
+      // short enough that a real tap right after still navigates).
+      dragSuppressRef.current = Date.now() + 250;
+    }
+  }, [isDragging, dragSuppressRef]);
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    touchAction: "manipulation",
+    // Lift the active row above its siblings so the ring/shadow aren't
+    // clipped by the next row in the list.
+    zIndex: isDragging ? 10 : "auto",
+    position: "relative",
+  } as const;
   return (
-    event.button === 0 &&
-    !event.defaultPrevented &&
-    !event.metaKey &&
-    !event.altKey &&
-    !event.ctrlKey &&
-    !event.shiftKey
+    // We intentionally spread only `listeners` (pointer-down etc.) and
+    // not dnd-kit's `attributes`. The latter inject role="button" and a
+    // tabIndex which would duplicate the inner Link as a focusable,
+    // button-styled affordance for assistive tech. Keyboard drag isn't
+    // supported here, so the omitted attributes don't cost anything.
+    <div
+      ref={setNodeRef}
+      style={style}
+      {...(dragOff ? {} : listeners)}
+      aria-roledescription={
+        dragOff ? undefined : "Press and hold to reorder"
+      }
+      // While dragging, the row gets an amber ring (matches the active
+      // session accent) and a soft shadow so it reads as elevated above
+      // the rest of the list. ring-inset keeps the highlight tight to
+      // the row rectangle; the transition runs in both directions so
+      // the lift and the drop both feel intentional. The inner
+      // SessionRow keeps its own background, so we only style the
+      // outline here.
+      className={
+        "transition-shadow duration-150 " +
+        (isDragging ? "ring-2 ring-inset ring-brand-500 shadow-lg" : "")
+      }
+    >
+      <SessionRow {...props} indented />
+    </div>
   );
 }
 
-const SessionRow = memo(function SessionRow({
+export const SessionRow = memo(function SessionRow({
   workspace,
   isActive,
   onClick,
@@ -239,10 +467,10 @@ const SessionRow = memo(function SessionRow({
     },
     idleDecayWindowMs,
   );
+  const firstSession = workspace.sessions[0];
   const runningSession = workspace.sessions.find((s) =>
     isSessionActive(s, idleDecayWindowMs),
   );
-  const firstSession = workspace.sessions[0];
   const singleSession = workspace.sessions.length === 1;
   const sessionTitle = firstSession?.title.trim() ?? "";
   const branchLabel = workspace.branch ?? null;
@@ -256,6 +484,20 @@ const SessionRow = memo(function SessionRow({
   const subtitleTitle = subtitle && baseBranch
     ? `${subtitle} (based on ${baseBranch})`
     : subtitle;
+  // Workspace renders as favorited when any of its sessions are
+  // favorited. Mirrors the TUI's within-tier pin: the star promotes the
+  // row visually so the user can find their starred work fast. Toggled
+  // via TUI `f`/`F` or `aoe session favorite|unfavorite`.
+  const isFavorited = workspace.sessions.some((s) => s.favorited);
+  // Web-only triage signals. `pinned` floats the workspace to the top
+  // of every sort mode; `archived` and `snoozedUntil` mark the row as
+  // sunk (the parent splits sunk workspaces into a separate collapsible
+  // section). Aggregators mirror the matching helpers in
+  // `lib/sidebarSort.ts` to keep render and sort in sync. See #1581.
+  const isPinned = workspace.sessions.some((s) => s.pinned_at != null);
+  const isArchived = workspace.sessions.some((s) => s.archived_at != null);
+  const snoozedUntil = workspace.sessions.find((s) => s.snoozed_until)
+    ?.snoozed_until ?? null;
   const sessionId = firstSession?.id;
   const navigationSessionId = runningSession?.id ?? firstSession?.id ?? null;
   const sessionPath = navigationSessionId
@@ -282,6 +524,126 @@ const SessionRow = memo(function SessionRow({
     if (!sessionId || preset === notifyPreset) return;
     await setSessionNotifications(sessionId, preset);
   };
+
+  // Triage actions (pin / archive / snooze). Optimistic state lets the
+  // glyph, chip, and tier flip immediately on click; on PATCH failure we
+  // revert and surface a toast. The optimistic snap clears itself once
+  // the next sessions-poll reflects the same value, so a successful
+  // round-trip is invisible to the user (just feels fast).
+  const [optimisticPinned, setOptimisticPinned] = useState<boolean | null>(
+    null,
+  );
+  const [optimisticArchived, setOptimisticArchived] = useState<boolean | null>(
+    null,
+  );
+  // Optimistic `snoozed_until` override. `undefined` = no override
+  // (use the prop), a string = pretend the server already returned
+  // this RFC3339 timestamp, `null` = pretend the server already
+  // unsnoozed. Clears once the prop matches the override on the next
+  // poll, matching the pin / archive pattern above.
+  const [optimisticSnoozedUntil, setOptimisticSnoozedUntil] = useState<
+    string | null | undefined
+  >(undefined);
+  // Snooze duration picker. Lives in its own portal-rendered modal,
+  // independent of the context menu's lifecycle so the parent-menu
+  // dismissal listener cannot close the picker out from under us.
+  const [snoozeModalOpen, setSnoozeModalOpen] = useState(false);
+  useEffect(() => {
+    if (optimisticPinned !== null && optimisticPinned === isPinned) {
+      setOptimisticPinned(null);
+    }
+  }, [isPinned, optimisticPinned]);
+  useEffect(() => {
+    if (optimisticArchived !== null && optimisticArchived === isArchived) {
+      setOptimisticArchived(null);
+    }
+  }, [isArchived, optimisticArchived]);
+  useEffect(() => {
+    if (optimisticSnoozedUntil === undefined) return;
+    // Clear the override only when the server value actually matches
+    // it. A naive "both non-null" check used to fire prematurely
+    // when the user re-snoozed an already-snoozed row: the prop
+    // was still the OLD timestamp but non-null, the override was
+    // the NEW timestamp, the effect treated them as a match, and
+    // the chip snapped back to the stale time until the next
+    // poll. See #1581 CodeRabbit review.
+    if (optimisticSnoozedUntil === null && snoozedUntil == null) {
+      setOptimisticSnoozedUntil(undefined);
+      return;
+    }
+    if (
+      optimisticSnoozedUntil != null &&
+      snoozedUntil != null &&
+      snoozeTimestampCloseEnough(optimisticSnoozedUntil, snoozedUntil)
+    ) {
+      setOptimisticSnoozedUntil(undefined);
+    }
+  }, [snoozedUntil, optimisticSnoozedUntil]);
+
+  const togglePin = async () => {
+    setContextMenu(null);
+    if (!sessionId) return;
+    const next = !isPinned;
+    setOptimisticPinned(next);
+    const result = await setSessionPin(sessionId, next);
+    if (!result) {
+      setOptimisticPinned(null);
+      reportError(next ? "Failed to pin session" : "Failed to unpin session");
+    }
+  };
+
+  const toggleArchive = async () => {
+    setContextMenu(null);
+    if (!sessionId) return;
+    const next = !isArchived;
+    setOptimisticArchived(next);
+    const result = await setSessionArchive(sessionId, next);
+    if (!result) {
+      setOptimisticArchived(null);
+      reportError(
+        next ? "Failed to archive session" : "Failed to unarchive session",
+      );
+    }
+  };
+
+  const applySnooze = async (minutes: number | null) => {
+    setContextMenu(null);
+    setSnoozeModalOpen(false);
+    if (!sessionId) return;
+    // Optimistic flip: render the snooze chip + sink the row before
+    // the PATCH round-trip lands, matching the pin / archive
+    // affordance. For positive minutes we synthesise a target
+    // timestamp; the server is the source of truth and the value is
+    // discarded on the next poll, so a few ms of drift is harmless.
+    const optimisticUntil =
+      minutes == null ? null : makeOptimisticSnoozedUntil(minutes);
+    setOptimisticSnoozedUntil(optimisticUntil);
+    const result = await setSessionSnooze(sessionId, minutes);
+    if (!result) {
+      setOptimisticSnoozedUntil(undefined);
+      reportError(
+        minutes == null ? "Failed to unsnooze session" : "Failed to snooze session",
+      );
+    }
+  };
+
+  // Close the context menu first, then open the modal in the next
+  // tick so the menu's document-click dismiss listener does not race
+  // with the modal's mount.
+  const openSnoozeModal = () => {
+    setContextMenu(null);
+    setSnoozeModalOpen(true);
+  };
+
+  // Effective state for rendering: optimistic overrides win until the
+  // prop catches up (cleared in the effects above).
+  const effectivePinned = optimisticPinned ?? isPinned;
+  const effectiveArchived = optimisticArchived ?? isArchived;
+  const effectiveSnoozedUntil = resolveEffectiveSnoozedUntil(
+    optimisticSnoozedUntil,
+    snoozedUntil,
+  );
+  const effectiveSnoozed = effectiveSnoozedUntil != null;
 
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const [renaming, setRenaming] = useState(false);
@@ -403,6 +765,7 @@ const SessionRow = memo(function SessionRow({
             if (e.key === "Enter") commitRename();
             if (e.key === "Escape") setRenaming(false);
           }}
+          data-testid="sidebar-rename-input"
           className="w-full bg-surface-900 border border-brand-600 rounded px-2 py-1 text-[13px] md:text-[14px] font-mono text-text-primary focus:outline-none"
         />
       </div>
@@ -411,17 +774,32 @@ const SessionRow = memo(function SessionRow({
 
   return (
     <>
-      <Link
-        to={sessionPath}
+      <a
+        href={sessionPath}
+        tabIndex={isDeleting ? -1 : undefined}
+        aria-disabled={isDeleting || undefined}
+        data-testid="sidebar-session-row"
+        draggable={false}
         onClick={(e) => {
+          if (
+            e.button !== 0 ||
+            e.metaKey ||
+            e.ctrlKey ||
+            e.shiftKey ||
+            e.altKey
+          ) {
+            return;
+          }
+          if (isDeleting) {
+            e.preventDefault();
+            return;
+          }
           if (longPressFired.current) {
             e.preventDefault();
             return;
           }
-          if (isPlainLeftClick(e)) {
-            e.preventDefault();
-            onClick();
-          }
+          e.preventDefault();
+          onClick();
         }}
         onContextMenu={handleContextMenu}
         onTouchStart={handleTouchStart}
@@ -447,7 +825,25 @@ const SessionRow = memo(function SessionRow({
             />
           </span>
           <div className="min-w-0 flex-1">
-            <span className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${isSessionActive({ status: sessionStatus, idle_entered_at: idleEnteredAt }, idleDecayWindowMs) ? textClass : isActive ? "text-text-primary" : "text-text-secondary"}`}>
+            <span className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${isSessionActive({ status: sessionStatus, idle_entered_at: idleEnteredAt }, idleDecayWindowMs) ? textClass : isActive ? "text-text-primary" : "text-text-secondary"} ${isFavorited || effectivePinned ? "font-semibold" : ""} ${effectiveArchived || effectiveSnoozed ? "italic opacity-70" : ""}`}>
+              {effectivePinned && (
+                <span
+                  title="Pinned"
+                  aria-label="Pinned"
+                  className="shrink-0 inline-flex text-brand-400"
+                >
+                  <Pin className="h-3 w-3 -rotate-45" />
+                </span>
+              )}
+              {isFavorited && (
+                <span
+                  title="Favorited"
+                  aria-label="Favorited"
+                  className="shrink-0 text-amber-300"
+                >
+                  *
+                </span>
+              )}
               <span className="truncate" title={label}>{label}</span>
               {hasDraft && (
                 <span
@@ -456,6 +852,26 @@ const SessionRow = memo(function SessionRow({
                   className="inline-flex shrink-0"
                 >
                   <Pencil className="h-3 w-3 text-amber-400/90" />
+                </span>
+              )}
+              {effectiveArchived && (
+                <span
+                  title="Archived"
+                  aria-label="Archived"
+                  className="shrink-0 inline-flex items-center gap-0.5 rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium text-text-dim"
+                >
+                  <Archive className="h-3 w-3" />
+                  <span className="hidden sm:inline">archived</span>
+                </span>
+              )}
+              {!effectiveArchived && effectiveSnoozed && effectiveSnoozedUntil && (
+                <span
+                  title={`Snoozed until ${new Date(effectiveSnoozedUntil).toLocaleString()}`}
+                  aria-label="Snoozed"
+                  className="shrink-0 inline-flex items-center gap-0.5 rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium text-text-dim"
+                >
+                  <Moon className="h-3 w-3" />
+                  <span>{formatSnoozeRemainingShort(effectiveSnoozedUntil)}</span>
                 </span>
               )}
               {firstSession?.cockpit_mode &&
@@ -518,15 +934,17 @@ const SessionRow = memo(function SessionRow({
             )}
           </div>
         </div>
-      </Link>
+      </a>
       {contextMenu && createPortal(
         <div
           ref={menuRef}
+          data-testid="sidebar-context-menu"
           className="fixed z-50 bg-surface-800 border border-surface-700 rounded-lg shadow-lg py-1 min-w-[180px]"
           style={{ left: contextMenu.x, top: contextMenu.y }}
         >
           <button
             onClick={startRename}
+            data-testid="sidebar-context-menu-rename"
             className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
           >
             Rename
@@ -561,8 +979,92 @@ const SessionRow = memo(function SessionRow({
           {!readOnly && (
             <>
               <div className="border-t border-surface-700/20 my-1" />
+              <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
+                Triage
+              </div>
+              {(() => {
+                // Menu actions are gated by the row's current triage
+                // state so contradictory transitions never appear in
+                // the UI: an archived row only offers Unarchive, a
+                // pinned row only offers Unpin, etc. The shape helper
+                // lives in `lib/sidebarSort.ts` so it can be unit
+                // tested. See #1581.
+                const shape = triageMenuShape(
+                  triageStateOf({
+                    isPinned: effectivePinned,
+                    isArchived: effectiveArchived,
+                    isSnoozed: effectiveSnoozed,
+                  }),
+                );
+                return (
+                  <>
+                    {shape.showPin && (
+                      <button
+                        onClick={() => void togglePin()}
+                        data-testid="sidebar-context-menu-pin"
+                        className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                      >
+                        <Pin className="h-3.5 w-3.5 shrink-0 -rotate-45" />
+                        Pin
+                      </button>
+                    )}
+                    {shape.showUnpin && (
+                      <button
+                        onClick={() => void togglePin()}
+                        data-testid="sidebar-context-menu-pin"
+                        className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                      >
+                        <Pin className="h-3.5 w-3.5 shrink-0 -rotate-45" />
+                        Unpin
+                      </button>
+                    )}
+                    {shape.showArchive && (
+                      <button
+                        onClick={() => void toggleArchive()}
+                        data-testid="sidebar-context-menu-archive"
+                        className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                      >
+                        <Archive className="h-3.5 w-3.5 shrink-0" />
+                        Archive
+                      </button>
+                    )}
+                    {shape.showUnarchive && (
+                      <button
+                        onClick={() => void toggleArchive()}
+                        data-testid="sidebar-context-menu-archive"
+                        className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                      >
+                        <Archive className="h-3.5 w-3.5 shrink-0" />
+                        Unarchive
+                      </button>
+                    )}
+                    {shape.showSnooze && (
+                      <button
+                        onClick={openSnoozeModal}
+                        data-testid="sidebar-context-menu-snooze"
+                        className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                      >
+                        <Moon className="h-3.5 w-3.5 shrink-0" />
+                        Snooze…
+                      </button>
+                    )}
+                    {shape.showUnsnooze && (
+                      <button
+                        onClick={() => void applySnooze(null)}
+                        data-testid="sidebar-context-menu-unsnooze"
+                        className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                      >
+                        <Moon className="h-3.5 w-3.5 shrink-0" />
+                        Unsnooze
+                      </button>
+                    )}
+                  </>
+                );
+              })()}
+              <div className="border-t border-surface-700/20 my-1" />
               <button
                 onClick={handleDelete}
+                data-testid="sidebar-context-menu-delete"
                 className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-status-error hover:bg-status-error/10 cursor-pointer transition-colors"
               >
                 Delete
@@ -572,70 +1074,481 @@ const SessionRow = memo(function SessionRow({
         </div>,
         document.body,
       )}
+      {snoozeModalOpen &&
+        createPortal(
+          <SnoozeModal
+            title={label}
+            onCancel={() => setSnoozeModalOpen(false)}
+            onPick={(minutes) => void applySnooze(minutes)}
+          />,
+          document.body,
+        )}
     </>
   );
 });
+
+/** Bounds for `validate_snooze_duration` on the server. Mirrored
+ *  client-side so the modal can pre-validate and disable the submit
+ *  button rather than round-trip a 400. See
+ *  `src/session/config.rs::SNOOZE_MAX_MINUTES`. */
+const SNOOZE_MIN_MINUTES = 1;
+const SNOOZE_MAX_MINUTES = 30 * 24 * 60;
+
+type SnoozeUnit = "m" | "h" | "d" | "w";
+
+const SNOOZE_UNIT_LABELS: Record<SnoozeUnit, string> = {
+  m: "minutes",
+  h: "hours",
+  d: "days",
+  w: "weeks",
+};
+
+function snoozeUnitToMinutes(value: number, unit: SnoozeUnit): number {
+  switch (unit) {
+    case "m":
+      return value;
+    case "h":
+      return value * 60;
+    case "d":
+      return value * 60 * 24;
+    case "w":
+      return value * 60 * 24 * 7;
+  }
+}
+
+/** Centered modal duration picker rendered as a separate portal so it
+ *  is independent of the row's context menu. Three submit paths:
+ *   - 8 TUI presets (matching `src/tui/dialogs/snooze_duration.rs`).
+ *   - Custom duration: number + unit (m/h/d/w).
+ *   - Until a specific date+time (HTML5 datetime-local input).
+ *  Backdrop click and Escape both dismiss. See #1581. */
+export function SnoozeModal({
+  title,
+  onCancel,
+  onPick,
+}: {
+  title: string;
+  onCancel: () => void;
+  onPick: (minutes: number) => void;
+}) {
+  const [customValue, setCustomValue] = useState("");
+  const [customUnit, setCustomUnit] = useState<SnoozeUnit>("h");
+  const [untilValue, setUntilValue] = useState("");
+  const [customError, setCustomError] = useState<string | null>(null);
+  const [untilError, setUntilError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onCancel();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onCancel]);
+
+  const submitCustom = () => {
+    setCustomError(null);
+    const n = Number.parseInt(customValue, 10);
+    if (!Number.isFinite(n) || n <= 0) {
+      setCustomError("Enter a positive whole number.");
+      return;
+    }
+    const minutes = snoozeUnitToMinutes(n, customUnit);
+    if (minutes < SNOOZE_MIN_MINUTES || minutes > SNOOZE_MAX_MINUTES) {
+      setCustomError(
+        `Must be between 1 minute and 30 days (got ${minutes} minutes).`,
+      );
+      return;
+    }
+    onPick(minutes);
+  };
+
+  const submitUntil = () => {
+    setUntilError(null);
+    if (!untilValue) {
+      setUntilError("Pick a date and time.");
+      return;
+    }
+    // datetime-local values are wall-clock (no zone). Date.parse
+    // interprets them as local time, which matches user expectation
+    // (snooze "until 9am tomorrow" means 9am in the user's TZ).
+    const target = Date.parse(untilValue);
+    if (!Number.isFinite(target)) {
+      setUntilError("Invalid date.");
+      return;
+    }
+    const deltaMs = target - Date.now();
+    if (deltaMs <= 0) {
+      setUntilError("Pick a time in the future.");
+      return;
+    }
+    const minutes = Math.max(1, Math.round(deltaMs / 60_000));
+    if (minutes > SNOOZE_MAX_MINUTES) {
+      setUntilError("Maximum snooze is 30 days from now.");
+      return;
+    }
+    onPick(minutes);
+  };
+
+  return (
+    <div
+      data-testid="snooze-modal-backdrop"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onCancel();
+      }}
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 px-4 py-8 overflow-y-auto"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Snooze session"
+    >
+      <div
+        data-testid="snooze-modal"
+        className="w-full max-w-sm rounded-lg border border-surface-700 bg-surface-800 shadow-xl"
+      >
+        <div className="px-4 py-3 border-b border-surface-700/40">
+          <div className="text-sm font-mono text-text-primary truncate" title={title}>
+            Snooze
+            <span className="text-text-muted"> · {title}</span>
+          </div>
+          <div className="mt-1 text-[11px] text-text-dim">
+            How long should this session sit out?
+          </div>
+        </div>
+        <div className="flex flex-col py-2">
+          {SNOOZE_PRESETS.map((preset) => (
+            <button
+              key={preset.minutes}
+              onClick={() => onPick(preset.minutes)}
+              data-testid={`snooze-modal-preset-${preset.minutes}`}
+              className="w-full text-left px-4 py-2 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+            >
+              {preset.label}
+            </button>
+          ))}
+        </div>
+        <div className="px-4 py-3 border-t border-surface-700/40">
+          <div className="text-[11px] font-mono uppercase tracking-widest text-text-muted mb-2">
+            Custom duration
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              inputMode="numeric"
+              min={1}
+              value={customValue}
+              onChange={(e) => setCustomValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") submitCustom();
+              }}
+              placeholder="3"
+              data-testid="snooze-modal-custom-value"
+              aria-label="Custom snooze duration"
+              className="w-20 rounded border border-surface-700 bg-surface-900 px-2 py-1 text-sm text-text-primary focus:border-brand-600 focus:outline-none"
+            />
+            <select
+              value={customUnit}
+              onChange={(e) => setCustomUnit(e.target.value as SnoozeUnit)}
+              data-testid="snooze-modal-custom-unit"
+              aria-label="Custom snooze unit"
+              className="rounded border border-surface-700 bg-surface-900 px-2 py-1 text-sm text-text-primary focus:border-brand-600 focus:outline-none"
+            >
+              {(Object.keys(SNOOZE_UNIT_LABELS) as SnoozeUnit[]).map((u) => (
+                <option key={u} value={u}>
+                  {SNOOZE_UNIT_LABELS[u]}
+                </option>
+              ))}
+            </select>
+            <button
+              onClick={submitCustom}
+              data-testid="snooze-modal-custom-submit"
+              className="ml-auto rounded bg-brand-600 px-3 py-1 text-sm font-medium text-text-primary hover:bg-brand-500 cursor-pointer transition-colors"
+            >
+              Snooze
+            </button>
+          </div>
+          {customError && (
+            <div
+              role="alert"
+              data-testid="snooze-modal-custom-error"
+              className="mt-1 text-[11px] text-status-error"
+            >
+              {customError}
+            </div>
+          )}
+        </div>
+        <div className="px-4 py-3 border-t border-surface-700/40">
+          <div className="text-[11px] font-mono uppercase tracking-widest text-text-muted mb-2">
+            Until
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              type="datetime-local"
+              value={untilValue}
+              onChange={(e) => setUntilValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") submitUntil();
+              }}
+              data-testid="snooze-modal-until-value"
+              aria-label="Snooze until"
+              className="flex-1 min-w-0 rounded border border-surface-700 bg-surface-900 px-2 py-1 text-sm text-text-primary focus:border-brand-600 focus:outline-none"
+            />
+            <button
+              onClick={submitUntil}
+              data-testid="snooze-modal-until-submit"
+              className="rounded bg-brand-600 px-3 py-1 text-sm font-medium text-text-primary hover:bg-brand-500 cursor-pointer transition-colors"
+            >
+              Snooze
+            </button>
+          </div>
+          {untilError && (
+            <div
+              role="alert"
+              data-testid="snooze-modal-until-error"
+              className="mt-1 text-[11px] text-status-error"
+            >
+              {untilError}
+            </div>
+          )}
+        </div>
+        <div className="px-4 py-3 border-t border-surface-700/40 flex justify-end">
+          <button
+            onClick={onCancel}
+            data-testid="snooze-modal-cancel"
+            className="text-sm text-text-dim hover:text-text-primary cursor-pointer transition-colors"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 const RepoGroupHeader = memo(function RepoGroupHeader({
   group,
   hasActiveChild,
   onClick,
   onNewSession,
+  onUpdateAppearance,
   offline,
 }: {
   group: RepoGroup;
   hasActiveChild: boolean;
   onClick: () => void;
   onNewSession: () => void;
+  onUpdateAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   offline: boolean;
 }) {
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const [renaming, setRenaming] = useState(false);
+  const [renameValue, setRenameValue] = useState(group.alias ?? group.displayName);
+  const renameRef = useRef<HTMLInputElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const dotClass =
     STATUS_DOT_CLASS[
       group.status === "active" ? "Running" : "Idle"
     ] ?? "bg-status-idle";
+  const headerStyle = repoColorStyle(group.color);
+  const headerHoverClass = group.color ? "" : "hover:bg-surface-800/50";
+
+  const openMenuAt = useCallback((x: number, y: number) => {
+    closeOtherContextMenus();
+    setContextMenu({ x, y });
+  }, []);
+
+  const handleHeaderKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.target !== e.currentTarget) return;
+    if (
+      e.key !== "Enter" &&
+      e.key !== " " &&
+      e.key !== "ContextMenu" &&
+      !(e.shiftKey && e.key === "F10")
+    ) {
+      return;
+    }
+    e.preventDefault();
+    const rect = e.currentTarget.getBoundingClientRect();
+    openMenuAt(rect.left + 12, rect.bottom + 4);
+  };
+
+  useEffect(() => {
+    if (renaming) renameRef.current?.select();
+  }, [renaming]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    const onDocClick = (e: MouseEvent) => {
+      if (menuRef.current?.contains(e.target as Node)) return;
+      close();
+    };
+    const id = requestAnimationFrame(() => {
+      document.addEventListener("click", onDocClick);
+      document.addEventListener("contextmenu", close);
+    });
+    menuBus.addEventListener("close", close);
+    return () => {
+      cancelAnimationFrame(id);
+      document.removeEventListener("click", onDocClick);
+      document.removeEventListener("contextmenu", close);
+      menuBus.removeEventListener("close", close);
+    };
+  }, [contextMenu]);
+
+  const commitRename = () => {
+    setRenaming(false);
+    const trimmed = renameValue.trim();
+    onUpdateAppearance(group.id, { alias: trimmed || null });
+  };
+
+  if (renaming) {
+    return (
+      <div
+        data-testid="sidebar-group-header"
+        data-group-id={group.id}
+        className={`flex items-center gap-2 px-3 py-2 transition-colors duration-75 text-text-secondary ${headerHoverClass} ${
+          hasActiveChild ? "border-l-2 border-brand-600" : ""
+        }`}
+        style={headerStyle}
+      >
+        <span className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`} />
+        <input
+          ref={renameRef}
+          type="text"
+          value={renameValue}
+          onChange={(e) => setRenameValue(e.target.value)}
+          onBlur={commitRename}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commitRename();
+            if (e.key === "Escape") setRenaming(false);
+          }}
+          data-testid="sidebar-group-rename-input"
+          className="min-w-0 flex-1 rounded border border-brand-600 bg-surface-900 px-2 py-1 text-[13px] md:text-[14px] font-mono text-text-primary focus:outline-none"
+        />
+      </div>
+    );
+  }
 
   return (
-    <div
-      className={`flex items-center gap-2 px-3 py-2 transition-colors duration-75 text-text-secondary hover:bg-surface-800/50 ${
-        hasActiveChild ? "border-l-2 border-brand-600" : ""
-      }`}
-    >
-      <span className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`} />
-      <button
-        onClick={onClick}
-        aria-expanded={!group.collapsed}
-        className="flex items-center gap-2 flex-1 min-w-0 text-left cursor-pointer"
+    <>
+      <div
+        data-testid="sidebar-group-header"
+        data-group-id={group.id}
+        tabIndex={0}
+        aria-haspopup="menu"
+        aria-label={`Project actions for ${group.displayName}`}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          openMenuAt(e.clientX, e.clientY);
+        }}
+        onKeyDown={handleHeaderKeyDown}
+        className={`flex items-center gap-2 px-3 py-2 transition-colors duration-75 text-text-secondary focus:outline-none focus:ring-2 focus:ring-brand-600 ${headerHoverClass} ${
+          hasActiveChild ? "border-l-2 border-brand-600" : ""
+        }`}
+        style={headerStyle}
       >
-        <svg
-          width="10"
-          height="10"
-          viewBox="0 0 10 10"
-          fill="currentColor"
-          className={`shrink-0 text-text-dim transition-transform duration-75 ${
-            group.collapsed ? "-rotate-90" : ""
-          }`}
-        >
-          <path d="M2 3 L5 6.5 L8 3" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-        </svg>
-        <OwnerAvatar owner={group.remoteOwner} size={16} />
-        <span className="text-[13px] md:text-[14px] font-medium truncate flex-1" title={group.repoPath}>
-          {group.displayName}
-        </span>
-      </button>
-      <Tooltip text={offline ? OFFLINE_TITLE : "New session"}>
+        <span className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`} />
         <button
-          onClick={onNewSession}
-          disabled={offline}
-          className="w-8 h-8 flex items-center justify-center shrink-0 rounded-md transition-colors text-text-muted hover:text-text-secondary hover:bg-surface-700/50 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-text-muted disabled:hover:bg-transparent"
-          aria-label={`New session in ${group.displayName}`}
+          onClick={onClick}
+          aria-expanded={!group.collapsed}
+          className="flex items-center gap-2 flex-1 min-w-0 text-left cursor-pointer"
         >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
-            <line x1="12" y1="5" x2="12" y2="19" />
-            <line x1="5" y1="12" x2="19" y2="12" />
+          <svg
+            width="10"
+            height="10"
+            viewBox="0 0 10 10"
+            fill="currentColor"
+            className={`shrink-0 text-text-dim transition-transform duration-75 ${
+              group.collapsed ? "-rotate-90" : ""
+            }`}
+          >
+            <path d="M2 3 L5 6.5 L8 3" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
+          <OwnerAvatar owner={group.remoteOwner} size={16} />
+          <span className="text-[13px] md:text-[14px] font-medium truncate flex-1" title={group.repoPath}>
+            {group.displayName}
+          </span>
         </button>
-      </Tooltip>
-    </div>
+        <Tooltip text={offline ? OFFLINE_TITLE : "New session"}>
+          <button
+            onClick={onNewSession}
+            disabled={offline}
+            className="w-8 h-8 flex items-center justify-center shrink-0 rounded-md transition-colors text-text-muted hover:text-text-secondary hover:bg-surface-700/50 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-text-muted disabled:hover:bg-transparent"
+            aria-label={`New session in ${group.displayName}`}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+              <line x1="12" y1="5" x2="12" y2="19" />
+              <line x1="5" y1="12" x2="19" y2="12" />
+            </svg>
+          </button>
+        </Tooltip>
+      </div>
+      {contextMenu && createPortal(
+        <div
+          ref={menuRef}
+          data-testid="sidebar-group-context-menu"
+          className="fixed z-50 bg-surface-800 border border-surface-700 rounded-lg shadow-lg py-1 min-w-[190px]"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+        >
+          <button
+            onClick={() => {
+              setContextMenu(null);
+              setRenameValue(group.alias ?? group.defaultDisplayName);
+              setRenaming(true);
+            }}
+            data-testid="sidebar-group-context-menu-rename"
+            className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+          >
+            Rename
+          </button>
+          {group.alias && (
+            <button
+              onClick={() => {
+                setContextMenu(null);
+                onUpdateAppearance(group.id, { alias: null });
+              }}
+              className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+            >
+              Clear alias
+            </button>
+          )}
+          <div className="border-t border-surface-700/20 my-1" />
+          <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
+            Background
+          </div>
+          <div className="grid grid-cols-4 gap-1 px-3 py-1.5">
+            {REPO_COLOR_OPTIONS.map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                onClick={() => {
+                  setContextMenu(null);
+                  onUpdateAppearance(group.id, { color: option.id });
+                }}
+                data-testid={`sidebar-group-color-${option.id}`}
+                aria-label={`Set ${option.label} background`}
+                className={`h-8 rounded-md border cursor-pointer transition-colors ${
+                  group.color === option.id ? "border-text-primary" : "border-surface-700"
+                }`}
+                style={repoSwatchStyle(option.id)}
+              />
+            ))}
+            <button
+              type="button"
+              onClick={() => {
+                setContextMenu(null);
+                onUpdateAppearance(group.id, { color: null });
+              }}
+              data-testid="sidebar-group-color-clear"
+              aria-label="Clear background"
+              className="h-8 rounded-md border border-surface-700 bg-surface-900 text-[10px] font-mono text-text-dim cursor-pointer hover:bg-surface-700/40"
+            >
+              None
+            </button>
+          </div>
+        </div>,
+        document.body,
+      )}
+    </>
   );
 });
 
@@ -662,24 +1575,93 @@ function workspaceMatchesFilter(ws: Workspace, q: string): boolean {
 
 export function WorkspaceSidebar({
   groups,
+  onReorderWorkspaces,
   activeId,
   open,
   onToggle,
   onSelect,
   onToggleRepo,
+  onUpdateRepoAppearance,
   onNew,
   onCreateSession,
   onSettings,
   onProjects,
   onDeleteSession,
   readOnly,
+  sortMode,
+  onSortModeChange,
 }: Props) {
+  const dragDisabled = !!readOnly || sortMode === "lastActivity";
+  const dragSuppressRef = useRef<number>(0);
+  useSuppressClickAfterDrag(dragSuppressRef);
   const offline = useServerDown();
   const [width, setWidth] = useState(loadSavedWidth);
   const [filterOpen, setFilterOpen] = useState(false);
   const [filterQuery, setFilterQuery] = useState("");
+  const [sunkExpanded, setSunkExpanded] = useState<boolean>(loadSunkExpanded);
+  const toggleSunkExpanded = useCallback(() => {
+    setSunkExpanded((prev) => {
+      const next = !prev;
+      safeSetItem(SUNK_EXPANDED_KEY, next ? "true" : "false");
+      return next;
+    });
+  }, []);
+  const [optimisticActive, setOptimisticActive] = useState<{
+    id: string;
+    fromActiveId: string | null;
+  } | null>(null);
   const filterRef = useRef<HTMLInputElement>(null);
   const dragging = useRef(false);
+  // Drop the optimistic hint once the parent's activeId has moved off
+  // fromActiveId. Otherwise a later navigation back to fromActiveId
+  // (e.g. browser back, deep link) would re-engage the stale id and
+  // highlight the wrong row. Adjusting state during render is the
+  // pattern React docs recommend for derived resets like this.
+  if (optimisticActive && optimisticActive.fromActiveId !== activeId) {
+    setOptimisticActive(null);
+  }
+  const displayedActiveId =
+    optimisticActive?.fromActiveId === activeId ? optimisticActive.id : activeId;
+
+  // Whole-row drag. Desktop uses distance activation so a deliberate
+  // but stationary click still navigates; touch keeps a long-press delay
+  // so scroll-flicks and taps do not reorder rows.
+  const sensors = useSensors(
+    useSensor(MouseSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 150, tolerance: 8 } }),
+  );
+
+  const handleDragEnd = useCallback(
+    (e: DragEndEvent) => {
+      const { active, over } = e;
+      if (!over || active.id === over.id) return;
+
+      // Drag is constrained to within a single repo group (each group
+      // has its own SortableContext), so finding the active group and
+      // reordering inside it is sufficient.
+      const groupIndex = groups.findIndex((g) =>
+        g.workspaces.some((w) => w.id === active.id),
+      );
+      const group = groups[groupIndex];
+      if (groupIndex < 0 || !group) return;
+      const oldIndex = group.workspaces.findIndex((w) => w.id === active.id);
+      const newIndex = group.workspaces.findIndex((w) => w.id === over.id);
+      if (oldIndex < 0 || newIndex < 0) return;
+
+      // Build the new full visual order by replacing the affected
+      // group's local order, then concat in the existing group order.
+      // We persist the full flat list so cross-device clients can render
+      // the same layout without re-deriving per-group ordering.
+      const reordered = arrayMove(group.workspaces, oldIndex, newIndex);
+      const flat: string[] = [];
+      groups.forEach((g, i) => {
+        const ws = i === groupIndex ? reordered : g.workspaces;
+        ws.forEach((w) => flat.push(w.id));
+      });
+      onReorderWorkspaces(flat);
+    },
+    [groups, onReorderWorkspaces],
+  );
 
   const q = filterQuery.trim().toLowerCase();
 
@@ -728,7 +1710,7 @@ export function WorkspaceSidebar({
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
       setWidth((w) => {
-        localStorage.setItem(SIDEBAR_WIDTH_KEY, String(w));
+        safeSetItem(SIDEBAR_WIDTH_KEY, String(w));
         return w;
       });
     };
@@ -759,6 +1741,40 @@ export function WorkspaceSidebar({
           <span className="text-sm text-text-muted flex-1">
             Projects
           </span>
+          <Tooltip
+            text={
+              sortMode === "lastActivity"
+                ? "Sort: last activity, drag disabled"
+                : "Sort: manual, drag enabled"
+            }
+          >
+            <button
+              onClick={() =>
+                onSortModeChange(
+                  sortMode === "manual" ? "lastActivity" : "manual",
+                )
+              }
+              aria-pressed={sortMode === "lastActivity"}
+              aria-label={
+                sortMode === "lastActivity"
+                  ? "Sort by last activity, currently pressed"
+                  : "Sort by manual order"
+              }
+              data-testid="sidebar-sort-toggle"
+              data-sort-mode={sortMode}
+              className={`w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
+                sortMode === "lastActivity"
+                  ? "text-brand-500"
+                  : "text-text-dim hover:text-text-secondary"
+              }`}
+            >
+              {sortMode === "lastActivity" ? (
+                <Clock className="h-3.5 w-3.5" />
+              ) : (
+                <ListOrdered className="h-3.5 w-3.5" />
+              )}
+            </button>
+          </Tooltip>
           <Tooltip text="Filter">
             <button
               onClick={toggleFilter}
@@ -825,37 +1841,143 @@ export function WorkspaceSidebar({
                 if (e.key === "Escape") toggleFilter();
               }}
               placeholder="Filter by name, branch, agent..."
+              data-testid="sidebar-filter-input"
               className="w-full bg-surface-800 border border-surface-700 rounded-md px-2.5 py-1.5 text-[13px] text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
             />
           </div>
         )}
 
         <div className="flex-1 overflow-y-auto overflow-x-hidden">
-          {filteredGroups.map((group) => {
-            const showExpanded = q ? true : !group.collapsed;
-            const hasActiveChild = group.workspaces.some(
-              (ws) => ws.id === activeId,
+          <DragSuppressContext.Provider value={dragSuppressRef}>
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            onDragEnd={dragDisabled ? undefined : handleDragEnd}
+          >
+            {filteredGroups.map((group) => {
+              const showExpanded = q ? true : !group.collapsed;
+              const hasActiveChild = group.workspaces.some(
+                (ws) => ws.id === displayedActiveId,
+              );
+              return (
+                <div key={group.id}>
+                  <RepoGroupHeader
+                    group={{ ...group, collapsed: !showExpanded }}
+                    hasActiveChild={!showExpanded && hasActiveChild}
+                    onClick={() => !q && onToggleRepo(group.id)}
+                    onUpdateAppearance={onUpdateRepoAppearance}
+                    onNewSession={() =>
+                      group.id === MULTI_REPO_GROUP_ID ||
+                      group.id === SCRATCH_GROUP_ID
+                        ? onNew()
+                        : onCreateSession(group.repoPath)
+                    }
+                    offline={offline}
+                  />
+                  {showExpanded && (() => {
+                    // Each group renders only its live tier. Sunk
+                    // workspaces (archived or actively snoozed across
+                    // every session) are pulled out into a single
+                    // global "Snoozed & archived" section at the very
+                    // bottom of the sidebar, rather than one footer
+                    // per repo group. See #1581.
+                    const liveWorkspaces = group.workspaces.filter(
+                      (ws) => !workspaceIsSunk(ws),
+                    );
+                    return (
+                      <SortableContext
+                        items={liveWorkspaces.map((ws) => ws.id)}
+                        strategy={verticalListSortingStrategy}
+                      >
+                        {liveWorkspaces.map((ws) => (
+                          <SortableSessionRow
+                            key={ws.id}
+                            workspace={ws}
+                            isActive={ws.id === displayedActiveId}
+                            onClick={() => {
+                              setOptimisticActive({
+                                id: ws.id,
+                                fromActiveId: activeId,
+                              });
+                              onSelect(ws.id);
+                            }}
+                            onDelete={onDeleteSession}
+                            readOnly={readOnly}
+                            // Drag is disabled when the tier comparator
+                            // already controls placement: lastActivity
+                            // mode has no manual concept, pinned rows
+                            // always float to the top of their group.
+                            // See #1581.
+                            dragDisabled={
+                              sortMode === "lastActivity" ||
+                              workspaceIsPinned(ws)
+                            }
+                          />
+                        ))}
+                      </SortableContext>
+                    );
+                  })()}
+                </div>
+              );
+            })}
+          </DndContext>
+          </DragSuppressContext.Provider>
+          {(() => {
+            // Single global "Snoozed & archived" section at the very
+            // bottom of the sidebar. Aggregates sunk workspaces from
+            // every repo group (live filtered) so users see one
+            // collapsible bucket rather than one footer per repo.
+            // Rows are listed flat in the order they appear inside
+            // their respective groups; each row's SessionRow already
+            // surfaces the title/branch/repo chips that anchor it to
+            // its project. See #1581.
+            const sunkWorkspaces = filteredGroups.flatMap((g) =>
+              g.workspaces.filter(workspaceIsSunk),
             );
+            if (sunkWorkspaces.length === 0) return null;
             return (
-              <div key={group.id}>
-                <RepoGroupHeader
-                  group={{ ...group, collapsed: !showExpanded }}
-                  hasActiveChild={!showExpanded && hasActiveChild}
-                  onClick={() => !q && onToggleRepo(group.id)}
-                  onNewSession={() =>
-                    group.id === MULTI_REPO_GROUP_ID
-                      ? onNew()
-                      : onCreateSession(group.repoPath)
-                  }
-                  offline={offline}
-                />
-                {showExpanded &&
-                  group.workspaces.map((ws) => (
+              <div data-testid="sidebar-sunk-section">
+                <button
+                  onClick={toggleSunkExpanded}
+                  data-testid="sidebar-sunk-toggle"
+                  aria-expanded={sunkExpanded}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] font-mono uppercase tracking-widest text-text-muted hover:text-text-secondary hover:bg-surface-800/40 cursor-pointer transition-colors border-t border-surface-800/60"
+                >
+                  <svg
+                    width="10"
+                    height="10"
+                    viewBox="0 0 10 10"
+                    fill="currentColor"
+                    className={`shrink-0 transition-transform duration-75 ${
+                      sunkExpanded ? "" : "-rotate-90"
+                    }`}
+                  >
+                    <path
+                      d="M2 3 L5 6.5 L8 3"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                  <span>
+                    Snoozed &amp; archived ({sunkWorkspaces.length})
+                  </span>
+                </button>
+                {sunkExpanded &&
+                  sunkWorkspaces.map((ws) => (
                     <SessionRow
                       key={ws.id}
                       workspace={ws}
-                      isActive={ws.id === activeId}
-                      onClick={() => onSelect(ws.id)}
+                      isActive={ws.id === displayedActiveId}
+                      onClick={() => {
+                        setOptimisticActive({
+                          id: ws.id,
+                          fromActiveId: activeId,
+                        });
+                        onSelect(ws.id);
+                      }}
                       onDelete={onDeleteSession}
                       readOnly={readOnly}
                       indented
@@ -863,7 +1985,7 @@ export function WorkspaceSidebar({
                   ))}
               </div>
             );
-          })}
+          })()}
 
           {!hasResults && filterQuery && (
             <div className="px-4 py-8 text-center">
@@ -918,6 +2040,7 @@ export function WorkspaceSidebar({
       </div>
       {/* Resize handle (desktop only) */}
       <div
+        data-testid="sidebar-resize-handle"
         onMouseDown={handleMouseDown}
         className="hidden md:block w-1 cursor-col-resize shrink-0 bg-surface-800 hover:bg-brand-600/50 transition-colors duration-75"
       />

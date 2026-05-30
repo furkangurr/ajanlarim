@@ -58,7 +58,9 @@ struct ResumeTarget {
     model: Option<String>,
     project_path: String,
     stored_acp_session_id: Option<String>,
+    source_profile: String,
     in_flight_turn: bool,
+    yolo_mode: bool,
 }
 
 /// Tuple shape used by the instance-list snapshot. Aliased to dodge
@@ -71,6 +73,8 @@ type RawTargetTuple = (
     Option<String>,
     String,
     Option<String>,
+    String,
+    bool,
 );
 
 pub async fn reconcile_cockpit_workers(state: &Arc<AppState>, attempted: &mut HashSet<String>) {
@@ -102,11 +106,19 @@ pub async fn reconcile_cockpit_workers(state: &Arc<AppState>, attempted: &mut Ha
     // Snapshot per-target resume inputs under the instances read lock.
     // We then drop the lock so the parallel resume tasks (each ~3s for
     // a fresh spawn) don't pin it.
+    //
+    // Triaged sessions (archived or currently-snoozed) are excluded from
+    // the resume targets so the reconciler does not race the web
+    // archive/snooze handler's worker teardown. Without this skip, the
+    // 2s tick would respawn an archived cockpit worker immediately after
+    // the API handler shuts it down, defeating the archive semantics.
+    // Expired snoozes naturally rejoin via `is_snoozed()` returning
+    // false past the deadline. See #1581.
     let raw_targets: Vec<RawTargetTuple> = {
         let instances = state.instances.read().await;
         instances
             .iter()
-            .filter(|i| i.cockpit_mode)
+            .filter(|i| i.cockpit_mode && !i.is_archived() && !i.is_snoozed())
             .map(|i| {
                 (
                     i.id.clone(),
@@ -115,6 +127,8 @@ pub async fn reconcile_cockpit_workers(state: &Arc<AppState>, attempted: &mut Ha
                     i.cockpit_model.clone(),
                     i.project_path.clone(),
                     i.cockpit_acp_session_id.clone(),
+                    i.source_profile.clone(),
+                    i.yolo_mode,
                 )
             })
             .collect()
@@ -138,7 +152,17 @@ pub async fn reconcile_cockpit_workers(state: &Arc<AppState>, attempted: &mut Ha
     // already-attached). For the rest, decide attach vs fresh-spawn at
     // task time so concurrent tasks see consistent registry state.
     let mut tasks: Vec<ResumeTarget> = Vec::new();
-    for (id, tool, agent_override, model, project_path, stored_acp_session_id) in raw_targets {
+    for (
+        id,
+        tool,
+        agent_override,
+        model,
+        project_path,
+        stored_acp_session_id,
+        source_profile,
+        yolo_mode,
+    ) in raw_targets
+    {
         if attempted.contains(&id) {
             continue;
         }
@@ -149,7 +173,52 @@ pub async fn reconcile_cockpit_workers(state: &Arc<AppState>, attempted: &mut Ha
             attempted.insert(id);
             continue;
         }
-        let in_flight_turn = state.cockpit_event_store.has_in_flight_turn(&id);
+        // Rate-limit park: if the most recent lifecycle event for this
+        // session is `Stopped { reason: "rate_limited" }`, the previous
+        // worker exited because the adapter hit a quota. Auto-resuming
+        // would `session/load` and immediately fail the next prompt the
+        // same way; on daemon restart that would undo the entire #1281
+        // fix. Hold the session parked until the user explicitly retries
+        // via `/cockpit/spawn` or hands off via `/cockpit/switch-agent`.
+        // SQLite call wrapped in spawn_blocking to match the
+        // has_in_flight_turn pattern below; the reconciler runs on the
+        // tokio runtime and these queries can stall under load.
+        let store = Arc::clone(&state.cockpit_event_store);
+        let id_for_status = id.clone();
+        let latest_status =
+            tokio::task::spawn_blocking(move || store.latest_status_event(&id_for_status))
+                .await
+                .unwrap_or(None);
+        if let Some(crate::cockpit::Event::Stopped { reason }) = latest_status {
+            if reason == "rate_limited" {
+                tracing::debug!(
+                    target: "cockpit.supervisor",
+                    session = %id,
+                    "skipping auto-resume: latest lifecycle event is Stopped{{rate_limited}}"
+                );
+                attempted.insert(id);
+                continue;
+            }
+        }
+        let store = Arc::clone(&state.cockpit_event_store);
+        let id_owned = id.clone();
+        let in_flight_turn =
+            match tokio::task::spawn_blocking(move || store.has_in_flight_turn(&id_owned)).await {
+                Ok(v) => v,
+                Err(e) => {
+                    // `attempted.insert` below runs unconditionally, so a swallowed
+                    // panic does not produce a retry storm; the only consequence is
+                    // the synthetic Stopped fanout is skipped this tick and the UI
+                    // may stay "thinking" until the next live event.
+                    tracing::warn!(
+                        target: "cockpit.supervisor",
+                        session_id = %id,
+                        error = %e,
+                        "in-flight turn probe blocking task failed; assuming no in-flight turn"
+                    );
+                    false
+                }
+            };
         // Mark before spawning so the next 2s tick doesn't double-poke
         // while the parallel resume task is still in flight. A task
         // that returns RetryAfterAttachTimeout will clear itself below.
@@ -161,7 +230,9 @@ pub async fn reconcile_cockpit_workers(state: &Arc<AppState>, attempted: &mut Ha
             model,
             project_path,
             stored_acp_session_id,
+            source_profile,
             in_flight_turn,
+            yolo_mode,
         });
     }
 
@@ -226,7 +297,9 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
         model,
         project_path,
         stored_acp_session_id,
+        source_profile,
         in_flight_turn,
+        yolo_mode,
     } = target;
 
     // Reattach path: if a previous daemon detached a runner for this
@@ -237,9 +310,19 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
         if crate::cockpit::worker_registry::is_record_live(&record) {
             let supervisor = Arc::clone(&state.cockpit_supervisor);
             let cwd = PathBuf::from(&project_path);
+            // Reconstruct sandbox context from the live instance state
+            // so the reattached session's fs/terminal handlers can
+            // still route across the container boundary.
+            let sandbox_for_attach = {
+                let instances = state.instances.read().await;
+                instances
+                    .iter()
+                    .find(|i| i.id == id)
+                    .and_then(|i| i.sandbox_info.clone())
+            };
             let attach_res = timeout(
                 Duration::from_secs(3),
-                supervisor.attach(id.clone(), cwd, vec![], in_flight_turn),
+                supervisor.attach(id.clone(), cwd, vec![], in_flight_turn, sandbox_for_attach),
             )
             .await;
             match attach_res {
@@ -317,6 +400,29 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
         .await;
     let cwd = PathBuf::from(project_path);
 
+    let inst_lock = state.instance_lock(&id).await;
+    let sandbox_info = match crate::cockpit::sandbox::ensure_container_for_session(
+        &state.instances,
+        &inst_lock,
+        &id,
+        false,
+    )
+    .await
+    {
+        Ok(info) => info,
+        Err(e) => {
+            let message = format!("sandbox container ensure failed: {e}");
+            tracing::warn!(
+                target: "cockpit.supervisor",
+                session = %id,
+                "reconciler container ensure failed: {message}"
+            );
+            supervisor.publish_startup_error(&id, message);
+            return ResumeOutcome::SpawnFinished;
+        }
+    };
+
+    let source_profile_for_spawn = sandbox_info.as_ref().map(|_| source_profile.clone());
     let spawn_result = supervisor
         .spawn(crate::cockpit::supervisor::SpawnRequest {
             session_id: id.clone(),
@@ -326,6 +432,9 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
             provider_env: vec![],
             model,
             stored_acp_session_id,
+            sandbox_info,
+            source_profile: source_profile_for_spawn,
+            yolo_mode,
         })
         .await;
     if let Err(e) = spawn_result {

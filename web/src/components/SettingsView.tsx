@@ -95,6 +95,21 @@ function isTabId(value: unknown): value is TabId {
   return typeof value === "string" && ALL_TAB_IDS.has(value as TabId);
 }
 
+/// Resolves the value `selectedProfile` should take when the mount-time
+/// `fetchProfiles()` returns. Preserve a user-set selection if it's still a
+/// valid profile (closes the race where the user picks one in the gap before
+/// the mount fetch resolves); otherwise fall back to the server's
+/// default-flagged profile, then to the literal "default" string. Exported
+/// for unit testing because the live race is hard to drive deterministically
+/// without mounting all of SettingsView.
+export function resolveSelectedProfile(
+  current: string,
+  profiles: ProfileInfo[],
+): string {
+  if (profiles.some((p) => p.name === current)) return current;
+  return profiles.find((p) => p.is_default)?.name ?? "default";
+}
+
 export function SettingsView({
   onClose,
   tab,
@@ -108,7 +123,17 @@ export function SettingsView({
   );
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
-  const [selectedProfile, setSelectedProfile] = useState("default");
+  // Seed empty rather than "default" so the initial
+  // useEffect-gated loadSettings doesn't fire a wasted
+  // fetchSettings("default") against a profile that may not exist.
+  // Once fetchProfiles resolves the seed flips to the real default
+  // profile (e.g. "main") and a single loadSettings fires. The
+  // previous "default" seed caused two fetchSettings calls (one for
+  // the placeholder and one for the resolved name), and the second
+  // setSettings could race ahead of an optimistic user edit and
+  // clobber it. See #1383 (profile-settings-isolation / settings-
+  // tmux-* flakes).
+  const [selectedProfile, setSelectedProfile] = useState("");
   const sidebar = buildSidebar();
   const tabs = sidebar.filter(
     (s): s is { kind: "tab"; id: TabId; label: string } => s.kind === "tab",
@@ -119,8 +144,7 @@ export function SettingsView({
   useEffect(() => {
     fetchProfiles().then((p) => {
       setProfiles(p);
-      const active = p.find((pr) => pr.is_default);
-      if (active) setSelectedProfile(active.name);
+      setSelectedProfile((current) => resolveSelectedProfile(current, p));
     });
   }, []);
 
@@ -132,6 +156,7 @@ export function SettingsView({
   };
 
   const loadSettings = useCallback(() => {
+    if (!selectedProfile) return;
     fetchSettings(selectedProfile).then((s) => {
       if (s) setSettings(s);
     });
@@ -142,7 +167,8 @@ export function SettingsView({
   }, [loadSettings]);
 
   const sendSave = useCallback(
-    async (section: string, data: Record<string, unknown>) => {
+    async (section: string, data: Record<string, unknown>): Promise<boolean> => {
+      if (!selectedProfile) return false;
       setSaving(true);
       setSaveError(null);
       const ok = await updateProfileSettings(selectedProfile, { [section]: data });
@@ -151,6 +177,7 @@ export function SettingsView({
         setSaveError("Failed to save, please try again");
         loadSettings();
       }
+      return ok;
     },
     [selectedProfile, loadSettings],
   );
@@ -172,15 +199,15 @@ export function SettingsView({
     sectionData: Record<string, unknown>,
     field: string,
     value: unknown,
-  ) => {
+  ): Promise<boolean> => {
     updateLocal({ [section]: { ...sectionData, [field]: value } });
-    sendSave(section, { [field]: value });
+    return sendSave(section, { [field]: value });
   };
 
   const saveSubField = useCallback(
-    (section: string, field: string, value: unknown) => {
+    (section: string, field: string, value: unknown): Promise<boolean> => {
       const sectionData = (settings?.[section] ?? {}) as Record<string, unknown>;
-      saveField(section, sectionData, field, value);
+      return saveField(section, sectionData, field, value);
     },
     [settings, selectedProfile, sendSave, loadSettings],
   );
@@ -242,7 +269,7 @@ export function SettingsView({
               label="Default container image"
               value={(sandbox.default_image as string) ?? ""}
               onChange={(v) => saveField("sandbox", sandbox, "default_image", v)}
-              placeholder="ghcr.io/njbrake/aoe-sandbox:latest"
+              placeholder="ghcr.io/agent-of-empires/aoe-sandbox:latest"
               mono
             />
             <SelectField
@@ -713,6 +740,34 @@ function CockpitSettings({
         >
           {showToolDurations ? "Visible" : "Hidden"}
         </button>
+      </div>
+
+      <div className="border-t border-surface-800 pt-3">
+        <NumberField
+          label="Silent-orphan grace (s)"
+          description="Daemon-side watchdog grace before declaring a prompt orphaned and restarting the worker. Fires when the agent finishes streaming but the adapter never sends PromptResponse (upstream agentclientprotocol/claude-agent-acp#688). Active only when no in-flight tool call is open and the prompt has produced at least one progress event, so long-running tools are unaffected. 0 disables. Default 60. Persists to config.toml as cockpit.silent_orphan_grace_secs; cross-device. See #1240."
+          value={
+            typeof cockpit.silent_orphan_grace_secs === "number"
+              ? (cockpit.silent_orphan_grace_secs as number)
+              : 60
+          }
+          min={0}
+          onChange={(v) => onSaveField("cockpit", "silent_orphan_grace_secs", v)}
+        />
+      </div>
+
+      <div className="border-t border-surface-800 pt-3">
+        <NumberField
+          label="Silent-orphan fast grace (s)"
+          description="Accelerated silent-orphan grace, used once a cost-populated UsageUpdate has arrived for the current prompt (the claude-agent-acp wrap-up accounting marker emitted just before PromptResponse). Lowers MTTR on the known adapter wedge without weakening the vendor-agnostic baseline. 0 disables the accelerator (cost UsageUpdate stops reducing the effective grace). Default 20. Persists to config.toml as cockpit.silent_orphan_fast_grace_secs; cross-device. See #1240."
+          value={
+            typeof cockpit.silent_orphan_fast_grace_secs === "number"
+              ? (cockpit.silent_orphan_fast_grace_secs as number)
+              : 20
+          }
+          min={0}
+          onChange={(v) => onSaveField("cockpit", "silent_orphan_fast_grace_secs", v)}
+        />
       </div>
 
       <div className="flex items-start justify-between gap-3 py-1 border-t border-surface-800 pt-3">

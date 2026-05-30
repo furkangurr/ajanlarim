@@ -1,7 +1,7 @@
 //! Agent of Empires - Terminal session manager for AI coding agents
 
 use agent_of_empires::cli::{self, Cli, Commands};
-use agent_of_empires::logging::{self, LogConfig, SubscriberTarget};
+use agent_of_empires::logging::{self, LogConfig, ProcessContext, SubscriberTarget};
 use agent_of_empires::migrations;
 use agent_of_empires::tui;
 use anyhow::Result;
@@ -18,6 +18,23 @@ fn is_serve_command(cli: &Cli) -> bool {
 
 #[cfg(not(feature = "serve"))]
 fn is_serve_command(_cli: &Cli) -> bool {
+    false
+}
+
+/// Did the parent `aoe serve --daemon` spawn this process as the detached
+/// child? Set by `start_daemon()` via the hidden `--daemon-child` flag.
+/// Drives sink resolution: child's stdout/stderr are redirected to the
+/// configured log file, so tracing must also write there (a Stdout sink
+/// would land bytes in the same file via the OS redirect, but mixing two
+/// writers on the same fd hurts ordering, and the configured-sink path
+/// is what the TUI dialog and `aoe logs` tail).
+#[cfg(feature = "serve")]
+fn is_serve_daemon_child(cli: &Cli) -> bool {
+    matches!(cli.command, Some(Commands::Serve(ref args)) if args.daemon_child)
+}
+
+#[cfg(not(feature = "serve"))]
+fn is_serve_daemon_child(_cli: &Cli) -> bool {
     false
 }
 
@@ -46,70 +63,93 @@ async fn main() -> Result<()> {
     // process). Compiled away in release builds.
     let debug_namespace_drift = agent_of_empires::session::debug_namespace_drift();
 
+    // Lazy holder for the loaded config. Populated by the logging-init block
+    // when it needs the `[logging]` section, and reused by the session-id
+    // poller seed below the early-return command dispatch. Staying lazy here
+    // means commands that don't need app data (`aoe completion`,
+    // `aoe init`, `aoe agents`, `aoe uninstall`, `aoe update`, …) never
+    // call `get_app_dir()` as a side effect. `config_load_attempted` lets
+    // the seed block skip a redundant load (and a redundant error warning)
+    // when the logging block already tried.
+    let mut loaded_config: Option<agent_of_empires::session::Config> = None;
+    let mut config_load_attempted = false;
+
     let mut debug_log_warning: Option<String> = None;
-    // Logging gate. Env-var matrix lives in `LogConfig::from_env`:
-    //   AOE_LOG_LEVEL=trace|debug|info|warn|error   (preferred)
-    //   AGENT_OF_EMPIRES_DEBUG=1                    (legacy alias for debug)
-    //   AOE_ACP_TRACE=1                             (raw JSON-RPC firehose)
-    //   AOE_TERMINAL_TRACE=1                        (per-byte WS firehose)
-    //
-    // Sinks by process:
-    //   env set, any aoe → debug.log (file)
-    //   aoe serve, no env → stdout (captured into serve.log by the daemon
-    //     redirect; foreground serve writes to the user's terminal)
-    //   TUI (no subcommand), no env → debug.log (stderr would garble the
-    //     alt-screen, so we always write to file)
-    //   other one-shot CLI, no env → no subscriber (short-lived; opt in
-    //     via AOE_LOG_LEVEL if you need a trace of one)
+    // Subscriber installation. One resolver picks the sink based on
+    // `ProcessContext` + `[logging]` config (see `logging::resolve_sink`).
+    // Filter precedence: env (AOE_LOG_LEVEL / AGENT_OF_EMPIRES_DEBUG /
+    // overlay vars) > `[logging]` config > info baseline. See
+    // `docs/development/logging.md` for the sink and filter matrix.
     let env_cfg = LogConfig::from_env();
     let env_filter = env_cfg.filter_string();
     let is_serve = is_serve_command(&cli);
+    let is_daemon_child = is_serve_daemon_child(&cli);
     let is_tui = cli.command.is_none();
-    let (init, log_path_for_msg) = if let Some(filter) = env_filter {
-        // Env-var wins for every aoe invocation. Writes file logs so a
-        // foreground TUI isn't garbled.
-        let log_path = agent_of_empires::session::get_app_dir().map(|d| d.join("debug.log"));
-        match log_path.as_ref() {
-            Ok(path) => {
-                let res = logging::init_subscriber(SubscriberTarget::File(path.clone()), filter);
-                (res, Some(path.clone()))
-            }
-            Err(_) => (
-                logging::InitResult {
-                    controller: None,
-                    warning: Some(
-                        "Log level requested but app dir unavailable; file logging disabled."
-                            .to_string(),
-                    ),
-                },
-                None,
-            ),
-        }
+
+    let ctx = if is_daemon_child {
+        ProcessContext::ServeDaemonChild
     } else if is_serve {
-        // Persistent settings (config.toml [logging]) drive the filter when
-        // no env var is set. Falls back to info baseline if the config can't
-        // be read — daemon must always come up.
-        let filter = logging::load_persisted_filter().unwrap_or_else(logging::serve_default_filter);
-        (
-            logging::init_subscriber(SubscriberTarget::Stdout, filter),
-            None,
-        )
+        ProcessContext::ServeForeground
     } else if is_tui {
-        // Same filter source as `aoe serve`, but sink is the shared
-        // debug.log because ratatui owns the alt-screen and a stderr
-        // subscriber would corrupt the UI. Daemon + runners + TUI all
-        // append to the same file so a single tail covers a session.
-        let filter = logging::load_persisted_filter().unwrap_or_else(logging::serve_default_filter);
-        let log_path = agent_of_empires::session::get_app_dir().map(|d| d.join("debug.log"));
-        match log_path.as_ref() {
-            Ok(path) => {
-                let res = logging::init_subscriber(SubscriberTarget::File(path.clone()), filter);
-                (res, Some(path.clone()))
+        ProcessContext::Tui
+    } else {
+        ProcessContext::OneShotCli
+    };
+
+    // One-shot CLI without an env override gets no subscriber: short-lived,
+    // not worth the overhead. Opt in via `AOE_LOG_LEVEL=...`.
+    let should_init = matches!(
+        ctx,
+        ProcessContext::Tui | ProcessContext::ServeForeground | ProcessContext::ServeDaemonChild
+    ) || env_filter.is_some();
+
+    let (init, log_path_for_msg) = if should_init {
+        let filter = env_filter
+            .clone()
+            .or_else(logging::load_persisted_filter)
+            .unwrap_or_else(logging::serve_default_filter);
+
+        match agent_of_empires::session::get_app_dir() {
+            Ok(app_dir) => {
+                loaded_config = match agent_of_empires::session::load_config() {
+                    Ok(opt) => opt,
+                    Err(e) => {
+                        eprintln!("warning: could not load config, using built-in defaults: {e}");
+                        None
+                    }
+                };
+                config_load_attempted = true;
+                let log_cfg = loaded_config
+                    .as_ref()
+                    .map(|c| c.logging.clone())
+                    .unwrap_or_default();
+                let resolution = logging::resolve_sink(&log_cfg, &app_dir, ctx);
+                let path_for_msg = match &resolution.target {
+                    SubscriberTarget::File(p, _) => Some(p.clone()),
+                    SubscriberTarget::Stdout => None,
+                };
+                let res = logging::init_subscriber_with_options(
+                    resolution.target,
+                    filter,
+                    log_cfg.show_spans,
+                );
+                if let Some(w) = resolution.warning {
+                    // Emit through the subscriber that just came up.
+                    tracing::warn!(target: "log.runtime", "{}", w);
+                }
+                (res, path_for_msg)
             }
             Err(_) => (
                 logging::InitResult {
                     controller: None,
-                    warning: None,
+                    warning: if env_filter.is_some() {
+                        Some(
+                            "Log level requested but app dir unavailable; file logging disabled."
+                                .to_string(),
+                        )
+                    } else {
+                        None
+                    },
                 },
                 None,
             ),
@@ -123,6 +163,7 @@ async fn main() -> Result<()> {
             None,
         )
     };
+
     if let Some(c) = init.controller.clone() {
         logging::install_controller(c);
     }
@@ -134,7 +175,7 @@ async fn main() -> Result<()> {
         log_path_for_msg.as_ref(),
         env_cfg.level,
     ) {
-        tracing::info!("Debug logging at {} to {}", lvl.as_str(), path.display());
+        tracing::info!(target: "log.runtime", "Debug logging at {} to {}", lvl.as_str(), path.display());
     }
 
     // CLI invocations get the dev-namespace drift warning on stderr right
@@ -189,6 +230,34 @@ async fn main() -> Result<()> {
 
     let profile_explicit = cli.profile.is_some();
     let profile = cli.profile.unwrap_or_default();
+
+    // Seed the session-id poller cap from persisted config. Reached only
+    // for commands that may spawn sessions (early-return commands above
+    // have already exited). Reuses the config loaded by the logging-init
+    // block when available; otherwise loads now. Skips a redundant load
+    // (and a redundant warning) when the logging block already attempted.
+    let cap_config = if let Some(cfg) = loaded_config.take() {
+        Some(cfg)
+    } else if config_load_attempted {
+        None
+    } else {
+        match agent_of_empires::session::load_config() {
+            Ok(opt) => opt,
+            Err(e) => {
+                eprintln!(
+                    "warning: could not load config to seed session-id poller cap, \
+                     using built-in default of {}: {e}",
+                    agent_of_empires::session::poller::DEFAULT_SESSION_ID_POLLER_MAX_THREADS,
+                );
+                None
+            }
+        }
+    };
+    if let Some(cfg) = cap_config {
+        agent_of_empires::session::poller::set_session_id_poller_max_threads(
+            cfg.session.session_id_poller_max_threads,
+        );
+    }
 
     // TUI mode handles migrations with a spinner; CLI runs them silently
     if cli.command.is_some() {

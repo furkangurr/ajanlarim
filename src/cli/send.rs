@@ -9,6 +9,7 @@ use anyhow::{bail, Result};
 use clap::Args;
 
 use crate::avk_agents::resolve_tier_slugs;
+use crate::cli::session::stale_history_suffix;
 use crate::session::{EnsureReadyError, EnsureReadyOutcome, Instance, Storage};
 
 #[derive(Args)]
@@ -26,6 +27,7 @@ pub struct SendArgs {
     no_revive: bool,
 }
 
+#[tracing::instrument(target = "cli.send", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
     let storage = Storage::new(profile)?;
     let (mut instances, _) = storage.load_with_groups()?;
@@ -92,11 +94,27 @@ fn send_to_single(
     if !no_revive {
         if let Some(target) = instances.iter_mut().find(|i| i.id == session_id) {
             match target.ensure_pane_ready() {
-                Ok(EnsureReadyOutcome::Respawned) => {
+                Ok(EnsureReadyOutcome::Respawned { stale_sid: None }) => {
                     eprintln!("  (respawned dead pane before send)");
                 }
-                Ok(EnsureReadyOutcome::Started) => {
+                Ok(EnsureReadyOutcome::Respawned {
+                    stale_sid: Some(sid),
+                }) => {
+                    eprintln!(
+                        "  (respawned dead pane before send){}",
+                        stale_history_suffix(&sid),
+                    );
+                }
+                Ok(EnsureReadyOutcome::Started { stale_sid: None }) => {
                     eprintln!("  (started stopped session before send)");
+                }
+                Ok(EnsureReadyOutcome::Started {
+                    stale_sid: Some(sid),
+                }) => {
+                    eprintln!(
+                        "  (started stopped session before send){}",
+                        stale_history_suffix(&sid),
+                    );
                 }
                 Ok(EnsureReadyOutcome::AlreadyAlive) => {}
                 Err(EnsureReadyError::Transient(status)) => {
@@ -122,7 +140,16 @@ fn send_to_single(
     tmux_session.send_keys_with_delay(message, delay)?;
 
     if let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) {
+        // Stamp last_accessed_at so the "last activity" column reflects user
+        // interaction, and remap the status to Running. The agent has just been
+        // given fresh input; the next status poll will reconcile the real state,
+        // but flipping to Running immediately keeps the row from sticking on a
+        // stale Idle/Waiting label during the gap between send and poll.
+        // touch_last_accessed also auto-clears archived_at and snoozed_until
+        // (see Instance::touch_last_accessed), so a user can wake any sunk row
+        // by sending to it.
         inst.touch_last_accessed();
+        inst.status = crate::session::Status::Running;
     }
 
     println!("Sent message to '{}'", session_title);

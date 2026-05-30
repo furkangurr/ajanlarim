@@ -24,6 +24,13 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe session capture`↴](#aoe-session-capture)
 * [`aoe session current`↴](#aoe-session-current)
 * [`aoe session set-session-id`↴](#aoe-session-set-session-id)
+* [`aoe session set-base`↴](#aoe-session-set-base)
+* [`aoe session snooze`↴](#aoe-session-snooze)
+* [`aoe session unsnooze`↴](#aoe-session-unsnooze)
+* [`aoe session favorite`↴](#aoe-session-favorite)
+* [`aoe session unfavorite`↴](#aoe-session-unfavorite)
+* [`aoe session archive`↴](#aoe-session-archive)
+* [`aoe session unarchive`↴](#aoe-session-unarchive)
 * [`aoe group`↴](#aoe-group)
 * [`aoe group list`↴](#aoe-group-list)
 * [`aoe group create`↴](#aoe-group-create)
@@ -88,7 +95,7 @@ Run without arguments to launch the TUI dashboard.
 * `agents` — List supported agents and their install status
 * `init` — Initialize .agent-of-empires/config.toml in a repository
 * `list` — List all sessions
-* `logs` — View AoE log files (debug.log, serve.log) with a pretty viewer
+* `logs` — View the configured AoE log file with a pretty viewer
 * `log-level` — Get or set the running daemon's log filter at runtime. Pass a bare level (debug/info/...) for the safe expansion, or `--filter <expr>` for raw EnvFilter syntax. `--get` prints the current filter. Changes are ephemeral and lost on daemon restart
 * `remove` — Remove a session
 * `send` — Send a message to a running agent session
@@ -123,15 +130,14 @@ Add a new session
 
 ###### **Arguments:**
 
-* `<PATH>` — Project directory (defaults to current directory)
-
-  Default value: `.`
+* `<PATH>` — Project directory (defaults to current directory). Omit when using `--scratch`
 
 ###### **Options:**
 
 * `-t`, `--title <TITLE>` — Session title (defaults to folder name)
 * `-g`, `--group <GROUP>` — Group path (defaults to parent folder)
 * `-c`, `--cmd <COMMAND>` — Command to run (e.g., 'claude' or any other supported agent)
+* `--tool <TOOL>` — Named built-in or configured custom agent to run
 * `-P`, `--parent <PARENT>` — Parent session (creates sub-session, inherits group)
 * `-l`, `--launch` — Launch the session immediately after creating
 * `-w`, `--worktree <WORKTREE_BRANCH>` — Create session in a git worktree for the specified branch
@@ -150,6 +156,7 @@ Add a new session
 * `--no-cockpit` — Force terminal/PTY mode for this session, overriding the default-for-claude cockpit setting
 * `--agent <AGENT>` — Pick a specific cockpit agent (e.g., aoe-agent, claude-code). Implies --cockpit
 * `--model <MODEL>` — Override the model used by aoe-agent (e.g., claude-opus-4-7, gpt-5, gemini-2.5-pro). Forwarded to the agent at session start
+* `--scratch` — Create the session in a fresh scratch directory under `<app_dir>/scratch/<id>/` instead of a project path. The directory is removed when the session is deleted (unless `aoe rm` is given `--keep-scratch`). Mutually exclusive with worktree-related flags
 
 
 
@@ -190,19 +197,16 @@ List all sessions
 
 ## `aoe logs`
 
-View AoE log files (debug.log, serve.log) with a pretty viewer
+View the configured AoE log file with a pretty viewer
 
 **Usage:** `aoe logs [OPTIONS]`
 
 ###### **Options:**
 
-* `--debug` — View debug.log (default)
-* `--serve` — View serve.log (daemon stdout/stderr)
-* `--all` — View both debug.log and serve.log, merged by timestamp
 * `-f`, `--follow` — Live-tail the log
 * `-n`, `--lines <N>` — Show only the last N lines (fallback viewers; lnav handles its own)
 * `--no-pager` — Skip viewer detection; write plain log to stdout
-* `--path` — Print the resolved log file path(s) and exit (no viewing)
+* `--path` — Print the resolved log file path and exit (no viewing)
 
 
 
@@ -239,6 +243,7 @@ Remove a session
 * `--delete-branch` — Delete git branch after worktree removal (default: per config)
 * `--force` — Force worktree removal even with untracked/modified files
 * `--keep-container` — Keep container instead of deleting it (default: delete per config)
+* `--keep-scratch` — For scratch sessions, keep the scratch directory on disk instead of removing it. The session record is still deleted; the kept path is logged so you can find the files later. No effect on non-scratch sessions
 
 
 
@@ -290,6 +295,13 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `capture` — Capture tmux pane output
 * `current` — Auto-detect current session
 * `set-session-id` — Set agent session ID for a session
+* `set-base` — Set or clear the per-session diff base branch. The diff view compares the worktree against this ref instead of the auto-detected default. Useful when the PR target differs from the project default (stacked PRs, hotfix off `release/*`, renamed default branch). See #970
+* `snooze` — Snooze a session for a duration (temporary archive, auto wakes)
+* `unsnooze` — Wake a snoozed session immediately
+* `favorite` — Mark a session as a favorite. Favorited rows pin to the top of their status tier in the Attention sort and render with a leading `* ` glyph plus bold + underline
+* `unfavorite` — Clear the favorite flag on a session
+* `archive` — Archive a session (sinks it to the bottom of the Attention sort). Kills the tmux pane unless `--no-kill` is passed. The worktree, branch, and container are preserved; use `aoe remove` (optionally with `--delete-worktree` / `--delete-branch`) to fully destroy a session
+* `unarchive` — Unarchive a session (restores it to its tier in the Attention sort)
 
 
 
@@ -424,6 +436,103 @@ Set agent session ID for a session
 
 * `<IDENTIFIER>` — Session ID or title
 * `<SESSION_ID>` — Agent session ID to set (pass empty string to clear)
+
+
+
+## `aoe session set-base`
+
+Set or clear the per-session diff base branch. The diff view compares the worktree against this ref instead of the auto-detected default. Useful when the PR target differs from the project default (stacked PRs, hotfix off `release/*`, renamed default branch). See #970
+
+**Usage:** `aoe session set-base [OPTIONS] <IDENTIFIER> [BRANCH]`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Session ID or title
+* `<BRANCH>` — Branch ref to diff against (short name like `main` or remote-qualified like `upstream/main`). Required unless `--clear` is passed
+
+###### **Options:**
+
+* `--clear` — Clear the override and fall back to the profile default / auto-detected base
+
+
+
+## `aoe session snooze`
+
+Snooze a session for a duration (temporary archive, auto wakes)
+
+**Usage:** `aoe session snooze [OPTIONS] <IDENTIFIER>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Session ID or title
+
+###### **Options:**
+
+* `--minutes <MINUTES>` — Snooze duration in minutes; if omitted, uses `session.snooze_duration_minutes` from the active config (default 30)
+
+
+
+## `aoe session unsnooze`
+
+Wake a snoozed session immediately
+
+**Usage:** `aoe session unsnooze <IDENTIFIER>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Session ID or title
+
+
+
+## `aoe session favorite`
+
+Mark a session as a favorite. Favorited rows pin to the top of their status tier in the Attention sort and render with a leading `* ` glyph plus bold + underline
+
+**Usage:** `aoe session favorite <IDENTIFIER>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Session ID or title
+
+
+
+## `aoe session unfavorite`
+
+Clear the favorite flag on a session
+
+**Usage:** `aoe session unfavorite <IDENTIFIER>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Session ID or title
+
+
+
+## `aoe session archive`
+
+Archive a session (sinks it to the bottom of the Attention sort). Kills the tmux pane unless `--no-kill` is passed. The worktree, branch, and container are preserved; use `aoe remove` (optionally with `--delete-worktree` / `--delete-branch`) to fully destroy a session
+
+**Usage:** `aoe session archive [OPTIONS] <IDENTIFIER>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Session ID or title
+
+###### **Options:**
+
+* `--no-kill` — Skip killing the tmux pane. By default archiving stops the running agent so the row renders as truly parked; pass this to keep the pane alive while still marking the session archived
+
+
+
+## `aoe session unarchive`
+
+Unarchive a session (restores it to its tier in the Attention sort)
+
+**Usage:** `aoe session unarchive <IDENTIFIER>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Session ID or title
 
 
 
@@ -818,7 +927,12 @@ Start a web dashboard for remote session access
 * `--host <HOST>` — Host/IP to bind to (use 0.0.0.0 for LAN/VPN access)
 
   Default value: `127.0.0.1`
-* `--no-auth` — Disable authentication (only allowed with localhost binding)
+* `--auth <AUTH>` — Authentication mode: `token` (default, random URL token), `passphrase` (no token URL, passphrase login wall only), or `none` (no auth at all, loopback-only unless --behind-proxy). Mutually exclusive with --no-auth (which aliases --auth=none)
+
+  Possible values: `token`, `passphrase`, `none`
+
+* `--no-auth` — Disable authentication (only allowed with localhost binding). Alias for --auth=none
+* `--behind-proxy` — Mark this server as sitting behind a reverse proxy that terminates TLS upstream. Sets cookies as `; Secure` and trusts the `X-Forwarded-For` / `cf-connecting-ip` headers from loopback peers. Does NOT auto-spawn a tunnel (unlike --remote). Required when --auth=passphrase or --auth=none is combined with a non-loopback bind
 * `--read-only` — Read-only mode: view terminals but cannot send keystrokes
 * `--remote` — Expose the dashboard over a public HTTPS tunnel. Prefers Tailscale Funnel when `tailscale` is installed and logged in (stable `.ts.net` URL, installable PWAs survive restarts). Falls back to a Cloudflare quick tunnel otherwise (fresh URL on every restart)
 * `--tunnel-name <TUNNEL_NAME>` — Use a named Cloudflare Tunnel (requires prior `cloudflared tunnel create`). Takes precedence over Tailscale auto-detection
@@ -828,7 +942,7 @@ Start a web dashboard for remote session access
 * `--stop` — Stop a running daemon
 * `--status` — Print the running daemon's PID, mode, URLs, and log path. Exits non-zero when no daemon is running. Useful for shell scripts that want to know whether a daemon is up without parsing `ps`.
 
-   `--status` is read-only and incompatible with every flag that would change daemon state (`--stop`, `--daemon`, `--remote`) or the bind config of a fresh daemon (`--no-auth`, `--read-only`, `--passphrase`, `--port`, `--tunnel-name`, `--no-tailscale`, `--tunnel-url`, `--open`). Clap reports the misuse instead of silently ignoring the extras.
+   `--status` is read-only and incompatible with every flag that would change daemon state (`--stop`, `--daemon`, `--remote`) or the bind config of a fresh daemon (`--no-auth`, `--auth`, `--behind-proxy`, `--read-only`, `--passphrase`, `--port`, `--tunnel-name`, `--no-tailscale`, `--tunnel-url`, `--open`). Clap reports the misuse instead of silently ignoring the extras.
 * `--passphrase <PASSPHRASE>` — Require a passphrase for login (second-factor auth). Can also be set via AOE_SERVE_PASSPHRASE environment variable
 * `--open` — Open the dashboard URL in the default browser once the server is ready. Ignored under --daemon, --remote, SSH (SSH_CONNECTION/SSH_TTY), or when no display server is reachable on Linux/BSD
 

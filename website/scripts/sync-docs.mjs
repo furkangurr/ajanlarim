@@ -89,6 +89,13 @@ const PAGES = [
     description:
       "Drive a single Agent of Empires session across several git repositories with the project registry and multi-select pickers.",
   },
+  {
+    source: "docs/guides/scratch-sessions.md",
+    dest: "guides/scratch-sessions.md",
+    title: "Scratch Sessions",
+    description:
+      "Launch a session in a fresh scratch directory under ~/.agent-of-empires/scratch/ with no project path. The directory is removed when the session is deleted.",
+  },
 
   // --- Docs pages (docs/ → pages/docs/) ---
   {
@@ -133,11 +140,53 @@ const PAGES = [
       "Logging targets, env-var matrix, runtime control endpoint, and browser-side error relay for Agent of Empires.",
   },
   {
+    source: "docs/development/playwright.md",
+    dest: "docs/development/playwright.md",
+    title: "Playwright + Vitest testing",
+    description:
+      "Long-form reference for the web dashboard test pipeline: mocked vs live Playwright, Vitest contract tests, fake ACP agent, coverage matrix, coverage reports.",
+  },
+  {
+    source: "docs/development/releases.md",
+    dest: "docs/development/releases.md",
+    title: "Releases",
+    description:
+      "Weekly release cadence, automated staging PR, post-merge tagger, and emergency-release path for Agent of Empires maintainers.",
+  },
+  {
     source: "docs/sounds.md",
     dest: "docs/sounds.md",
     title: "Sound Effects",
     description:
       "Configure audio feedback for agent state transitions in Agent of Empires.",
+  },
+  {
+    source: "docs/push-notifications.md",
+    dest: "docs/push-notifications.md",
+    title: "Push Notifications",
+    description:
+      "Browser and PWA push notifications for Agent of Empires session status changes and cockpit approvals.",
+  },
+  {
+    source: "docs/features.md",
+    dest: "docs/features.md",
+    title: "Features",
+    description:
+      "Canonical inventory of every Agent of Empires feature, grouped by surface and capability, with links to each guide.",
+  },
+  {
+    source: "docs/guides/podman.md",
+    dest: "guides/podman.md",
+    title: "Podman",
+    description:
+      "Run Agent of Empires sandboxes on Podman, a daemonless and rootless Docker alternative.",
+  },
+  {
+    source: "docs/guides/apple-containers.md",
+    dest: "guides/apple-containers.md",
+    title: "Apple Containers",
+    description:
+      "Run Agent of Empires sandboxes on Apple's native macOS container runtime on Apple silicon.",
   },
   {
     source: "docs/guides/configuration.md",
@@ -161,6 +210,20 @@ const PAGES = [
       "Mobile-first native rendering of AI agent state via the Agent Client Protocol (ACP). Plan panels, tool-call cards, swipe-to-approve, multi-provider support.",
   },
   {
+    source: "docs/cockpit/multi-agent.md",
+    dest: "docs/cockpit/multi-agent.md",
+    title: "Cockpit Multi-Agent Support",
+    description:
+      "Per-agent cockpit feature matrix: claude, codex, opencode, gemini. Covers profile data, supported tools, and known limitations.",
+  },
+  {
+    source: "docs/guides/tool-sessions.md",
+    dest: "guides/tool-sessions.md",
+    title: "Tool Sessions",
+    description:
+      "Configure persistent dev-tool sessions (lazygit, yazi, tig, etc.) tied to each agent session's working directory, with hotkey, picker, and command-palette access.",
+  },
+  {
     source: "docs/api.md",
     dest: "docs/api.md",
     title: "HTTP API Reference",
@@ -176,12 +239,17 @@ const URL_MAP = {
   "docs/installation.md": "/docs/installation/",
   "docs/quick-start.md": "/docs/quick-start/",
   "docs/sounds.md": "/docs/sounds/",
+  "docs/push-notifications.md": "/docs/push-notifications/",
+  "docs/features.md": "/docs/features/",
   "docs/development.md": "/docs/development/",
   "docs/development/adding-agents.md": "/docs/development/adding-agents/",
   "docs/development/logging.md": "/docs/development/logging/",
+  "docs/development/playwright.md": "/docs/development/playwright/",
+  "docs/development/releases.md": "/docs/development/releases/",
   "docs/guides/configuration.md": "/docs/guides/configuration/",
   "docs/cli/reference.md": "/docs/cli/reference/",
   "docs/cockpit.md": "/docs/cockpit/",
+  "docs/cockpit/multi-agent.md": "/docs/cockpit/multi-agent/",
   "docs/api.md": "/docs/api/",
   // Guides
   "docs/guides/diff-view.md": "/guides/diff-view/",
@@ -194,10 +262,14 @@ const URL_MAP = {
   "docs/guides/agent-override.md": "/guides/agent-override/",
   "docs/guides/session-resume.md": "/guides/session-resume/",
   "docs/guides/multi-repo-workspaces.md": "/guides/multi-repo-workspaces/",
+  "docs/guides/scratch-sessions.md": "/guides/scratch-sessions/",
+  "docs/guides/tool-sessions.md": "/guides/tool-sessions/",
+  "docs/guides/podman.md": "/guides/podman/",
+  "docs/guides/apple-containers.md": "/guides/apple-containers/",
 };
 
 const GITHUB_BASE =
-  "https://github.com/njbrake/agent-of-empires/blob/main/";
+  "https://github.com/agent-of-empires/agent-of-empires/blob/main/";
 
 function rewriteLinks(content, sourceDir) {
   // Rewrite markdown links to .md files: [text](target.md) or [text](target.md#anchor)

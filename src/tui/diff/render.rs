@@ -61,7 +61,7 @@ impl DiffView {
         }
 
         // Render warning dialog on top of everything
-        if let Some(ref dialog) = self.warning_dialog {
+        if let Some(ref mut dialog) = self.warning_dialog {
             dialog.render(frame, area, theme);
         }
     }
@@ -131,7 +131,7 @@ impl DiffView {
         self.render_diff_content(frame, layout[1], theme);
     }
 
-    fn render_file_list(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    fn render_file_list(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let block = Block::default()
             .title(" Files ")
             .borders(Borders::ALL)
@@ -140,6 +140,7 @@ impl DiffView {
             .padding(Padding::horizontal(1));
 
         let inner = block.inner(area);
+        self.file_list_inner = inner;
         frame.render_widget(block, area);
 
         if self.files.is_empty() {
@@ -571,7 +572,7 @@ impl DiffView {
 mod tests {
     use super::*;
     use crate::tui::diff::BranchSelectState;
-    use crate::tui::styles::Theme;
+    use crate::tui::styles::load_theme;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -584,7 +585,7 @@ mod tests {
     fn render_dialog_to_string(view: &mut DiffView) -> String {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        let theme = Theme::empire();
+        let theme = load_theme("empire");
         terminal
             .draw(|f| {
                 let area = f.area();

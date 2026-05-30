@@ -2,6 +2,7 @@
 //! `aoe-agent`, `gemini`) to a spawn command + args. Users add agents via
 //! the settings TUI; this module is the in-memory model.
 
+use super::install_hints::install_hint_for;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -45,7 +46,7 @@ impl AgentRegistry {
     ///   gemini   → `gemini --acp`       (native, Google)
     ///   codex    → codex-acp            (Zed adapter, OpenAI Codex CLI)
     ///   vibe     → vibe-acp             (native, Mistral)
-    ///   pi       → pi-acp               (adapter, Hermes coding agent)
+    ///   pi       → pi-acp               (adapter, Pi coding agent)
     ///
     /// We deliberately don't use `npx -y` for these. First-run
     /// downloads can hang for tens of seconds with no output, which
@@ -55,14 +56,15 @@ impl AgentRegistry {
     pub fn with_defaults() -> Self {
         let mut reg = Self::new();
 
+        let claude_install = install_hint_for("claude-agent-acp").unwrap_or("(see project docs)");
         reg.agents.insert(
             "claude".into(),
             AgentSpec {
                 command: "claude-agent-acp".into(),
                 args: vec![],
-                description:
-                    "Anthropic Claude via the official ACP adapter (npm i -g @agentclientprotocol/claude-agent-acp)"
-                        .into(),
+                description: format!(
+                    "Anthropic Claude via the official ACP adapter ({claude_install})"
+                ),
                 env_allowlist: None,
             },
         );
@@ -120,7 +122,7 @@ impl AgentRegistry {
             AgentSpec {
                 command: "pi-acp".into(),
                 args: vec![],
-                description: "Hermes coding agent (`pi`) via the pi-acp adapter (npm i -g pi-acp)"
+                description: "Pi coding agent (`pi`) via the pi-acp adapter (npm i -g pi-acp)"
                     .into(),
                 env_allowlist: None,
             },

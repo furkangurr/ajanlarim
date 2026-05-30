@@ -41,6 +41,9 @@ pub struct Config {
     pub sound: crate::sound::SoundConfig,
 
     #[serde(default)]
+    pub status_hooks: crate::status_hooks::StatusHookConfig,
+
+    #[serde(default)]
     pub app_state: AppStateConfig,
 
     #[serde(default)]
@@ -65,6 +68,27 @@ pub struct Config {
         deserialize_with = "super::serde_helpers::string_or_vec"
     )]
     pub environment: Vec<String>,
+
+    /// User-defined tool sessions: name -> config.
+    /// Tools are launched in the selected session's working directory and
+    /// persist as independent tmux sessions until the parent agent session
+    /// is deleted. Access via hotkey, the tool picker (`;`), or command
+    /// palette (Ctrl+K).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub tools: HashMap<String, ToolSessionConfig>,
+}
+
+/// Configuration for a user-defined tool session (lazygit, yazi, tig, etc.)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolSessionConfig {
+    /// Shell command to run (e.g. "lazygit", "yazi", "tig --all").
+    /// The string is passed to the shell, so pipes and `&&` work.
+    #[serde(default)]
+    pub command: String,
+    /// Optional hotkey binding in `Alt+<letter>` format (e.g. "Alt+g", "Alt+f").
+    /// Only Alt+ single-character bindings are supported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hotkey: Option<String>,
 }
 
 /// Persistent logging configuration. Drives the default tracing
@@ -86,6 +110,61 @@ pub struct LoggingConfig {
 
     #[serde(default)]
     pub targets: std::collections::BTreeMap<String, String>,
+
+    /// Where tracing output goes. `File` is the default; `Stdout` is only
+    /// honored for foreground `aoe serve` and env-overridden one-shot CLI
+    /// invocations. TUI, daemon child, and cockpit runners coerce to `File`
+    /// because their alt-screen / detached-stdio would otherwise corrupt or
+    /// discard the output.
+    #[serde(default)]
+    pub output: SinkKind,
+
+    /// Log file location. Relative paths resolve under the app data dir;
+    /// absolute paths are used verbatim. Defaults to `debug.log`.
+    #[serde(default = "default_file_path")]
+    pub file_path: String,
+
+    /// Rotation policy. `Size` rotates when the live file crosses
+    /// `max_size_mib`; `Never` disables rotation.
+    #[serde(default)]
+    pub rotation: RotationKind,
+
+    /// Size threshold (MiB) for `RotationKind::Size`. The file may
+    /// overshoot the threshold slightly between stat checks; bounded by
+    /// the writer's stat-on-tick interval.
+    #[serde(default = "default_max_size_mib")]
+    pub max_size_mib: u64,
+
+    /// How many rotated files to retain (`.1` through `.keep_count`).
+    /// Older rotations are dropped.
+    #[serde(default = "default_keep_count")]
+    pub keep_count: u8,
+
+    /// Whether the tracing formatter prefixes each event with the names
+    /// and fields of the spans wrapping it (e.g. the per-request
+    /// `http_request{request_id=... method=GET path=...}` introduced by
+    /// the axum middleware). Useful for grep-correlation when triaging
+    /// across async boundaries, noisy on idle polling endpoints.
+    /// Defaults to `false` so the log stays readable; flip to `true`
+    /// when investigating. Requires restart.
+    #[serde(default = "default_show_spans")]
+    pub show_spans: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SinkKind {
+    #[default]
+    File,
+    Stdout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RotationKind {
+    #[default]
+    Size,
+    Never,
 }
 
 impl Default for LoggingConfig {
@@ -93,12 +172,34 @@ impl Default for LoggingConfig {
         Self {
             default_level: default_log_level(),
             targets: std::collections::BTreeMap::new(),
+            output: SinkKind::default(),
+            file_path: default_file_path(),
+            rotation: RotationKind::default(),
+            max_size_mib: default_max_size_mib(),
+            keep_count: default_keep_count(),
+            show_spans: default_show_spans(),
         }
     }
 }
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_file_path() -> String {
+    "debug.log".to_string()
+}
+
+fn default_max_size_mib() -> u64 {
+    50
+}
+
+fn default_keep_count() -> u8 {
+    5
+}
+
+fn default_show_spans() -> bool {
+    false
 }
 
 /// Configuration for the cockpit (ACP-based native rendering of agent
@@ -168,6 +269,40 @@ pub struct CockpitConfig {
     /// `session/cancel` the agent. Default 30s.
     #[serde(default = "default_force_end_turn_threshold_secs")]
     pub force_end_turn_threshold_secs: u32,
+    /// Silent-orphan watchdog: vendor-agnostic correctness grace. When
+    /// a prompt is in flight, `tool_calls_in_flight` is empty, at least
+    /// one progress notification has arrived, and no further progress
+    /// arrives for this many seconds, the daemon sends best-effort
+    /// `session/cancel` and arms the existing cancel-escalation grace.
+    /// Closes the gap where claude-agent-acp finishes streaming but
+    /// never sends `PromptResponse` (upstream
+    /// agentclientprotocol/claude-agent-acp#688). Upstream
+    /// agentclientprotocol/claude-agent-acp#706 (shipped in 0.37.0)
+    /// recovers the prompt stream after a failed turn for some cases,
+    /// reducing the false-positive rate, but cannot rescue every wedge
+    /// (transport-level stalls, child process hangs, lost terminal
+    /// frames), so the watchdog stays as the vendor-agnostic floor.
+    /// Default 120s; raised
+    /// from 60s in #1360 so async-agent flows (Claude SDK `Agent` tool
+    /// with `isAsync: true`) get a longer wait window before the
+    /// watchdog cancels them. `0` disables the watchdog. Long-running
+    /// tools are not affected; the watchdog only fires when no
+    /// in-flight tool call is open. The async-agent extension lifts the
+    /// effective grace to at least 30 minutes when the daemon observes
+    /// an async-agent launch in the current prompt. Nonzero values
+    /// below 120 clamp up at runtime so a typo cannot disable the
+    /// watchdog accidentally. See #1240, #1360.
+    #[serde(default = "default_silent_orphan_grace_secs")]
+    pub silent_orphan_grace_secs: u32,
+    /// Silent-orphan watchdog: accelerated grace used when the current
+    /// prompt has already received a cost-populated `UsageUpdate`
+    /// notification (claude-agent-acp's "wrap up accounting" marker
+    /// emitted just before `PromptResponse`). Lowers MTTR on the known
+    /// adapter wedge without weakening the vendor-agnostic baseline.
+    /// Default 20s. If `silent_orphan_grace_secs` is 0 (disabled), this
+    /// has no effect. See #1240.
+    #[serde(default = "default_silent_orphan_fast_grace_secs")]
+    pub silent_orphan_fast_grace_secs: u32,
 }
 
 fn default_max_concurrent_resumes() -> u32 {
@@ -176,6 +311,14 @@ fn default_max_concurrent_resumes() -> u32 {
 
 fn default_force_end_turn_threshold_secs() -> u32 {
     30
+}
+
+fn default_silent_orphan_grace_secs() -> u32 {
+    120
+}
+
+fn default_silent_orphan_fast_grace_secs() -> u32 {
+    20
 }
 
 /// Drain strategy for the cockpit composer's client-side prompt queue.
@@ -225,6 +368,8 @@ impl Default for CockpitConfig {
             queue_drain_mode: QueueDrainMode::default(),
             max_concurrent_resumes: default_max_concurrent_resumes(),
             force_end_turn_threshold_secs: default_force_end_turn_threshold_secs(),
+            silent_orphan_grace_secs: default_silent_orphan_grace_secs(),
+            silent_orphan_fast_grace_secs: default_silent_orphan_fast_grace_secs(),
         }
     }
 }
@@ -253,6 +398,7 @@ fn default_replay_bytes() -> u64 {
 pub enum SortOrder {
     #[default]
     Newest,
+    Attention,
     LastActivity,
     Oldest,
     AZ,
@@ -262,7 +408,8 @@ pub enum SortOrder {
 impl SortOrder {
     pub fn cycle(self) -> Self {
         match self {
-            SortOrder::Newest => SortOrder::LastActivity,
+            SortOrder::Newest => SortOrder::Attention,
+            SortOrder::Attention => SortOrder::LastActivity,
             SortOrder::LastActivity => SortOrder::Oldest,
             SortOrder::Oldest => SortOrder::AZ,
             SortOrder::AZ => SortOrder::ZA,
@@ -273,7 +420,8 @@ impl SortOrder {
     pub fn cycle_reverse(self) -> Self {
         match self {
             SortOrder::Newest => SortOrder::ZA,
-            SortOrder::LastActivity => SortOrder::Newest,
+            SortOrder::Attention => SortOrder::Newest,
+            SortOrder::LastActivity => SortOrder::Attention,
             SortOrder::Oldest => SortOrder::LastActivity,
             SortOrder::AZ => SortOrder::Oldest,
             SortOrder::ZA => SortOrder::AZ,
@@ -283,6 +431,7 @@ impl SortOrder {
     pub fn label(self) -> &'static str {
         match self {
             SortOrder::Newest => "Newest",
+            SortOrder::Attention => "Attention",
             SortOrder::LastActivity => "Recent",
             SortOrder::Oldest => "Oldest",
             SortOrder::AZ => "A-Z",
@@ -324,11 +473,25 @@ pub struct AppStateConfig {
     #[serde(default)]
     pub last_seen_version: Option<String>,
 
+    /// Latest version for which the user dismissed the update banner. The
+    /// banner stays hidden as long as the latest available version equals
+    /// this value; it returns automatically when a newer release ships.
+    /// Cleared by switching `update_check_mode` or upgrading past the
+    /// snoozed version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dismissed_update_version: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_list_width: Option<u16>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_file_list_width: Option<u16>,
+
+    /// Show the info header (profile/tool/path/status/sandbox/worktree) at
+    /// the top of the home preview pane. Defaults to `true` when absent;
+    /// users hide it with `i` when they want the full pane for live output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_preview_info: Option<bool>,
 
     #[serde(default)]
     pub has_seen_custom_instruction_warning: bool,
@@ -346,10 +509,19 @@ pub struct AppStateConfig {
     /// Restored on subsequent opens so users don't re-navigate every time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_browse_dir: Option<PathBuf>,
+
+    /// Collapsed state for the synthetic "Archived" sidebar section.
+    /// Defaults to collapsed when absent. Archived sessions are pulled out
+    /// of the natural sort and grouped under this section at the bottom
+    /// across every sort mode, so they stop interleaving with active rows
+    /// without users in non-Attention modes losing the ability to find a
+    /// shelved session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_section_collapsed: Option<bool>,
 }
 
 /// Session-related configuration defaults
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
     /// Default coding tool for new sessions (claude, opencode, vibe, codex)
     /// If not set or tool is unavailable, falls back to first available tool
@@ -396,6 +568,195 @@ pub struct SessionConfig {
     /// Off by default; existing users keep the legacy single-letter UX.
     #[serde(default)]
     pub strict_hotkeys: bool,
+
+    /// How long (in minutes) to snooze a session when the user presses
+    /// `w`/`W` or runs `aoe session snooze`. During the snooze window the
+    /// session is treated like archive: sinks to the bottom, renders
+    /// italic+dim with a `z ` prefix, ignored by the attention sort,
+    /// then rejoins the active list automatically when the timer expires.
+    /// Default: 30 minutes.
+    #[serde(default = "default_snooze_duration_minutes")]
+    pub snooze_duration_minutes: u32,
+
+    /// Text sent to the agent after a successful `aoe session restart` /
+    /// `e`-keybind restart, once the post-restart readiness probe says the
+    /// pane is alive. Restart re-execs the agent at a blank prompt; this
+    /// nudge tells the agent to pick up where it left off. Set to an
+    /// empty string to disable the wake-up message entirely (the restart
+    /// itself still runs).
+    #[serde(default = "default_restart_wake_message")]
+    pub restart_wake_message: String,
+
+    /// Per-row label shown next to the session title in the home view.
+    /// `Auto` (default) preserves the historical UX: show a profile short
+    /// code in all-profiles view and nothing in filtered views. Other
+    /// variants override that to always show the chosen tag, or to
+    /// suppress the row label entirely.
+    #[serde(default)]
+    pub row_tag: RowTagMode,
+
+    /// Process-wide cap on concurrent session-id poller threads (one per
+    /// live session). Edited via the TUI Settings panel; saving in Global
+    /// scope pushes the new value into the runtime atomic for new sessions
+    /// to pick up immediately.
+    #[serde(default = "default_session_id_poller_max_threads")]
+    pub session_id_poller_max_threads: u32,
+
+    /// Comma-separated list of chord specs that exit live-send mode.
+    /// Each chord is a tmux-style spec like `C-q`, `M-x`, `F12`; the
+    /// first chord in the list that matches an event ends live mode.
+    /// Default is `C-q` alone: mobile-friendly, passes through Termius,
+    /// well-known as a quit chord, and verified to survive every common
+    /// macOS terminal config (unlike `C-]` and `C-\`, both of which
+    /// fail silently on at least one combination). Customize when the
+    /// default conflicts with a workflow (vim quoted-insert needs `C-q`
+    /// passthrough, so swap to `F12,M-q` or any chord that's free).
+    #[serde(default = "default_live_send_exit_chord")]
+    pub live_send_exit_chord: String,
+
+    /// What the TUI does immediately after a new session finishes
+    /// creating. `Tmux` (default) drops into the tmux attach view, the
+    /// historical behavior. `LiveSend` enters live-send mode against
+    /// the new session's pane instead, so users who never want to be
+    /// inside tmux directly can create-and-type without an extra
+    /// keystroke. Cockpit-mode sessions ignore this setting because
+    /// neither tmux nor live-send applies to them.
+    #[serde(default)]
+    pub new_session_attach_mode: NewSessionAttachMode,
+
+    /// What `Enter` (and double-click) does on an existing session
+    /// row in the Agent view. `Tmux` (default) attaches to the tmux
+    /// pane, the historical behavior. `LiveSend` enters live-send
+    /// mode instead so the TUI keeps the home list visible and pipes
+    /// keystrokes through to the agent. Terminal/Tool views and
+    /// cockpit-mode sessions ignore this setting; they keep their
+    /// existing activation paths (terminal attach, cockpit open).
+    #[serde(default)]
+    pub default_attach_mode: NewSessionAttachMode,
+
+    /// What a single mouse click on a session row does in the Agent
+    /// view. `LiveSend` (default) enters live-send mode for that row,
+    /// the historical behavior. `SelectOnly` just moves the cursor
+    /// to the row so the user can read the preview without ever
+    /// entering live-send. Double-click still activates via
+    /// `default_attach_mode` regardless of this setting.
+    #[serde(default)]
+    pub click_action: ClickAction,
+}
+
+/// What a single mouse click on a session row does in the Agent view.
+/// See `SessionConfig::click_action`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClickAction {
+    /// Single-click enters live-send mode for the clicked session
+    /// (the historical behavior on `main` before this setting landed).
+    #[default]
+    LiveSend,
+    /// Single-click only moves the cursor to the clicked row, so the
+    /// user can browse session previews without entering live-send.
+    /// Double-click still activates the session via the configured
+    /// `default_attach_mode`.
+    SelectOnly,
+}
+
+/// What the TUI does after a new session is created. See
+/// `SessionConfig::new_session_attach_mode`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NewSessionAttachMode {
+    /// Attach to the new session's tmux pane (the historical
+    /// behavior; the user lands inside tmux with the agent running).
+    #[default]
+    Tmux,
+    /// Enter live-send mode against the new session's pane: the agent
+    /// runs in the background, the TUI stays on the home view, and
+    /// keystrokes pipe straight to the agent. Users who never want to
+    /// see a raw tmux session pick this so creating a session never
+    /// detaches them from the home list.
+    LiveSend,
+}
+
+/// What to render in the per-row tag slot next to the session title.
+///
+/// Defaults to `None` so existing users see no behavior change. Power
+/// users opt in via Settings: pick `Auto` (profile tag in all-profiles
+/// view only), `Profile`, `Sandbox`, or `Branch`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowTagMode {
+    /// Never render a per-row tag. The historical behavior on `main`
+    /// before the row-tag feature landed; default so the feature is
+    /// fully opt-in.
+    #[default]
+    None,
+    /// Show the profile short code in all-profiles view, nothing in
+    /// filtered views.
+    Auto,
+    /// Always render the profile short code (`fb` for `forit-backup`).
+    Profile,
+    /// Render `sb` on sandboxed sessions, nothing on host sessions.
+    Sandbox,
+    /// Render the worktree branch name (last segment if `/`-namespaced,
+    /// truncated to 8 chars).
+    Branch,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            default_tool: None,
+            yolo_mode_default: false,
+            agent_extra_args: HashMap::new(),
+            agent_command_override: HashMap::new(),
+            agent_status_hooks: true,
+            custom_agents: HashMap::new(),
+            agent_detect_as: HashMap::new(),
+            strict_hotkeys: false,
+            snooze_duration_minutes: 30,
+            restart_wake_message: default_restart_wake_message(),
+            row_tag: RowTagMode::default(),
+            session_id_poller_max_threads: default_session_id_poller_max_threads(),
+            live_send_exit_chord: default_live_send_exit_chord(),
+            new_session_attach_mode: NewSessionAttachMode::default(),
+            default_attach_mode: NewSessionAttachMode::default(),
+            click_action: ClickAction::default(),
+        }
+    }
+}
+
+fn default_snooze_duration_minutes() -> u32 {
+    30
+}
+
+fn default_restart_wake_message() -> String {
+    "wake up: pick up what you were doing".to_string()
+}
+
+fn default_live_send_exit_chord() -> String {
+    // Ctrl+q: mobile-friendly, passes Termius, well-known quit chord.
+    // Kept in sync with live_send::DEFAULT_EXIT_CHORD.
+    "C-q".to_string()
+}
+
+/// Upper bound on snooze duration: 30 days (43,200 minutes). Originally
+/// capped at 24 hours but the TUI snooze dialog now offers up to a 1-week
+/// preset and longer ad-hoc values via the API are reasonable for
+/// long-tail "circle back next month" workflows.
+pub const SNOOZE_MAX_MINUTES: u64 = 30 * 24 * 60;
+
+pub fn validate_snooze_duration(minutes: u64) -> Result<(), String> {
+    if !(1..=SNOOZE_MAX_MINUTES).contains(&minutes) {
+        return Err(format!(
+            "Snooze duration must be between 1 and {} minutes (got {})",
+            SNOOZE_MAX_MINUTES, minutes
+        ));
+    }
+    Ok(())
+}
+
+fn default_session_id_poller_max_threads() -> u32 {
+    crate::session::poller::DEFAULT_SESSION_ID_POLLER_MAX_THREADS
 }
 
 impl SessionConfig {
@@ -415,16 +776,16 @@ impl SessionConfig {
     pub fn warn_custom_agent_issues(&self) {
         for (name, command) in &self.custom_agents {
             if name.is_empty() {
-                tracing::warn!("custom_agents: entry with empty name will be ignored");
+                tracing::warn!(target: "session.store", "custom_agents: entry with empty name will be ignored");
             }
             if command.is_empty() {
-                tracing::warn!(
+                tracing::warn!(target: "session.store",
                     "custom_agents: '{}' has an empty command, session will launch with no command",
                     name
                 );
             }
             if crate::agents::get_agent(name).is_some() {
-                tracing::warn!(
+                tracing::warn!(target: "session.store",
                     "custom_agents: '{}' shadows a built-in agent; use agent_command_override instead",
                     name
                 );
@@ -432,15 +793,15 @@ impl SessionConfig {
         }
         for (name, target) in &self.agent_detect_as {
             if name.is_empty() {
-                tracing::warn!("agent_detect_as: entry with empty agent name will be ignored");
+                tracing::warn!(target: "session.store", "agent_detect_as: entry with empty agent name will be ignored");
             }
             if target.is_empty() {
-                tracing::warn!(
+                tracing::warn!(target: "session.store",
                     "agent_detect_as: '{}' maps to an empty target, status detection will default to Idle",
                     name
                 );
             } else if crate::agents::get_agent(target).is_none() {
-                tracing::warn!(
+                tracing::warn!(target: "session.store",
                     "agent_detect_as: '{}' maps to unknown agent '{}', status detection will default to Idle. Known agents: {}",
                     name,
                     target,
@@ -525,8 +886,12 @@ impl Default for WebConfig {
     }
 }
 
+/// Serde default for `Config.default_profile`. Empty means "not explicitly
+/// chosen"; the active profile is then resolved at runtime by
+/// `resolve_default_profile`, which picks the first existing profile or
+/// bootstraps one. There is no magic profile name.
 fn default_profile() -> String {
-    "default".to_string()
+    String::new()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -581,10 +946,52 @@ fn default_idle_decay_minutes() -> u64 {
     0
 }
 
+/// Controls how the TUI and CLI surface update availability. See #1140.
+///
+/// `Auto` quietly installs new releases in the background on next launch
+/// after detection (mid-session restart is intentionally out of scope, the
+/// new binary is picked up next time `aoe` starts). `Notify` is the
+/// default: shows the TUI banner and, when `notify_in_cli` is true, the
+/// CLI eprintln nag. `Off` suppresses every check, banner, and fetch.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateCheckMode {
+    /// Silently install detected updates; user picks them up next launch.
+    Auto,
+    /// Surface the banner / CLI notice (default).
+    #[default]
+    Notify,
+    /// Skip every check, banner, and fetch.
+    Off,
+}
+
+impl UpdateCheckMode {
+    /// True when the runtime should call `check_for_update` at all.
+    /// Both `Auto` and `Notify` need the check to fire; only `Off`
+    /// short-circuits.
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, UpdateCheckMode::Off)
+    }
+
+    /// True when the user should see a TUI banner / CLI notice once a
+    /// newer version is detected.
+    pub fn notifies(self) -> bool {
+        matches!(self, UpdateCheckMode::Notify)
+    }
+
+    /// True when the runtime should kick off a background install on
+    /// detection (no banner; binary picked up next launch).
+    pub fn auto_installs(self) -> bool {
+        matches!(self, UpdateCheckMode::Auto)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdatesConfig {
-    #[serde(default = "default_true")]
-    pub check_enabled: bool,
+    /// How updates are surfaced (auto / notify / off). Replaces the
+    /// legacy `check_enabled` boolean (see migration `v009`).
+    #[serde(default)]
+    pub update_check_mode: UpdateCheckMode,
 
     #[serde(default = "default_check_interval")]
     pub check_interval_hours: u64,
@@ -604,7 +1011,7 @@ pub struct UpdatesConfig {
 impl Default for UpdatesConfig {
     fn default() -> Self {
         Self {
-            check_enabled: true,
+            update_check_mode: UpdateCheckMode::default(),
             check_interval_hours: 24,
             notify_in_cli: true,
             web_poll_interval_minutes: 60,
@@ -775,7 +1182,7 @@ impl Default for SandboxConfig {
 }
 
 fn default_sandbox_image() -> String {
-    "ghcr.io/njbrake/aoe-sandbox:latest".to_string()
+    "ghcr.io/agent-of-empires/aoe-sandbox:latest".to_string()
 }
 
 fn default_sandbox_environment() -> Vec<String> {
@@ -923,7 +1330,8 @@ impl Config {
         }
 
         let content = fs::read_to_string(&path)?;
-        let config: Config = toml::from_str(&content)?;
+        let mut config: Config = toml::from_str(&content)?;
+        config.normalize();
         Ok(config)
     }
 
@@ -933,9 +1341,18 @@ impl Config {
         match Self::load() {
             Ok(config) => config,
             Err(e) => {
-                tracing::warn!("Failed to load global config, using defaults: {e}");
+                tracing::warn!(target: "session.store", "Failed to load global config, using defaults: {e}");
                 Config::default()
             }
+        }
+    }
+
+    /// Clamp invariants that the type system can't enforce. Keeps config,
+    /// TUI, and runtime in agreement when a user hand-edits a value below
+    /// its minimum (zero would silently disable session-id polling).
+    fn normalize(&mut self) {
+        if self.session.session_id_poller_max_threads == 0 {
+            self.session.session_id_poller_max_threads = 1;
         }
     }
 }
@@ -951,18 +1368,42 @@ pub fn load_config() -> Result<Option<Config>> {
 pub fn save_config(config: &Config) -> Result<()> {
     let path = config_path()?;
     let content = toml::to_string_pretty(config)?;
-    fs::write(&path, content)?;
+    super::atomic_write(&path, content.as_bytes())?;
     Ok(())
 }
 
-/// Load the user's default profile name, falling back to "default" on error.
+/// Resolve the active profile name.
+///
+/// If the user has explicitly set `config.default_profile`, that name is
+/// returned verbatim. Otherwise this returns the first profile directory
+/// found under `<app_dir>/profiles/` (sorted, so the choice is
+/// deterministic). On a genuine first run, when no profile directory exists
+/// yet, one is bootstrapped (see `ensure_bootstrap_profile`).
 pub fn resolve_default_profile() -> String {
     let config = Config::load_or_warn();
-    if config.default_profile.is_empty() {
-        "default".to_string()
-    } else {
-        config.default_profile
+    if !config.default_profile.is_empty() {
+        return config.default_profile;
     }
+    match super::list_profiles() {
+        Ok(profiles) => match profiles.into_iter().next() {
+            Some(first) => first,
+            None => ensure_bootstrap_profile(),
+        },
+        Err(_) => ensure_bootstrap_profile(),
+    }
+}
+
+/// Name of the profile created on a genuine first run.
+const BOOTSTRAP_PROFILE: &str = "main";
+
+/// Create the first profile on a genuine first run and return its name.
+///
+/// AoE always needs at least one profile (somewhere to file sessions). When
+/// `profiles/` has no entries, this creates `main`. It is idempotent: calling
+/// it when `main` already exists just returns the name.
+fn ensure_bootstrap_profile() -> String {
+    let _ = super::get_profile_dir(BOOTSTRAP_PROFILE);
+    BOOTSTRAP_PROFILE.to_string()
 }
 
 /// Return `profile` if non-empty, otherwise the user's globally configured
@@ -1057,19 +1498,20 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = Config::default();
-        // default_profile uses default_profile() function which returns "default"
-        // but Default derive gives empty string, so check deserialize case works
+        // An unset default_profile deserializes empty: "not explicitly
+        // chosen". The active profile is resolved at runtime, not baked in
+        // as a magic name here.
         let deserialized: Config = toml::from_str("").unwrap();
-        assert_eq!(deserialized.default_profile, "default");
+        assert_eq!(deserialized.default_profile, "");
         assert!(!config.worktree.enabled);
         assert!(!config.sandbox.enabled_by_default);
-        assert!(config.updates.check_enabled);
+        assert_eq!(config.updates.update_check_mode, UpdateCheckMode::Notify);
     }
 
     #[test]
     fn test_config_deserialize_empty_toml() {
         let config: Config = toml::from_str("").unwrap();
-        assert_eq!(config.default_profile, "default");
+        assert_eq!(config.default_profile, "");
     }
 
     #[test]
@@ -1131,7 +1573,7 @@ mod tests {
     #[test]
     fn test_updates_config_default() {
         let updates = UpdatesConfig::default();
-        assert!(updates.check_enabled);
+        assert_eq!(updates.update_check_mode, UpdateCheckMode::Notify);
         assert_eq!(updates.check_interval_hours, 24);
         assert!(updates.notify_in_cli);
     }
@@ -1139,41 +1581,56 @@ mod tests {
     #[test]
     fn test_updates_config_deserialize() {
         let toml = r#"
-            check_enabled = false
+            update_check_mode = "off"
             check_interval_hours = 12
             notify_in_cli = false
         "#;
         let updates: UpdatesConfig = toml::from_str(toml).unwrap();
-        assert!(!updates.check_enabled);
+        assert_eq!(updates.update_check_mode, UpdateCheckMode::Off);
         assert_eq!(updates.check_interval_hours, 12);
         assert!(!updates.notify_in_cli);
     }
 
     #[test]
     fn test_updates_config_partial_deserialize() {
-        let toml = r#"check_enabled = false"#;
+        let toml = r#"update_check_mode = "auto""#;
         let updates: UpdatesConfig = toml::from_str(toml).unwrap();
-        assert!(!updates.check_enabled);
-        // Defaults for other fields
+        assert_eq!(updates.update_check_mode, UpdateCheckMode::Auto);
         assert_eq!(updates.check_interval_hours, 24);
     }
 
-    /// Regression: a previous schema had `auto_update = bool` on
-    /// UpdatesConfig (it was wired through profiles but never read).
-    /// The field is gone now, so old configs that still set it must
-    /// deserialize cleanly with the field silently dropped by serde.
     #[test]
-    fn test_legacy_auto_update_field_is_silently_ignored() {
+    fn test_update_check_mode_helpers() {
+        assert!(UpdateCheckMode::Notify.is_enabled());
+        assert!(UpdateCheckMode::Notify.notifies());
+        assert!(!UpdateCheckMode::Notify.auto_installs());
+
+        assert!(UpdateCheckMode::Auto.is_enabled());
+        assert!(!UpdateCheckMode::Auto.notifies());
+        assert!(UpdateCheckMode::Auto.auto_installs());
+
+        assert!(!UpdateCheckMode::Off.is_enabled());
+        assert!(!UpdateCheckMode::Off.notifies());
+        assert!(!UpdateCheckMode::Off.auto_installs());
+    }
+
+    /// Regression: the previous schema had `check_enabled = bool` and
+    /// `auto_update = bool` on UpdatesConfig. Both fields are gone now;
+    /// the on-disk migration runs at startup, but configs read between
+    /// upgrade and migration must still deserialize cleanly with the
+    /// unknown fields silently dropped by serde.
+    #[test]
+    fn test_legacy_check_enabled_and_auto_update_are_ignored() {
         let old_toml = r#"
-            check_enabled = true
+            check_enabled = false
             auto_update = true
             check_interval_hours = 12
             notify_in_cli = true
         "#;
         let updates: UpdatesConfig =
-            toml::from_str(old_toml).expect("old auto_update field should not error");
+            toml::from_str(old_toml).expect("legacy fields should not error");
         assert_eq!(updates.check_interval_hours, 12);
-        assert!(updates.check_enabled);
+        assert_eq!(updates.update_check_mode, UpdateCheckMode::Notify);
         assert!(updates.notify_in_cli);
     }
 
@@ -1311,6 +1768,7 @@ mod tests {
         let app = AppStateConfig::default();
         assert!(!app.has_seen_welcome);
         assert!(app.last_seen_version.is_none());
+        assert!(app.dismissed_update_version.is_none());
     }
 
     #[test]
@@ -1318,10 +1776,12 @@ mod tests {
         let toml = r#"
             has_seen_welcome = true
             last_seen_version = "1.0.0"
+            dismissed_update_version = "1.0.0"
         "#;
         let app: AppStateConfig = toml::from_str(toml).unwrap();
         assert!(app.has_seen_welcome);
         assert_eq!(app.last_seen_version, Some("1.0.0".to_string()));
+        assert_eq!(app.dismissed_update_version, Some("1.0.0".to_string()));
     }
 
     // Full config serialization roundtrip
@@ -1376,7 +1836,7 @@ mod tests {
             enabled_by_default = true
 
             [updates]
-            check_enabled = true
+            update_check_mode = "notify"
             check_interval_hours = 12
 
             [app_state]
@@ -1389,7 +1849,7 @@ mod tests {
         assert!(config.worktree.enabled);
         assert_eq!(config.worktree.path_template, "../wt/{branch}");
         assert!(config.sandbox.enabled_by_default);
-        assert!(config.updates.check_enabled);
+        assert_eq!(config.updates.update_check_mode, UpdateCheckMode::Notify);
         assert_eq!(config.updates.check_interval_hours, 12);
         assert!(config.app_state.has_seen_welcome);
     }
@@ -1399,7 +1859,7 @@ mod tests {
     fn test_get_update_settings_returns_defaults_when_no_config() {
         // This test doesn't access the filesystem, so it should return defaults
         let settings = UpdatesConfig::default();
-        assert!(settings.check_enabled);
+        assert_eq!(settings.update_check_mode, UpdateCheckMode::Notify);
         assert_eq!(settings.check_interval_hours, 24);
     }
 
@@ -1599,6 +2059,48 @@ mod tests {
     }
 
     #[test]
+    fn test_session_config_default_session_id_poller_max_threads() {
+        let cfg = SessionConfig::default();
+        assert_eq!(
+            cfg.session_id_poller_max_threads,
+            crate::session::poller::DEFAULT_SESSION_ID_POLLER_MAX_THREADS
+        );
+    }
+
+    #[test]
+    fn test_session_config_session_id_poller_max_threads_roundtrip() {
+        let mut config = Config::default();
+        config.session.session_id_poller_max_threads = 137;
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.session.session_id_poller_max_threads, 137);
+    }
+
+    #[test]
+    fn test_session_config_session_id_poller_max_threads_defaults_when_absent() {
+        let toml = r#"
+            [session]
+            default_tool = "claude"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.session.session_id_poller_max_threads,
+            crate::session::poller::DEFAULT_SESSION_ID_POLLER_MAX_THREADS
+        );
+    }
+
+    #[test]
+    fn test_session_config_normalize_clamps_zero_poller_threads() {
+        let mut cfg = Config::default();
+        cfg.session.session_id_poller_max_threads = 0;
+        cfg.normalize();
+        assert_eq!(
+            cfg.session.session_id_poller_max_threads, 1,
+            "normalize() must clamp zero to 1 to keep config, UI, and runtime aligned"
+        );
+    }
+
+    #[test]
     fn test_resolve_tool_command_prefers_command_override() {
         let mut config = SessionConfig::default();
         config
@@ -1641,6 +2143,41 @@ mod tests {
     }
 
     #[test]
+    fn test_session_config_default_snooze_duration_is_30() {
+        let config = SessionConfig::default();
+        assert_eq!(
+            config.snooze_duration_minutes, 30,
+            "default snooze duration must be 30 minutes"
+        );
+    }
+
+    #[test]
+    fn test_validate_snooze_duration_accepts_valid_range() {
+        assert!(validate_snooze_duration(1).is_ok());
+        assert!(validate_snooze_duration(30).is_ok());
+        assert!(validate_snooze_duration(1440).is_ok());
+    }
+
+    #[test]
+    fn test_validate_snooze_duration_rejects_out_of_range() {
+        assert!(validate_snooze_duration(0).is_err());
+        assert!(validate_snooze_duration(SNOOZE_MAX_MINUTES + 1).is_err());
+    }
+
+    #[test]
+    fn test_validate_snooze_duration_accepts_dialog_presets() {
+        // The TUI dialog presets must all pass the validator; otherwise
+        // the API silently rejects what the UI offered. Presets:
+        // 1-6h (60-360 min), 24h (1 day), 1 week.
+        for &m in &[60u64, 120, 180, 240, 300, 360, 1440, 7 * 1440] {
+            assert!(
+                validate_snooze_duration(m).is_ok(),
+                "preset {m} min must pass validator"
+            );
+        }
+    }
+
+    #[test]
     fn test_custom_agents_roundtrip() {
         let mut config = Config::default();
         config.session.custom_agents.insert(
@@ -1675,5 +2212,54 @@ mod tests {
 
         let serialized = toml::to_string(&parsed).unwrap();
         assert!(serialized.contains(r#"container_runtime = "podman""#));
+    }
+
+    #[test]
+    fn logging_config_old_shape_populates_new_defaults() {
+        // Existing user configs predate output/file_path/rotation; their
+        // [logging] section is just default_level + targets. The new fields
+        // must populate from serde defaults rather than failing to parse.
+        let toml_str = r#"
+default_level = "debug"
+
+[targets]
+"cockpit.acp" = "trace"
+"#;
+        let parsed: LoggingConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.default_level, "debug");
+        assert_eq!(
+            parsed.targets.get("cockpit.acp"),
+            Some(&"trace".to_string())
+        );
+        assert_eq!(parsed.output, SinkKind::File);
+        assert_eq!(parsed.file_path, "debug.log");
+        assert_eq!(parsed.rotation, RotationKind::Size);
+        assert_eq!(parsed.max_size_mib, 50);
+        assert_eq!(parsed.keep_count, 5);
+    }
+
+    #[test]
+    fn logging_config_new_shape_round_trip() {
+        let toml_str = r#"
+default_level = "info"
+output = "stdout"
+file_path = "/tmp/aoe.log"
+rotation = "never"
+max_size_mib = 100
+keep_count = 10
+
+[targets]
+"#;
+        let parsed: LoggingConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.output, SinkKind::Stdout);
+        assert_eq!(parsed.file_path, "/tmp/aoe.log");
+        assert_eq!(parsed.rotation, RotationKind::Never);
+        assert_eq!(parsed.max_size_mib, 100);
+        assert_eq!(parsed.keep_count, 10);
+
+        let serialized = toml::to_string(&parsed).unwrap();
+        let reparsed: LoggingConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.output, SinkKind::Stdout);
+        assert_eq!(reparsed.rotation, RotationKind::Never);
     }
 }

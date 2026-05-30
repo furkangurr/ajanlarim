@@ -44,12 +44,36 @@ All settings below can also be edited from the TUI settings screen (press `s` or
 
 ```toml
 [theme]
-name = "empire"   # empire, phosphor, tokyo-night-storm, catppuccin-latte, dracula, rose-pine
+name = "default"   # default, empire, phosphor, tokyo-night-storm, catppuccin-latte, dracula, rose-pine, deep-ocean
+color_mode = "truecolor"   # truecolor | palette (TUI only)
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `name` | `"empire"` | TUI color theme. Available: `empire` (warm navy/amber), `phosphor` (green), `tokyo-night-storm` (dark blue/purple), `catppuccin-latte` (light pastel), `dracula` (dark purple/pink), `rose-pine` (dark muted purple/pink). |
+| `name` | `"default"` | Color theme. Applies to **both the TUI and the web dashboard**. Available builtins: `default` (neutral zinc/amber), `empire` (warm navy/copper), `phosphor` (green), `tokyo-night-storm` (dark blue/purple), `catppuccin-latte` (light pastel), `dracula` (dark purple/pink), `rose-pine` (dark muted purple/pink), `deep-ocean` (Material Theme Deep Ocean, dark navy/cyan). Custom TOML themes in `~/.agent-of-empires/themes/*.toml` also appear in the picker. An empty `name` resolves to `default`. |
+| `color_mode` | `"truecolor"` | TUI only. `palette` downsamples to xterm-256 for transports that mangle 24-bit RGB (e.g. some `mosh` setups). The web dashboard always renders truecolor. |
+
+### Builtin themes
+
+Each builtin theme is a TOML file under `themes/builtin/` in the repo, embedded into the binary at build time. The schema matches the custom-theme format below, plus two optional metadata fields:
+
+- `appearance = "dark" | "light"` declares the surface polarity. Drives the web dashboard's surface-ramp derivation (lighten vs darken from background) and selects the fallback Shiki syntax theme. If omitted, the server classifies from background luminance.
+- `[syntax].shiki_theme = "..."` names the bundled Shiki theme the web dashboard loads for code blocks. If omitted, falls back by appearance (`github-dark` / `github-light`).
+
+### Custom themes
+
+Drop a TOML file in `~/.agent-of-empires/themes/<name>.toml` (or `$XDG_CONFIG_HOME/agent-of-empires/themes/` on Linux). The file appears in the theme picker under its filename stem.
+
+Export a builtin as a starting point:
+
+```bash
+aoe theme export empire             # writes ~/.agent-of-empires/themes/custom-empire.toml
+aoe theme export dracula -o my.toml # writes to my.toml
+aoe theme list                      # show all available themes
+aoe theme dir                       # print the custom themes directory
+```
+
+The schema is flat; every field is optional. Missing fields in a partial custom TOML fall back to Empire's hex values (the canonical baseline `Theme` struct defaults); fully unknown theme names at lookup time fall back to the `default` builtin. The 24 color fields cover background, borders, text, status semantics, diff colors, branch/sandbox chips, and accent. Add the optional `appearance` and `[syntax]` table to control the web surface.
 
 ## Session
 
@@ -63,29 +87,46 @@ agent_status_hooks = true
 | Option | Default | Description |
 |--------|---------|-------------|
 | `default_tool` | (auto-detect) | Default agent for new sessions. Falls back to the first available tool if unset or unavailable. Can be set to a custom agent name. |
-| `yolo_mode_default` | `false` | Enable YOLO mode by default for new sessions (skip permission prompts). Works with or without sandbox. |
-| `agent_status_hooks` | `true` | Install status-detection hooks into the agent's settings file. When disabled, status detection falls back to tmux pane content parsing. |
+| `yolo_mode_default` | `false` | Enable YOLO mode by default for new sessions (skip permission prompts). Works with or without sandbox. In tmux mode this passes `--dangerously-skip-permissions` to the agent CLI; in cockpit mode it maps to ACP `bypassPermissions` (see [Cockpit: Permission modes and YOLO](../cockpit.md#permission-modes-and-yolo) for the adapter caveat). |
+| `agent_status_hooks` | `true` | Install status-detection hooks into the agent's config file. Codex uses the `[hooks]` table in `~/.codex/config.toml`; other JSON-based agents use their settings JSON. When disabled, status detection falls back to tmux pane content parsing. Codex is hook-first, but known hook gaps are reconciled from pane content. |
 | `agent_extra_args` | `{}` | Per-agent extra arguments appended after the binary (e.g., `{ opencode = "--port 8080" }`). |
 | `agent_command_override` | `{}` | Per-agent command override replacing the binary entirely (e.g., `{ claude = "my-claude-wrapper" }`). |
 | `custom_agents` | `{}` | User-defined agents: name to command mapping. Custom agent names appear in the TUI agent picker alongside built-in agents. |
 | `agent_detect_as` | `{}` | Status detection mapping: maps an agent name to a built-in agent whose status heuristics should be used. |
 
-### Custom Agents
+For Codex, AoE preserves existing `[hooks.state]` trust data and writes `~/.codex/config.toml` through `config.toml.lock` plus an atomic replace. This keeps repeated or concurrent AoE launches from duplicating hook blocks or leaving partial TOML.
 
-You can register additional agents (SSH wrappers to remote machines, custom workflows, etc.) that appear in the TUI agent picker alongside built-in agents like `claude`, `opencode`, and `codex`.
+## Status Hooks
+
+Status hooks run local shell commands when the TUI sees a session status change. They are disabled by default and are intended for personal machine behavior such as desktop notifications.
 
 ```toml
-[session]
-custom_agents = { "lenovo-claude" = "ssh -t lenovo claude" }
-agent_detect_as = { "lenovo-claude" = "claude" }
+[status_hooks]
+enabled = true
+debounce_ms = 100
+on_waiting = "notify-send -a aoe 'AoE: Waiting' \"$AOE_SESSION_TITLE is waiting for input\""
+on_idle = "notify-send -a aoe 'AoE: Idle' \"$AOE_SESSION_TITLE is idle\""
+on_error = "notify-send -u critical -a aoe 'AoE: Error' \"$AOE_SESSION_TITLE errored\""
 ```
 
-- **`custom_agents`**: Maps a display name to the command to run. The name appears in the agent picker when creating a new session, and the command is auto-filled as the session's command override.
-- **`agent_detect_as`** (optional): Maps a custom agent to a built-in agent's status detection. Without this, custom agents default to `Idle` status. Setting `"lenovo-claude" = "claude"` reuses Claude's Running/Waiting/Idle detection heuristics for the remote session.
+| Option | Default | Description |
+|--------|---------|-------------|
+| `enabled` | `false` | Run configured status hook commands from the TUI. |
+| `debounce_ms` | `100` | Wait this many milliseconds for a status to remain stable before running commands. Set to `0` to run hooks immediately. |
+| `on_starting` | unset | Command run when a session enters `Starting`. |
+| `on_running` | unset | Command run when a session enters `Running`. |
+| `on_waiting` | unset | Command run when a session enters `Waiting`. |
+| `on_idle` | unset | Command run when a session enters `Idle`. |
+| `on_error` | unset | Command run when a session enters `Error`. |
+| `on_change` | unset | Command run on every status change after the status-specific command. |
 
-Custom agents are always shown as available in the picker (no binary detection), since the command may target a remote host or a wrapper script.
+Commands run in the session project directory and receive context through environment variables: `AOE_SESSION_ID`, `AOE_SESSION_TITLE`, `AOE_PROJECT_PATH`, `AOE_PROFILE`, `AOE_TOOL`, `AOE_GROUP_PATH`, `AOE_OLD_STATUS`, `AOE_NEW_STATUS`, and `AOE_STATUS_CHANGED_AT`. When both a status-specific hook and `on_change` are configured for the same transition, AoE runs them sequentially in one background worker, with the status-specific command first.
 
-You can also set `default_tool` to a custom agent name:
+Hook commands are best-effort and non-blocking. Failures are logged at `warn` under `hooks.status_hooks` and never block status updates or sound playback. While you are attached to a tmux session from the TUI, AoE keeps polling eligible sessions so status hook commands still fire during long attaches. Status hooks are configurable in global and profile settings, not repo config, because they run arbitrary local commands.
+
+### Custom Agents
+
+Custom agents let you name commands for agents that AoE cannot detect as built-in binaries, such as SSH wrappers, local scripts, or remote Claude sessions. Configure them once in `custom_agents`, then select the configured name from the TUI picker, `aoe add --tool <name>`, or the Web session wizard.
 
 ```toml
 [session]
@@ -93,6 +134,14 @@ default_tool = "lenovo-claude"
 custom_agents = { "lenovo-claude" = "ssh -t lenovo claude" }
 agent_detect_as = { "lenovo-claude" = "claude" }
 ```
+
+- **`custom_agents`**: Maps a display name to the command AoE runs when that agent is selected. Custom-agent names are configured in config files or the TUI settings screen, and they appear alongside built-in agents like `claude`, `opencode`, and `codex`.
+- **`agent_detect_as`** (optional): Maps a custom agent to a built-in agent's status detection. Without this, custom agents default to `Idle` status. Setting `"lenovo-claude" = "claude"` reuses Claude's Running/Waiting/Idle detection heuristics for the remote session.
+- **`default_tool`** (optional): Can point at a custom-agent name so new sessions default to that configured agent.
+
+Custom agents are always shown as available in the TUI picker because their command may target a remote host or wrapper script instead of a local binary. From the CLI, use `aoe add --tool <name>` to create a session with a configured custom agent by name. The selected custom agent still uses the command from `custom_agents`; browser or CLI input is not treated as a raw command.
+
+The Web session wizard can select configured custom agents and submit the selected name to the server. For security, the Web UI does not expose custom-agent command strings, does not expose `agent_detect_as` values, and does not edit `custom_agents` or `agent_detect_as`. Edit those fields through config files or the TUI settings screen instead.
 
 Both fields are editable from the TUI settings screen and support profile/repo-level overrides.
 
@@ -157,7 +206,7 @@ init_submodules = true
 ```toml
 [sandbox]
 enabled_by_default = false
-default_image = "ghcr.io/njbrake/aoe-sandbox:latest"
+default_image = "ghcr.io/agent-of-empires/aoe-sandbox:latest"
 cpu_limit = "4"
 memory_limit = "8g"
 port_mappings = ["3000:3000", "5432:5432"]
@@ -171,7 +220,7 @@ default_terminal_mode = "host"
 | Option | Default | Description |
 |--------|---------|-------------|
 | `enabled_by_default` | `false` | Auto-enable sandbox for new sessions |
-| `default_image` | `ghcr.io/njbrake/aoe-sandbox:latest` | Docker image for containers |
+| `default_image` | `ghcr.io/agent-of-empires/aoe-sandbox:latest` | Docker image for containers |
 | `cpu_limit` | (none) | CPU limit (e.g., `"4"`) |
 | `memory_limit` | (none) | Memory limit (e.g., `"8g"`) |
 | `port_mappings` | `[]` | Host-to-container port mappings (e.g., `["3000:3000"]`) |
@@ -221,8 +270,7 @@ context_lines = 3
 
 ```toml
 [updates]
-check_enabled = true
-auto_update = false
+update_check_mode = "notify"
 check_interval_hours = 24
 notify_in_cli = true
 web_poll_interval_minutes = 60
@@ -230,11 +278,36 @@ web_poll_interval_minutes = 60
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `check_enabled` | `true` | Check for new versions; also gates the web dashboard's update banner |
-| `auto_update` | `false` | Automatically install updates |
+| `update_check_mode` | `"notify"` | One of `auto`, `notify`, `off`. See below. |
 | `check_interval_hours` | `24` | Hours between GitHub checks (server-side cache TTL) |
-| `notify_in_cli` | `true` | Show update notifications in CLI output |
+| `notify_in_cli` | `true` | Show the `aoe` CLI eprintln nag when a new version is available; only fires while `update_check_mode = "notify"` |
 | `web_poll_interval_minutes` | `60` | How often the web dashboard re-polls `/api/system/update-status` while open (min 5) |
+
+### `update_check_mode`
+
+- `auto`: when a new release is detected, install it silently in the background using the same tarball install path as `aoe update`. The new binary is picked up on the next launch (no mid-session restart). Only fires when the install location is writable; Homebrew installs fall through to manual `brew upgrade`.
+- `notify` (default): show the TUI banner and, if `notify_in_cli = true`, the CLI eprintln nag. Press `Ctrl+x` on the banner to snooze for the current latest version; the banner returns automatically when a newer release ships.
+- `off`: skip every check, banner, fetch, and dashboard poll. Use this on offline / restricted networks.
+
+The TUI banner snooze is persisted to `app_state.dismissed_update_version`, so dismissing on v1.5.3 keeps the banner hidden across `aoe` restarts until v1.5.4 (or later) ships. See #1140.
+
+Configs written for older `aoe` versions used a `check_enabled` boolean and an orphaned `auto_update` field. Migration `v009` runs once on startup and rewrites `check_enabled = false` to `update_check_mode = "off"`, `check_enabled = true` (or missing) to `"notify"`, and drops `auto_update` entirely.
+
+## Tools
+
+The `[tools.*]` block configures persistent dev tool sessions (lazygit, yazi, tig, etc.) tied to each agent session's working directory. Each entry has a required `command` and an optional `hotkey` in `Alt+<single-char>` format.
+
+```toml
+[tools.lazygit]
+command = "lazygit"
+hotkey = "Alt+g"
+
+[tools.yazi]
+command = "yazi"
+hotkey = "Alt+f"
+```
+
+See [Tool Sessions](tool-sessions.md) for the full reference, hotkey rules, and lifecycle.
 
 ## Profiles
 

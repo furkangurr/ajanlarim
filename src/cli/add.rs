@@ -11,9 +11,9 @@ use crate::session::{civilizations, GroupTree, Instance, SandboxInfo, Storage};
 
 #[derive(Args)]
 pub struct AddArgs {
-    /// Project directory (defaults to current directory)
-    #[arg(default_value = ".")]
-    path: PathBuf,
+    /// Project directory (defaults to current directory). Omit when
+    /// using `--scratch`.
+    path: Option<PathBuf>,
 
     /// Session title (defaults to folder name)
     #[arg(short = 't', long)]
@@ -26,6 +26,10 @@ pub struct AddArgs {
     /// Command to run (e.g., 'claude' or any other supported agent)
     #[arg(short = 'c', long = "cmd")]
     command: Option<String>,
+
+    /// Named built-in or configured custom agent to run
+    #[arg(long = "tool", conflicts_with = "command")]
+    tool: Option<String>,
 
     /// Parent session (creates sub-session, inherits group)
     #[arg(short = 'P', long)]
@@ -83,7 +87,7 @@ pub struct AddArgs {
     trust_hooks: bool,
 
     /// Extra arguments to append after the agent binary
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     extra_args: Option<String>,
 
     /// Override the agent binary command
@@ -113,21 +117,55 @@ pub struct AddArgs {
     #[cfg(feature = "serve")]
     #[arg(long = "model")]
     model: Option<String>,
+
+    /// Create the session in a fresh scratch directory under
+    /// `<app_dir>/scratch/<id>/` instead of a project path. The directory is
+    /// removed when the session is deleted (unless `aoe rm` is given
+    /// `--keep-scratch`). Mutually exclusive with worktree-related flags.
+    #[arg(
+        long = "scratch",
+        conflicts_with_all = [
+            "worktree_branch",
+            "create_branch",
+            "base_branch",
+            "extra_repos",
+            "projects",
+            "no_submodules",
+        ]
+    )]
+    scratch: bool,
 }
 
+#[tracing::instrument(target = "cli.add", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
-    let mut path = if args.path.as_os_str() == "." {
-        std::env::current_dir()?
+    // Scratch sessions have no project path; the scratch directory is
+    // provisioned below once we know the instance id. Reject an
+    // explicitly-passed path loudly so `aoe add /some/repo --scratch` does
+    // not silently drop the path arg.
+    if args.scratch && args.path.is_some() {
+        bail!(
+            "Cannot specify a project path with --scratch\nTip: drop the path argument, the session runs in a fresh scratch directory"
+        );
+    }
+
+    let mut path = if args.scratch {
+        // Placeholder; the real path is set after `Instance::new` runs and
+        // `scratch::provision_scratch_dir` returns a fresh scratch dir.
+        PathBuf::new()
     } else {
-        if !args.path.exists() {
-            bail!("Path does not exist: {}", args.path.display());
+        let raw = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
+        if raw.as_os_str() == "." {
+            std::env::current_dir()?
+        } else {
+            if !raw.exists() {
+                bail!("Path does not exist: {}", raw.display());
+            }
+            raw.canonicalize()
+                .with_context(|| format!("Failed to resolve path: {}", raw.display()))?
         }
-        args.path
-            .canonicalize()
-            .with_context(|| format!("Failed to resolve path: {}", args.path.display()))?
     };
 
-    if !path.is_dir() {
+    if !args.scratch && !path.is_dir() {
         bail!("Path is not a directory: {}", path.display());
     }
 
@@ -148,7 +186,17 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     all_extra_repos.extend(args.extra_repos.iter().cloned());
     all_extra_repos.extend(resolved_project_paths);
 
-    let config = repo_config::resolve_config_with_repo_or_warn(profile, &path);
+    // Scratch sessions have no project repo, so repo-scoped config
+    // overrides have nothing to anchor on. Resolving the repo-aware
+    // variant against the launch directory would silently pick up
+    // `.agent-of-empires/config.toml` from whatever folder the user
+    // happened to run `aoe add --scratch` in, which breaks the
+    // project-less contract. Fall back to the profile-only resolver.
+    let config = if args.scratch {
+        crate::session::profile_config::resolve_config_or_warn(profile)
+    } else {
+        repo_config::resolve_config_with_repo_or_warn(profile, &path)
+    };
 
     // Preserve the original project path for hook trust checking.
     // `path` gets reassigned to the worktree/workspace directory below,
@@ -202,55 +250,88 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             let git_wt =
                 GitWorktree::new(main_repo_path.clone())?.with_init_submodules(init_submodules);
 
-            let session_id = uuid::Uuid::new_v4().to_string();
-            let session_id_short = &session_id[..8];
-
-            // Choose appropriate template based on repo type (bare vs regular)
-            // Use main_repo_path (not path) to correctly detect bare repos when running from a worktree
-            let template = if GitWorktree::is_bare_repo(&main_repo_path) {
-                &config.worktree.bare_repo_path_template
-            } else {
-                &config.worktree.path_template
-            };
-            let worktree_path = git_wt.compute_path(branch, template, session_id_short)?;
-
-            if worktree_path.exists() {
-                bail!(
-                    "Worktree already exists at {}\nTip: Use 'aoe add {}' to add the existing worktree",
-                    worktree_path.display(),
-                    worktree_path.display()
-                );
-            }
-
-            println!("Creating worktree at: {}", worktree_path.display());
-            let base = if args.create_branch {
-                args.base_branch.as_deref()
+            // Attach mode: when `-b` is not passed, mirror the TUI's "Attach
+            // to existing branch" behavior. If a worktree already exists
+            // for this branch, point the session at it instead of bailing.
+            // This closes the CLI half of #969 / matches builder.rs.
+            let attach_existing = !args.create_branch;
+            let existing_match = if attach_existing {
+                git_wt.list_worktrees().ok().and_then(|wts| {
+                    wts.into_iter()
+                        .find(|wt| wt.branch.as_deref() == Some(branch))
+                })
             } else {
                 None
             };
-            let warnings =
-                git_wt.create_worktree(branch, &worktree_path, args.create_branch, base)?;
 
-            path = worktree_path;
+            if let Some(existing) = existing_match {
+                println!(
+                    "Attaching to existing worktree: {}",
+                    existing.path.display()
+                );
+                path = existing.path;
+                worktree_info_opt = Some(WorktreeInfo {
+                    branch: branch.to_string(),
+                    main_repo_path: main_repo_path.to_string_lossy().to_string(),
+                    managed_by_aoe: false,
+                    created_at: Utc::now(),
+                    base_branch: None,
+                });
+            } else {
+                let session_id = uuid::Uuid::new_v4().to_string();
+                let session_id_short = &session_id[..8];
 
-            worktree_info_opt = Some(WorktreeInfo {
-                branch: branch.to_string(),
-                main_repo_path: main_repo_path.to_string_lossy().to_string(),
-                managed_by_aoe: true,
-                created_at: Utc::now(),
-                base_branch: base.map(|s| s.to_string()),
-            });
+                // Choose appropriate template based on repo type (bare vs regular)
+                // Use main_repo_path (not path) to correctly detect bare repos when running from a worktree
+                let template = if GitWorktree::is_bare_repo(&main_repo_path) {
+                    &config.worktree.bare_repo_path_template
+                } else {
+                    &config.worktree.path_template
+                };
+                let worktree_path = git_wt.compute_path(branch, template, session_id_short)?;
 
-            for w in &warnings {
-                eprintln!("⚠ {}", w);
+                if worktree_path.exists() {
+                    bail!(
+                        "Worktree already exists at {}\nTip: Use 'aoe add {}' to add the existing worktree",
+                        worktree_path.display(),
+                        worktree_path.display()
+                    );
+                }
+
+                println!("Creating worktree at: {}", worktree_path.display());
+                let base = if args.create_branch {
+                    args.base_branch.as_deref()
+                } else {
+                    None
+                };
+                let warnings =
+                    git_wt.create_worktree(branch, &worktree_path, args.create_branch, base)?;
+
+                path = worktree_path;
+
+                worktree_info_opt = Some(WorktreeInfo {
+                    branch: branch.to_string(),
+                    main_repo_path: main_repo_path.to_string_lossy().to_string(),
+                    managed_by_aoe: true,
+                    created_at: Utc::now(),
+                    base_branch: base.map(|s| s.to_string()),
+                });
+
+                for w in &warnings {
+                    eprintln!("⚠ {}", w);
+                }
+
+                println!("✓ Worktree created successfully");
             }
-
-            println!("✓ Worktree created successfully");
         }
     }
 
     let storage = Storage::new(profile)?;
-    let (mut instances, groups) = storage.load_with_groups()?;
+    // Phase 1 (unlocked): pre-flight read of the current persisted state to
+    // resolve `--parent`, generate a non-colliding title, and make
+    // best-effort duplicate / parent decisions before any side effects.
+    // Final duplicate enforcement happens under the flock in phase 3.
+    let (instances, _groups) = storage.load_with_groups()?;
 
     // Resolve parent session if specified
     let mut group_path = args.group.clone();
@@ -273,6 +354,13 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 "Session already exists with same title and path: {}",
                 trimmed_title
             );
+            cleanup_partial_session(
+                &path,
+                worktree_info_opt.as_ref(),
+                workspace_info_opt.as_ref(),
+                args.create_branch,
+                None,
+            );
             return Ok(());
         }
         trimmed_title.to_string()
@@ -282,6 +370,13 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             println!(
                 "Session already exists with same title and path: {}",
                 branch_title
+            );
+            cleanup_partial_session(
+                &path,
+                worktree_info_opt.as_ref(),
+                workspace_info_opt.as_ref(),
+                args.create_branch,
+                None,
             );
             return Ok(());
         }
@@ -294,6 +389,16 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     let mut instance = Instance::new(&final_title, path.to_str().unwrap_or(""));
     instance.source_profile = profile.to_string();
 
+    // Scratch sessions: provision a fresh scratch directory keyed on the
+    // freshly-generated instance id. The session layer owns the location
+    // (`<app_dir>/scratch/<id>/`) and the deletion guard.
+    if args.scratch {
+        let dir = crate::session::scratch::provision_scratch_dir(&instance.id)?;
+        path = dir;
+        instance.project_path = path.to_string_lossy().to_string();
+        instance.scratch = true;
+    }
+
     if let Some(group) = &group_path {
         instance.group_path = group.trim().to_string();
     }
@@ -302,7 +407,13 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         instance.parent_session_id = Some(parent);
     }
 
-    if let Some(cmd) = &args.command {
+    if let Some(tool) = &args.tool {
+        let selection = resolve_named_tool(tool, &config)?;
+        if selection.is_custom() && args.cmd_override.is_some() {
+            bail!("--cmd-override cannot be used with configured custom agent --tool selections");
+        }
+        instance.tool = selection.name().to_string();
+    } else if let Some(cmd) = &args.command {
         let tool_name = detect_tool(cmd)?;
         // Verify the agent binary is actually on PATH before creating the session
         if let Some(agent_def) = crate::agents::get_agent(&tool_name) {
@@ -436,7 +547,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             );
             if let Some(spec) = registry.get(&agent_name) {
                 if !crate::cli::cockpit::command_present(&spec.command) {
-                    let hint = crate::cli::cockpit::install_hint_for(&spec.command)
+                    let hint = crate::cockpit::install_hints::install_hint_for(&spec.command)
                         .unwrap_or("install via your package manager and re-run");
                     bail!(
                         "cockpit ACP adapter `{}` is not installed or not on $PATH.\n\
@@ -471,6 +582,13 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 );
             }
         } else {
+            // Surface env-resolution warnings before container creation so
+            // typos and missing host vars don't silently produce empty
+            // values inside the sandbox. Same source the TUI path uses.
+            for w in crate::session::validate_env_entries(&config.sandbox.environment) {
+                eprintln!("⚠ {}", w);
+            }
+
             let container_name = containers::DockerContainer::generate_name(&instance.id);
             let image = args
                 .sandbox_image
@@ -492,7 +610,14 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // Use the original project path for trust checking (not the worktree/workspace
     // path, which won't contain `.agent-of-empires/config.toml`).
     let hook_result: Result<()> = (|| {
-        let resolved_hooks: Option<crate::session::HooksConfig> =
+        let resolved_hooks: Option<crate::session::HooksConfig> = if args.scratch {
+            // Scratch sessions never have a `.agent-of-empires/config.toml`
+            // anchored on `original_project_path` (the path is either
+            // empty or the scratch dir itself). Skip the repo hook
+            // trust prompt entirely and fall back to profile-level
+            // hooks so the project-less contract stays intact.
+            repo_config::resolve_global_profile_hooks(profile)
+        } else {
             match repo_config::check_hook_trust(&original_project_path) {
                 Ok(repo_config::HookTrustStatus::NeedsTrust { hooks, hooks_hash }) => {
                     let should_trust = if args.trust_hooks {
@@ -535,15 +660,17 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     repo_config::resolve_global_profile_hooks(profile)
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to check repo hooks: {}", e);
+                    tracing::warn!(target: "cli.add", "Failed to check repo hooks: {}", e);
                     repo_config::resolve_global_profile_hooks(profile)
                 }
-            };
+            }
+        };
 
         if let Some(hooks) = resolved_hooks {
             if !hooks.on_create.is_empty() {
                 println!("Running on_create hooks...");
-                repo_config::execute_hooks(&hooks.on_create, &path)?;
+                let hook_env = repo_config::lifecycle_env_vars(&instance);
+                repo_config::execute_hooks(&hooks.on_create, &path, &hook_env)?;
                 println!("✓ on_create hooks completed");
             }
         }
@@ -551,41 +678,71 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     })();
 
     if let Err(e) = hook_result {
-        // Clean up worktree if we created one
-        if let Some(ref wt_info) = instance.worktree_info {
-            if wt_info.managed_by_aoe {
-                if let Ok(git_wt) =
-                    crate::git::GitWorktree::new(std::path::PathBuf::from(&wt_info.main_repo_path))
-                {
-                    let _ = git_wt.remove_worktree(&path, false);
-                }
-            }
-        }
-        // Clean up workspace worktrees if we created them
-        if let Some(ref ws_info) = instance.workspace_info {
-            for repo in &ws_info.repos {
-                if repo.managed_by_aoe {
-                    let wt_path = PathBuf::from(&repo.worktree_path);
-                    let main_repo = PathBuf::from(&repo.main_repo_path);
-                    if let Ok(git_wt) = crate::git::GitWorktree::new(main_repo) {
-                        let _ = git_wt.remove_worktree(&wt_path, false);
-                    }
-                }
-            }
-            let _ = std::fs::remove_dir_all(&ws_info.workspace_dir);
-        }
+        cleanup_partial_session(
+            &path,
+            instance.worktree_info.as_ref(),
+            instance.workspace_info.as_ref(),
+            args.create_branch,
+            if instance.scratch {
+                Some(std::path::Path::new(&instance.project_path))
+            } else {
+                None
+            },
+        );
         return Err(e);
     }
 
-    instances.push(instance.clone());
-
-    // Rebuild group tree
-    let mut group_tree = GroupTree::new_with_groups(&instances, &groups);
-    if !instance.group_path.is_empty() {
-        group_tree.create_group(&instance.group_path);
+    let persist_result = storage.update(|all_instances, groups| {
+        if is_duplicate_session(
+            all_instances,
+            &instance.title,
+            instance.project_path.as_str(),
+        ) {
+            return Ok(false);
+        }
+        all_instances.push(instance.clone());
+        if !instance.group_path.is_empty() {
+            let mut group_tree = GroupTree::new_with_groups(all_instances, groups);
+            group_tree.create_group(&instance.group_path);
+            *groups = group_tree.get_all_groups();
+        }
+        Ok(true)
+    });
+    match persist_result {
+        Ok(true) => {}
+        Ok(false) => {
+            println!(
+                "Session already exists with same title and path: {}",
+                instance.title
+            );
+            cleanup_partial_session(
+                &path,
+                instance.worktree_info.as_ref(),
+                instance.workspace_info.as_ref(),
+                args.create_branch,
+                if instance.scratch {
+                    Some(std::path::Path::new(&instance.project_path))
+                } else {
+                    None
+                },
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            cleanup_partial_session(
+                &path,
+                instance.worktree_info.as_ref(),
+                instance.workspace_info.as_ref(),
+                args.create_branch,
+                if instance.scratch {
+                    Some(std::path::Path::new(&instance.project_path))
+                } else {
+                    None
+                },
+            );
+            return Err(e);
+        }
     }
-
-    storage.save_with_groups(&instances, &group_tree)?;
 
     println!("✓ Added session: {}", final_title);
     println!("  Profile: {}", storage.profile());
@@ -600,6 +757,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     }
     if instance.sandbox_info.is_some() {
         println!("  Sandbox: enabled");
+    }
+    if instance.scratch {
+        println!("  Scratch:  yes");
     }
     if instance.yolo_mode {
         println!("  YOLO:    enabled");
@@ -635,15 +795,55 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             );
         }
     } else if args.launch {
-        let idx = instances
-            .iter()
-            .position(|i| i.id == instance.id)
-            .expect("just added instance");
-        instances[idx].start_with_size(crate::terminal::get_size())?;
-        storage.save_with_groups(&instances, &group_tree)?;
+        // Persist Status::Error + last_error on launch failure rather than
+        // cleanup_partial_session: row is committed; surface as broken.
+        let id = instance.id.clone();
+        match instance.start_with_size(crate::terminal::get_size()) {
+            Ok(()) => {
+                let landed = storage.update(|all_instances, _groups| {
+                    if let Some(stored) = all_instances.iter_mut().find(|i| i.id == id) {
+                        stored.merge_post_start(&instance);
+                        Ok(true)
+                    } else {
+                        tracing::warn!(
+                            target: "session.cli",
+                            session_id = %id,
+                            "session row removed by peer between insert and launch-merge; tmux session is now orphan"
+                        );
+                        Ok(false)
+                    }
+                })?;
+                if !landed {
+                    anyhow::bail!(
+                        "Session {} was removed by another process before launch could land; tmux session is now orphan",
+                        instance.title
+                    );
+                }
 
-        let tmux_session = crate::tmux::Session::new(&instance.id, &instance.title)?;
-        tmux_session.attach()?;
+                let tmux_session = crate::tmux::Session::new(&instance.id, &instance.title)?;
+                tmux_session.attach()?;
+            }
+            Err(e) => {
+                if let Err(rollback_err) = storage.update(|all_instances, _groups| {
+                    if let Some(stored) = all_instances.iter_mut().find(|i| i.id == id) {
+                        stored.status = crate::session::Status::Error;
+                    }
+                    Ok(())
+                }) {
+                    tracing::error!(
+                        target: "session.store",
+                        "Failed to persist Status::Error rollback for {}: {}; row may show stale Starting status",
+                        id,
+                        rollback_err
+                    );
+                }
+                eprintln!(
+                    "Warning: launch failed: {}. Retry with: aoe session start {}",
+                    e, final_title
+                );
+                return Err(e);
+            }
+        }
     } else {
         println!();
         println!("Next steps:");
@@ -652,6 +852,46 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn cleanup_partial_session(
+    path: &std::path::Path,
+    worktree_info: Option<&crate::session::WorktreeInfo>,
+    workspace_info: Option<&crate::session::WorkspaceInfo>,
+    created_branch: bool,
+    scratch_dir: Option<&std::path::Path>,
+) {
+    if let Some(wt) = worktree_info {
+        if wt.managed_by_aoe {
+            if let Ok(git_wt) = crate::git::GitWorktree::new(PathBuf::from(&wt.main_repo_path)) {
+                let _ = git_wt.remove_worktree(path, false);
+                if created_branch {
+                    let _ = git_wt.delete_branch(&wt.branch);
+                }
+            }
+        }
+    }
+    if let Some(ws) = workspace_info {
+        for repo in &ws.repos {
+            if repo.managed_by_aoe {
+                if let Ok(git_wt) =
+                    crate::git::GitWorktree::new(PathBuf::from(&repo.main_repo_path))
+                {
+                    let _ =
+                        git_wt.remove_worktree(std::path::Path::new(&repo.worktree_path), false);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&ws.workspace_dir);
+    }
+    // Remove the scratch directory provisioned earlier in this run.
+    // Guarded by `is_scratch_path` (same check the deletion path uses),
+    // so a tampered or unexpected `project_path` is a no-op.
+    if let Some(scratch) = scratch_dir {
+        if crate::session::scratch::is_scratch_path(scratch) {
+            let _ = std::fs::remove_dir_all(scratch);
+        }
+    }
 }
 
 pub fn is_duplicate_session(instances: &[Instance], title: &str, path: &str) -> bool {
@@ -699,4 +939,84 @@ fn detect_tool(cmd: &str) -> Result<String> {
                 crate::agents::agent_names().join(", ")
             )
         })
+}
+
+enum NamedToolSelection {
+    Custom(String),
+    BuiltIn(String),
+}
+
+impl NamedToolSelection {
+    fn name(&self) -> &str {
+        match self {
+            Self::Custom(name) | Self::BuiltIn(name) => name,
+        }
+    }
+
+    fn is_custom(&self) -> bool {
+        matches!(self, Self::Custom(_))
+    }
+}
+
+fn resolve_named_tool(tool: &str, config: &crate::session::Config) -> Result<NamedToolSelection> {
+    let name = tool.trim();
+    if name.is_empty() {
+        bail!("--tool requires a non-empty agent name");
+    }
+
+    if let Some(command) = config.session.custom_agents.get(name) {
+        if command.trim().is_empty() {
+            bail!("custom agent '{name}' has an empty configured command");
+        }
+        if let Some(detect_as) = config
+            .session
+            .agent_detect_as
+            .get(name)
+            .map(|target| target.trim())
+            .filter(|target| !target.is_empty())
+        {
+            if crate::agents::get_agent(detect_as).is_none() {
+                bail!(
+                    "custom agent '{name}' maps agent_detect_as to unknown agent '{detect_as}'. Known agents: {}",
+                    crate::agents::agent_names().join(", ")
+                );
+            }
+        }
+        return Ok(NamedToolSelection::Custom(name.to_string()));
+    }
+
+    if let Some(tool_name) = crate::agents::resolve_tool_name(name) {
+        if let Some(agent_def) = crate::agents::get_agent(tool_name) {
+            if !crate::tmux::is_agent_available(agent_def) {
+                bail!(
+                    "'{}' is not installed or not on $PATH.\n\
+                     Install with: {}\n\
+                     See all supported agents: aoe agents",
+                    agent_def.binary,
+                    agent_def.install_hint
+                );
+            }
+        }
+        return Ok(NamedToolSelection::BuiltIn(tool_name.to_string()));
+    }
+
+    let mut safe_names: Vec<String> = crate::agents::agent_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    safe_names.extend(
+        config
+            .session
+            .custom_agents
+            .keys()
+            .filter(|name| !name.is_empty())
+            .cloned(),
+    );
+    safe_names.sort();
+    safe_names.dedup();
+
+    bail!(
+        "Unknown tool: {name}\nSupported built-in and configured custom agents: {}",
+        safe_names.join(", ")
+    )
 }

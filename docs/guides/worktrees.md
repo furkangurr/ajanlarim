@@ -9,7 +9,7 @@ For workflow guidance, see the [Workflow Guide](workflow.md).
 | Feature | CLI | TUI |
 |---------|-----|-----|
 | Create new branch | Use `-b` flag | Always creates new branch |
-| Use existing branch | Omit `-b` flag | Not supported |
+| Use existing branch | Omit `-b` flag | "Attach to existing branch" toggle (TUI: `Ctrl+P`; web: in the session step under the branch field) |
 | Branch validation | Checks if branch exists | None (always creates) |
 | Pick a base branch | `--base-branch <name>` | `Base` field in `Ctrl+P` overlay |
 
@@ -22,7 +22,9 @@ aoe add . -w feat/my-feature -b
 # Create worktree session (new branch, branched off a specific base)
 aoe add . -w hotfix-1 -b --base-branch release-1.2
 
-# Create worktree session (existing branch)
+# Attach to an existing branch + worktree (or check out the branch into a
+# new worktree if no worktree exists yet). The `-b` flag is what flips
+# between "create a new branch" and "attach"; omitting it = attach.
 aoe add . -w feat/my-feature
 
 # List all worktrees
@@ -42,10 +44,19 @@ aoe remove <session> --delete-worktree
 ```
 
 `--base-branch` only matters with `--new-branch` / `-b`. The base is
-resolved against the remote first (`origin/<base>`), then against a
-local branch with that name, so passing a teammate's not-yet-fetched
-branch works without a manual `git fetch`. When omitted, the new
-branch is based on the repository's default branch (`main`/`master`).
+resolved against the remote first, then against a local branch with
+that name, so passing a teammate's not-yet-fetched branch works
+without a manual `git fetch`. When omitted, the new branch is based
+on the repository's default branch (`main`/`master`).
+
+Remote selection scores every configured remote (not just `origin`),
+for both the autodetected default branch (issue \#1029) and an
+explicit `--base-branch` (issue \#1511). In a fork plus `upstream`
+layout where `upstream/main` is ahead of `origin/main`, aoe fetches
+and branches off `upstream/main` even when you typed `main` into the
+wizard's base-branch field. Ties break in favor of `origin` so the
+historical single-remote behavior still applies when there is no
+freshness signal.
 
 ## TUI Keyboard Shortcuts
 
@@ -59,7 +70,7 @@ branch is based on the repository's default branch (`main`/`master`).
 
 In the TUI, enable the Worktree checkbox to create a new branch and worktree. By default, the worktree name is derived from the session title. Press `Ctrl+P` on the Worktree field to set an explicit `Name`, attach to an existing branch, pick a `Base` branch the new branch is based on (defaults to the repo default), or configure extra repos. `Ctrl+P` on the `Base` field opens a branch picker over local and remote-tracking branches.
 
-The web dashboard's new-session wizard exposes the same control under an "Advanced" disclosure beneath the worktree name input; it shows a typeahead populated from local + remote branches via `GET /api/git/branches?include_remote=true`.
+The web dashboard's new-session wizard exposes the same control under an "Advanced" disclosure beneath the worktree name input; it shows a typeahead populated from local + remote branches via `GET /api/git/branches?include_remote=true`. The same step also exposes an "Attach to existing branch" toggle that flips the request from "create new branch" to "attach to whichever branch is named" — when on, the server re-uses any existing worktree for that branch and otherwise checks the branch out into a new worktree. Mirrors the TUI / CLI behavior (CLI: omit `-b`). See #969.
 
 ## Configuration
 
@@ -107,17 +118,31 @@ path_template = "/absolute/path/to/worktrees/{repo-name}/{branch}"
 path_template = "../wt/{branch}-{session-id}"
 ```
 
-## Post-Checkout Hooks
+## Worktree Warnings
 
-Some repos install pre-commit hooks at the `post-checkout` stage (`uv-sync`, `npm install`, LFS smudge, etc.) that fire when `git worktree add` checks out the new branch. If such a hook fails, the worktree directory and its `.git` pointer have already been created, and the worktree is usable. AOE no longer aborts session creation in that case: the hook output is captured and surfaced as a warning.
+Two classes of non-fatal failures surface through the same warning channel during session create. AOE does not abort the session; instead it captures the failure and surfaces it so you know what to investigate.
 
-| Surface | Where the warning appears |
+| Surface | Where warnings appear |
 |---|---|
 | CLI (`aoe add`) | `⚠ <message>` line on stderr after `✓ Worktree created successfully` |
 | TUI | `Worktree warnings` info dialog opens after the session is added |
 | Web | Toast per warning, plus `warnings: string[]` on the `POST /api/sessions` response body |
 
+### Post-checkout hooks
+
+Some repos install pre-commit hooks at the `post-checkout` stage (`uv-sync`, `npm install`, LFS smudge, etc.) that fire when `git worktree add` checks out the new branch. If such a hook fails, the worktree directory and its `.git` pointer have already been created, and the worktree is usable.
+
 Common cause: the hook calls a tool (uv, npm, pip) that needs network access or credentials the new worktree does not yet have. Re-run the hook manually inside the worktree once the environment is set up, or disable it for AOE-created worktrees by configuring `core.hooksPath` per checkout.
+
+### Fetch failures
+
+Before checking out the new branch, AOE runs `git fetch <remote> <branch>` so the worktree starts from the latest remote state. Network errors, missing remotes, SSH key issues, and 10s timeouts no longer pass silently; they surface as warnings shaped like:
+
+```text
+git fetch <remote> <branch> failed for <repo>: <stderr>
+```
+
+The session is still created when the fetch fails. The worktree branches off whatever local ref already exists, which may be stale. Multi-repo sessions emit one warning per repo whose fetch failed, so a single bad remote in a workspace of five repos shows up as one toast rather than aborting the whole workspace. See issue \#1511 for the rationale.
 
 ## Performance & Debug Logging
 

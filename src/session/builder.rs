@@ -42,6 +42,11 @@ pub struct InstanceParams {
     pub command_override: String,
     /// Additional repository paths for multi-repo workspace mode
     pub extra_repo_paths: Vec<String>,
+    /// Scratch session: ignore `path`, provision a fresh directory under
+    /// `<app_dir>/scratch/<id>/`, and persist `instance.scratch = true` so
+    /// the deletion path removes the directory. Mutually exclusive with
+    /// worktree/workspace and with non-empty `extra_repo_paths`.
+    pub scratch: bool,
 }
 
 /// Result of building an instance, tracking what was created for cleanup purposes.
@@ -200,7 +205,7 @@ pub fn create_workspace(
                                 )
                                 .map_err(|e| format!("{}: {}", repo_name, e))
                         })();
-                        tracing::info!(
+                        tracing::info!(target: "session.create",
                             "workspace create: repo={} elapsed={:?} ok={}",
                             repo_name,
                             repo_start.elapsed(),
@@ -218,7 +223,7 @@ pub fn create_workspace(
                 })
                 .collect()
         });
-    tracing::info!(
+    tracing::info!(target: "session.create",
         "workspace create: {} repos completed in {:?}",
         plans.len(),
         create_start.elapsed()
@@ -300,6 +305,15 @@ pub fn build_instance(
         bail!("{} does not support worktree mode.", params.tool);
     }
 
+    if params.scratch {
+        if params.worktree_enabled {
+            bail!("Cannot combine --scratch with worktree mode");
+        }
+        if !params.extra_repo_paths.is_empty() {
+            bail!("Cannot combine --scratch with extra repository paths");
+        }
+    }
+
     if params.sandbox {
         let runtime = containers::get_container_runtime();
         if !runtime.is_available() {
@@ -310,17 +324,32 @@ pub fn build_instance(
         }
     }
 
+    // Scratch sessions have no project repo, so config resolution falls
+    // back to global+profile defaults (`Path::new("")` makes
+    // `resolve_config_with_repo` skip the repo-config layer cleanly).
+    let config_path = if params.scratch {
+        std::path::PathBuf::new()
+    } else {
+        std::path::PathBuf::from(&params.path)
+    };
     let config =
-        super::repo_config::resolve_config_with_repo(profile, std::path::Path::new(&params.path))
-            .unwrap_or_else(|e| {
-                tracing::warn!("Failed to load config, using defaults: {}", e);
-                Config::default()
-            });
+        super::repo_config::resolve_config_with_repo(profile, &config_path).unwrap_or_else(|e| {
+            tracing::warn!(target: "session.create", "Failed to load config, using defaults: {}", e);
+            Config::default()
+        });
 
-    let mut final_path = PathBuf::from(&params.path)
-        .canonicalize()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| params.path.clone());
+    let mut final_path = if params.scratch {
+        // Provisioning happens after `Instance::new` so we can key the
+        // directory on the generated instance id. Leave `final_path` empty
+        // for now; the worktree/workspace and path-existence blocks below
+        // are gated on the same flag.
+        String::new()
+    } else {
+        PathBuf::from(&params.path)
+            .canonicalize()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| params.path.clone())
+    };
 
     let mut worktree_info = None;
     let mut created_worktree = None;
@@ -468,18 +497,27 @@ pub fn build_instance(
         }
     }
 
-    // Validate that the final path exists and is a directory.
-    // This catches cases where the user typed a non-existent path in the TUI;
-    // without this check tmux silently falls back to the home directory.
-    let final_path_buf = PathBuf::from(&final_path);
-    if !final_path_buf.exists() {
-        bail!("Project path does not exist: {}", final_path);
-    }
-    if !final_path_buf.is_dir() {
-        bail!("Project path is not a directory: {}", final_path);
+    // For scratch sessions, `final_path` is intentionally empty here; the
+    // scratch directory is provisioned below after `Instance::new` runs (we
+    // need the instance id to name the directory). For all other sessions,
+    // catch the typed-a-bad-path case before tmux silently falls back to
+    // the home directory.
+    if !params.scratch {
+        let final_path_buf = PathBuf::from(&final_path);
+        if !final_path_buf.exists() {
+            bail!("Project path does not exist: {}", final_path);
+        }
+        if !final_path_buf.is_dir() {
+            bail!("Project path is not a directory: {}", final_path);
+        }
     }
 
     let mut instance = Instance::new(&final_title, &final_path);
+    if params.scratch {
+        let dir = super::scratch::provision_scratch_dir(&instance.id)?;
+        instance.project_path = dir.to_string_lossy().to_string();
+        instance.scratch = true;
+    }
     instance.group_path = params.group;
     instance.tool = params.tool.clone();
     instance.detect_as = config
@@ -506,6 +544,12 @@ pub fn build_instance(
             instance.command = resolved;
         }
     }
+    if instance.command.trim().is_empty() && crate::agents::get_agent(&params.tool).is_none() {
+        bail!(
+            "No launch command resolved for custom agent '{}'. Config may have changed since validation.",
+            params.tool
+        );
+    }
     if !params.extra_args.is_empty() {
         instance.extra_args = params.extra_args;
     } else if let Some(extra) = config.session.agent_extra_args.get(&params.tool) {
@@ -515,6 +559,17 @@ pub fn build_instance(
     }
 
     if params.sandbox {
+        // Surface env-resolution warnings up-front. `collect_environment`
+        // silently drops entries whose host source var is unset (typo,
+        // shell sourcing gap, daemon's frozen env). Without this check
+        // the value is missing in the container with no UI signal.
+        let effective_env: &[String] = if params.extra_env.is_empty() {
+            &config.sandbox.environment
+        } else {
+            &params.extra_env
+        };
+        warnings.extend(crate::session::validate_env_entries(effective_env));
+
         instance.sandbox_info = Some(SandboxInfo {
             enabled: true,
             container_id: None,
@@ -548,10 +603,29 @@ pub fn cleanup_instance(
     created_worktree: Option<&CreatedWorktree>,
     created_workspace_worktrees: &[CreatedWorktree],
 ) {
+    // Scratch dirs are provisioned eagerly inside `build_instance`
+    // (well before this helper's other cleanup targets exist), so an
+    // abort between provisioning and the caller finishing the session
+    // would otherwise leak the directory on disk. Guard the removal
+    // through `is_scratch_path` so a tampered `project_path` cannot
+    // wipe unrelated app data.
+    if instance.scratch {
+        let scratch_path = PathBuf::from(&instance.project_path);
+        if super::scratch::is_scratch_path(&scratch_path) {
+            if let Err(e) = std::fs::remove_dir_all(&scratch_path) {
+                tracing::warn!(
+                    target: "session.create",
+                    "Failed to clean up scratch dir: {}",
+                    e
+                );
+            }
+        }
+    }
+
     if let Some(wt) = created_worktree {
         if let Ok(git_wt) = GitWorktree::new(wt.main_repo_path.clone()) {
             if let Err(e) = git_wt.remove_worktree(&wt.path, false) {
-                tracing::warn!("Failed to clean up worktree: {}", e);
+                tracing::warn!(target: "session.create", "Failed to clean up worktree: {}", e);
             }
         }
     }
@@ -560,7 +634,7 @@ pub fn cleanup_instance(
     for wt in created_workspace_worktrees {
         if let Ok(git_wt) = GitWorktree::new(wt.main_repo_path.clone()) {
             if let Err(e) = git_wt.remove_worktree(&wt.path, false) {
-                tracing::warn!("Failed to clean up workspace worktree: {}", e);
+                tracing::warn!(target: "session.create", "Failed to clean up workspace worktree: {}", e);
             }
         }
     }
@@ -574,7 +648,7 @@ pub fn cleanup_instance(
             let container = containers::DockerContainer::from_session_id(&instance.id);
             if container.exists().unwrap_or(false) {
                 if let Err(e) = container.remove(true) {
-                    tracing::warn!("Failed to clean up container: {}", e);
+                    tracing::warn!(target: "session.create", "Failed to clean up container: {}", e);
                 }
             }
         }
@@ -1042,5 +1116,220 @@ mod tests {
             "single-failure path should not use multi-error wording: {msg}"
         );
         assert!(msg.contains("repo-solo-fail"), "repo name missing: {msg}");
+    }
+
+    fn isolated_app_dir(temp_home: &std::path::Path) -> std::path::PathBuf {
+        #[cfg(target_os = "linux")]
+        {
+            let config_home = temp_home.join(".config");
+            std::env::set_var("XDG_CONFIG_HOME", &config_home);
+            config_home.join(crate::session::APP_DIR_NAME_LINUX)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            temp_home.join(crate::session::APP_DIR_NAME_OTHER)
+        }
+    }
+
+    fn custom_agent_params(project_path: &std::path::Path, tool: &str) -> InstanceParams {
+        InstanceParams {
+            title: "custom session".to_string(),
+            path: project_path.to_string_lossy().to_string(),
+            group: String::new(),
+            tool: tool.to_string(),
+            worktree_enabled: false,
+            worktree_branch: None,
+            create_new_branch: false,
+            base_branch: None,
+            sandbox: false,
+            sandbox_image: "ubuntu:latest".to_string(),
+            yolo_mode: false,
+            extra_env: Vec::new(),
+            extra_args: String::new(),
+            command_override: String::new(),
+            extra_repo_paths: Vec::new(),
+            scratch: false,
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_instance_preserves_custom_agent_detect_as_mapping() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let app_dir = isolated_app_dir(temp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            r#"
+                [session.custom_agents]
+                remote-claude = "ssh -t host claude"
+
+                [session.agent_detect_as]
+                remote-claude = "claude"
+            "#,
+        )
+        .unwrap();
+        let project = tempfile::tempdir().unwrap();
+
+        let result = build_instance(
+            custom_agent_params(project.path(), "remote-claude"),
+            &[],
+            &[],
+            "default",
+        )
+        .unwrap();
+
+        assert_eq!(result.instance.tool, "remote-claude");
+        assert_eq!(result.instance.command, "ssh -t host claude");
+        assert_eq!(result.instance.detect_as, "claude");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_instance_keeps_empty_detect_as_without_mapping() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let app_dir = isolated_app_dir(temp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            r#"
+                [session.custom_agents]
+                remote-opencode = "ssh -t host opencode"
+            "#,
+        )
+        .unwrap();
+        let project = tempfile::tempdir().unwrap();
+
+        let result = build_instance(
+            custom_agent_params(project.path(), "remote-opencode"),
+            &[],
+            &[],
+            "default",
+        )
+        .unwrap();
+
+        assert_eq!(result.instance.tool, "remote-opencode");
+        assert_eq!(result.instance.command, "ssh -t host opencode");
+        assert_eq!(result.instance.detect_as, "");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_instance_rejects_custom_agent_without_resolved_command() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let app_dir = isolated_app_dir(temp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("config.toml"), "").unwrap();
+        let project = tempfile::tempdir().unwrap();
+
+        let result = build_instance(
+            custom_agent_params(project.path(), "remote-missing"),
+            &[],
+            &[],
+            "default",
+        );
+        let err = match result {
+            Ok(_) => panic!("custom agent without a command should fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("No launch command resolved for custom agent 'remote-missing'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_instance_rejects_custom_agent_with_whitespace_only_command() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let app_dir = isolated_app_dir(temp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            r#"
+                [session.custom_agents]
+                whitespace-agent = "   "
+            "#,
+        )
+        .unwrap();
+        let project = tempfile::tempdir().unwrap();
+
+        let result = build_instance(
+            custom_agent_params(project.path(), "whitespace-agent"),
+            &[],
+            &[],
+            "default",
+        );
+        let err = match result {
+            Ok(_) => panic!("custom agent with whitespace-only command should fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("No launch command resolved for custom agent 'whitespace-agent'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_instance_scratch_provisions_app_dir() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let app_dir = isolated_app_dir(temp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("config.toml"), "").unwrap();
+
+        let mut params = custom_agent_params(std::path::Path::new(""), "claude");
+        params.tool = "claude".to_string();
+        params.path = String::new();
+        params.scratch = true;
+        params.sandbox = false;
+
+        let result = build_instance(params, &[], &[], "default")
+            .expect("scratch build must succeed without a project path");
+
+        assert!(
+            result.instance.scratch,
+            "scratch flag must be persisted on the instance"
+        );
+        let provisioned = std::path::PathBuf::from(&result.instance.project_path);
+        assert!(provisioned.exists());
+        assert!(super::super::scratch::is_scratch_path(&provisioned));
+
+        let _ = std::fs::remove_dir_all(&provisioned);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_instance_rejects_scratch_with_worktree() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let app_dir = isolated_app_dir(temp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("config.toml"), "").unwrap();
+
+        let mut params = custom_agent_params(std::path::Path::new(""), "claude");
+        params.tool = "claude".to_string();
+        params.scratch = true;
+        params.worktree_enabled = true;
+        params.worktree_branch = Some("feat".to_string());
+
+        let err = match build_instance(params, &[], &[], "default") {
+            Ok(_) => panic!("scratch + worktree must error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string()
+                .contains("Cannot combine --scratch with worktree mode"),
+            "unexpected error: {err}"
+        );
     }
 }

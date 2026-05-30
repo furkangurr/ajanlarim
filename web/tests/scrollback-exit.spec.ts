@@ -1,5 +1,6 @@
-import { test, expect, devices, type Page } from "@playwright/test";
-import { clickSidebarSession } from "./helpers/sidebar";
+import { test, expect } from "./helpers/mockedTest";
+import { devices, type Page } from "@playwright/test";
+import { clickSidebarSession, openMobileSidebar } from "./helpers/sidebar";
 import {
   mockTerminalApis,
   installTerminalSpies,
@@ -14,8 +15,11 @@ import {
 // Desktop keeps tmux's default copy-mode-with-`-e` behavior untouched.
 test.use({ ...devices["iPhone 13"] });
 
-const WHEEL_UP_SEQ = "\x1b[<64;1;1M";
-const WHEEL_DOWN_SEQ = "\x1b[<65;1;1M";
+// SGR mouse wheel sequences are `\x1b[<64;<col>;<row>M` (up) and
+// `\x1b[<65;...M` (down). Coordinates now track the pointer, so match
+// by the button-code prefix and count one hit per emitted event.
+const WHEEL_UP_SEQ = "\x1b[<64;";
+const WHEEL_DOWN_SEQ = "\x1b[<65;";
 const ESC = "\x1b";
 
 function countSeq(handle: MockHandle, seq: string): number {
@@ -32,13 +36,9 @@ function countSeq(handle: MockHandle, seq: string): number {
 }
 
 async function openSession(page: Page) {
-  const sidebarToggle = page.getByRole("button", { name: "Toggle sidebar" });
-  if (await sidebarToggle.isVisible()) {
-    await sidebarToggle.click();
-    await page.waitForTimeout(300);
-  }
+  await openMobileSidebar(page);
   await clickSidebarSession(page, "pinch-test");
-  await page.locator(".wterm").waitFor({ state: "visible", timeout: 10_000 });
+  await page.locator(".xterm").waitFor({ state: "visible", timeout: 10_000 });
 }
 
 async function swipeUp(page: Page, travel: number) {

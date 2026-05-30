@@ -256,6 +256,18 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         preserve_files: &[],
         clean_files: &[],
     },
+    AgentConfigMount {
+        tool_name: "antigravity",
+        host_rel: ".gemini/antigravity-cli",
+        container_suffix: ".gemini/antigravity-cli",
+        skip_entries: &["sandbox", "logs", "cache"],
+        seed_files: &[],
+        copy_dirs: &["plugins"],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &["antigravity-oauth-token"],
+        clean_files: &[],
+    },
 ];
 
 /// Sync host agent config into the shared sandbox directory. Copies top-level files
@@ -292,7 +304,7 @@ fn sync_agent_config(
     // just potentially overwriting container-side customizations).
     let has_prior_data = sandbox_dir.join("projects").exists();
     if has_prior_data {
-        tracing::info!(
+        tracing::info!(target: "session.profile",
             "sync_agent_config: sandbox={} has prior session data, skipping general file copy",
             sandbox_dir.display()
         );
@@ -311,7 +323,7 @@ fn sync_agent_config(
         let metadata = match std::fs::metadata(entry.path()) {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!("Skipping {}: {}", entry.path().display(), e);
+                tracing::warn!(target: "session.profile", "Skipping {}: {}", entry.path().display(), e);
                 continue;
             }
         };
@@ -320,7 +332,7 @@ fn sync_agent_config(
             if copy_dirs.iter().any(|&d| d == name_str.as_ref()) {
                 let dest = sandbox_dir.join(&name);
                 if let Err(e) = copy_dir_recursive(&entry.path(), &dest) {
-                    tracing::warn!("Failed to copy dir {}: {}", name_str, e);
+                    tracing::warn!(target: "session.profile", "Failed to copy dir {}: {}", name_str, e);
                 }
             }
             continue;
@@ -342,7 +354,7 @@ fn sync_agent_config(
         }
 
         if let Err(e) = std::fs::copy(entry.path(), &dest) {
-            tracing::warn!("Failed to copy {}: {}", name_str, e);
+            tracing::warn!(target: "session.profile", "Failed to copy {}: {}", name_str, e);
         }
     }
 
@@ -377,7 +389,7 @@ fn rewrite_claude_plugin_paths(sandbox_dir: &Path, host_home: &Path) -> Result<(
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!("Failed to read {}: {}", path.display(), e);
+                tracing::warn!(target: "session.profile", "Failed to read {}: {}", path.display(), e);
                 continue;
             }
         };
@@ -385,7 +397,7 @@ fn rewrite_claude_plugin_paths(sandbox_dir: &Path, host_home: &Path) -> Result<(
         let mut value: serde_json::Value = match serde_json::from_str(&content) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!("Failed to parse {}: {}", path.display(), e);
+                tracing::warn!(target: "session.profile", "Failed to parse {}: {}", path.display(), e);
                 continue;
             }
         };
@@ -396,7 +408,7 @@ fn rewrite_claude_plugin_paths(sandbox_dir: &Path, host_home: &Path) -> Result<(
         if changed {
             let serialized = serde_json::to_string(&value)?;
             if let Err(e) = std::fs::write(&path, serialized) {
-                tracing::warn!("Failed to write {}: {}", path.display(), e);
+                tracing::warn!(target: "session.profile", "Failed to write {}: {}", path.display(), e);
             }
         }
     }
@@ -492,7 +504,7 @@ fn extract_keychain_credential(service: &str, dest: &Path) -> Result<bool> {
         // Exit code 36 = errSecInteractionNotAllowed (keychain locked or ACL denied)
         // Exit code 44 = errSecItemNotFound
         if code == 36 {
-            tracing::warn!(
+            tracing::warn!(target: "session.profile",
                 "Keychain access denied for service '{}' (exit code 36). \
                  The keychain may be locked. Run 'security unlock-keychain' and restart. \
                  Stderr: {}",
@@ -500,13 +512,13 @@ fn extract_keychain_credential(service: &str, dest: &Path) -> Result<bool> {
                 stderr.trim()
             );
         } else if code == 44 {
-            tracing::debug!(
+            tracing::debug!(target: "session.profile",
                 "No keychain entry found for service '{}' (account '{}')",
                 service,
                 user
             );
         } else {
-            tracing::warn!(
+            tracing::warn!(target: "session.profile",
                 "Failed to extract keychain credential for service '{}' \
                  (account '{}', exit code {}): {}",
                 service,
@@ -521,7 +533,7 @@ fn extract_keychain_credential(service: &str, dest: &Path) -> Result<bool> {
     let content = String::from_utf8_lossy(&output.stdout);
     let trimmed = content.trim();
     if trimmed.is_empty() {
-        tracing::warn!(
+        tracing::warn!(target: "session.profile",
             "Keychain entry for service '{}' exists but has empty content",
             service
         );
@@ -532,7 +544,7 @@ fn extract_keychain_credential(service: &str, dest: &Path) -> Result<bool> {
     if dest.exists() {
         if let Ok(existing_content) = std::fs::read_to_string(dest) {
             if !should_overwrite_credential(&existing_content, trimmed) {
-                tracing::debug!(
+                tracing::debug!(target: "session.profile",
                     "Keychain credential for '{}' is not fresher than sandbox, keeping sandbox",
                     service,
                 );
@@ -542,7 +554,7 @@ fn extract_keychain_credential(service: &str, dest: &Path) -> Result<bool> {
     }
 
     std::fs::write(dest, trimmed)?;
-    tracing::debug!(
+    tracing::debug!(target: "session.profile",
         "Extracted keychain credential for '{}' -> {}",
         service,
         dest.display()
@@ -568,7 +580,7 @@ fn prepare_sandbox_dir(mount: &AgentConfigMount, home: &Path) -> Result<std::pat
         let path = sandbox_dir.join(name);
         if path.exists() {
             if let Err(e) = std::fs::remove_file(&path) {
-                tracing::warn!("Failed to clean {}: {}", path.display(), e);
+                tracing::warn!(target: "session.profile", "Failed to clean {}: {}", path.display(), e);
             }
         }
     }
@@ -585,7 +597,7 @@ fn prepare_sandbox_dir(mount: &AgentConfigMount, home: &Path) -> Result<std::pat
 
         if mount.tool_name == "claude" {
             if let Err(e) = rewrite_claude_plugin_paths(&sandbox_dir, home) {
-                tracing::warn!(
+                tracing::warn!(target: "session.profile",
                     "Failed to rewrite Claude plugin paths in {}: {}",
                     sandbox_dir.display(),
                     e
@@ -595,7 +607,7 @@ fn prepare_sandbox_dir(mount: &AgentConfigMount, home: &Path) -> Result<std::pat
 
         if let Some((service, filename)) = mount.keychain_credential {
             if let Err(e) = extract_keychain_credential(service, &sandbox_dir.join(filename)) {
-                tracing::warn!(
+                tracing::warn!(target: "session.profile",
                     "Failed to extract keychain credential for {}: {}",
                     mount.host_rel,
                     e
@@ -806,14 +818,147 @@ pub(crate) fn refresh_agent_configs() {
         return;
     };
 
+    let hooks_enabled = super::config::Config::load()
+        .map(|c| c.session.agent_status_hooks)
+        .unwrap_or(true);
+
     for mount in AGENT_CONFIG_MOUNTS {
-        if let Err(e) = prepare_sandbox_dir(mount, &home) {
-            tracing::warn!(
-                "Failed to refresh agent config for {}: {}",
-                mount.host_rel,
-                e
-            );
+        let refresh_codex_hooks = hooks_enabled && should_refresh_codex_hooks(mount, &home);
+        let preserved_codex_state = if refresh_codex_hooks {
+            let config_path = home
+                .join(mount.host_rel)
+                .join(SANDBOX_SUBDIR)
+                .join("config.toml");
+            match crate::hooks::snapshot_codex_hooks_state(&config_path) {
+                Ok(state) => state,
+                Err(e) => {
+                    tracing::warn!(target: "session.profile",
+                        "Failed to read Codex sandbox hook state from {}: {}",
+                        config_path.display(),
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        match prepare_sandbox_dir(mount, &home) {
+            Ok(sandbox_dir) => {
+                if refresh_codex_hooks {
+                    refresh_codex_sandbox_hooks(&sandbox_dir, preserved_codex_state);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "session.profile",
+                    "Failed to refresh agent config for {}: {}",
+                    mount.host_rel,
+                    e
+                );
+            }
         }
+    }
+}
+
+fn should_refresh_codex_hooks(mount: &AgentConfigMount, home: &Path) -> bool {
+    if mount.tool_name != "codex" || mount.host_rel != ".codex" {
+        return false;
+    }
+
+    let host_config = home.join(mount.host_rel).join("config.toml");
+    let sandbox_config = home
+        .join(mount.host_rel)
+        .join(SANDBOX_SUBDIR)
+        .join("config.toml");
+    host_config.exists() || sandbox_config.exists()
+}
+
+fn refresh_codex_sandbox_hooks(sandbox_dir: &Path, preserved_state: Option<toml_edit::Item>) {
+    let Some(hook_cfg) = crate::agents::get_agent("codex").and_then(|a| a.hook_config.as_ref())
+    else {
+        return;
+    };
+
+    let config_path = sandbox_dir.join("config.toml");
+    if let Err(e) = crate::hooks::install_codex_hooks_with_preserved_state(
+        &config_path,
+        hook_cfg.events,
+        preserved_state,
+    ) {
+        tracing::warn!(
+            "Failed to refresh Codex hooks in sandbox config {}: {}",
+            config_path.display(),
+            e
+        );
+    }
+}
+
+fn resolve_active_agent(
+    tool: &str,
+    detect_as: Option<&str>,
+    session_config: &super::config::SessionConfig,
+) -> Option<&'static crate::agents::AgentDef> {
+    crate::agents::get_agent(tool)
+        .or_else(|| {
+            detect_as
+                .filter(|name| !name.is_empty())
+                .and_then(crate::agents::get_agent)
+        })
+        .or_else(|| {
+            session_config
+                .agent_detect_as
+                .get(tool)
+                .and_then(|detect_as| crate::agents::get_agent(detect_as))
+        })
+}
+
+fn agent_config_container_path(
+    mount: &AgentConfigMount,
+    container_home: &str,
+    environment: &[EnvEntry],
+) -> String {
+    let default_path = format!("{}/{}", container_home, mount.container_suffix);
+    if mount.tool_name != "codex" || mount.host_rel != ".codex" {
+        return default_path;
+    }
+
+    let Some(codex_home) = environment
+        .iter()
+        .find(|entry| entry.key() == "CODEX_HOME")
+        .map(EnvEntry::value)
+    else {
+        return default_path;
+    };
+
+    if codex_home == "/" || !codex_home.starts_with('/') {
+        tracing::warn!(
+            "Ignoring sandbox CODEX_HOME for Codex config mount because it is not a usable absolute container directory: {}",
+            codex_home
+        );
+        return default_path;
+    }
+
+    let normalized = codex_home.trim_end_matches('/');
+    if normalized.is_empty() {
+        tracing::warn!(
+            "Ignoring sandbox CODEX_HOME for Codex config mount because it resolves to an empty container directory"
+        );
+        return default_path;
+    }
+
+    normalized.to_string()
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ContainerAgentSelection<'a> {
+    tool: &'a str,
+    detect_as: Option<&'a str>,
+}
+
+impl<'a> ContainerAgentSelection<'a> {
+    pub(crate) fn new(tool: &'a str, detect_as: Option<&'a str>) -> Self {
+        Self { tool, detect_as }
     }
 }
 
@@ -825,7 +970,7 @@ pub(crate) fn refresh_agent_configs() {
 pub(crate) fn build_container_config(
     project_path_str: &str,
     sandbox_info: &SandboxInfo,
-    tool: &str,
+    agent_selection: ContainerAgentSelection<'_>,
     is_yolo_mode: bool,
     instance_id: &str,
     workspace_info: Option<&super::WorkspaceInfo>,
@@ -834,6 +979,15 @@ pub(crate) fn build_container_config(
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
 
     let project_path = Path::new(project_path_str);
+    let resolved_profile = super::config::effective_profile(profile);
+    let profile_session_config =
+        super::profile_config::resolve_config_or_warn(&resolved_profile).session;
+    let active_agent = resolve_active_agent(
+        agent_selection.tool,
+        agent_selection.detect_as,
+        &profile_session_config,
+    );
+    let config_tool = active_agent.map_or(agent_selection.tool, |agent| agent.name);
 
     // Determine mount path(s) and working directory.
     // For multi-repo workspaces, mount the workspace dir and all main repos.
@@ -859,10 +1013,9 @@ pub(crate) fn build_container_config(
     let mut volumes = project_volumes;
 
     let sandbox_config = {
-        let resolved_profile = super::config::effective_profile(profile);
         match super::repo_config::resolve_config_with_repo(&resolved_profile, project_path) {
             Ok(c) => {
-                tracing::debug!(
+                tracing::debug!(target: "session.profile",
                     "Loaded sandbox config: extra_volumes={:?}, mount_ssh={}, volume_ignores={:?}",
                     c.sandbox.extra_volumes,
                     c.sandbox.mount_ssh,
@@ -871,13 +1024,15 @@ pub(crate) fn build_container_config(
                 c.sandbox
             }
             Err(e) => {
-                tracing::warn!("Failed to load config, using defaults: {}", e);
+                tracing::warn!(target: "session.profile", "Failed to load config, using defaults: {}", e);
                 Default::default()
             }
         }
     };
 
     const CONTAINER_HOME: &str = "/root";
+
+    let mut environment = collect_environment(&sandbox_config, sandbox_info);
 
     let gitconfig = home.join(".gitconfig");
     if gitconfig.exists() {
@@ -905,7 +1060,7 @@ pub(crate) fn build_container_config(
     // just because the user has the flag exported globally.
     // `GOOGLE_APPLICATION_CREDENTIALS` is not forwarded as an env var; client libraries
     // discover the well-known path automatically.
-    if tool == "claude" && super::environment::host_vertex_enabled() {
+    if agent_selection.tool == "claude" && super::environment::host_vertex_enabled() {
         let container_cred_path = format!(
             "{}/.config/gcloud/application_default_credentials.json",
             CONTAINER_HOME
@@ -919,7 +1074,7 @@ pub(crate) fn build_container_config(
                     read_only: true,
                 });
             } else {
-                tracing::warn!(
+                tracing::warn!(target: "session.profile",
                     "GOOGLE_APPLICATION_CREDENTIALS points to non-existent file: {}",
                     cred_path
                 );
@@ -939,13 +1094,16 @@ pub(crate) fn build_container_config(
     // Sync host agent config into a shared sandbox directory per agent and
     // bind-mount it read-write. Only mount the config for the active tool.
     // Agent definitions are in AGENT_CONFIG_MOUNTS -- add new agents there, not here.
-    for mount in AGENT_CONFIG_MOUNTS.iter().filter(|m| m.tool_name == tool) {
-        let container_path = format!("{}/{}", CONTAINER_HOME, mount.container_suffix);
+    for mount in AGENT_CONFIG_MOUNTS
+        .iter()
+        .filter(|m| m.tool_name == config_tool)
+    {
+        let container_path = agent_config_container_path(mount, CONTAINER_HOME, &environment);
 
         let sandbox_dir = match prepare_sandbox_dir(mount, &home) {
             Ok(dir) => dir,
             Err(e) => {
-                tracing::warn!(
+                tracing::warn!(target: "session.profile",
                     "Failed to prepare sandbox dir for {}, skipping: {}",
                     mount.host_rel,
                     e
@@ -954,7 +1112,7 @@ pub(crate) fn build_container_config(
             }
         };
 
-        tracing::debug!(
+        tracing::debug!(target: "session.profile",
             "Sandbox dir ready for {}, binding {} -> {}",
             mount.host_rel,
             sandbox_dir.display(),
@@ -980,19 +1138,17 @@ pub(crate) fn build_container_config(
         }
     }
 
-    let hooks_enabled = super::config::Config::load()
-        .map(|c| c.session.agent_status_hooks)
-        .unwrap_or(true);
-    if let Some(agent) = crate::agents::get_agent(tool) {
+    let hooks_enabled = profile_session_config.agent_status_hooks;
+    if let Some(agent) = active_agent {
         if hooks_enabled {
             // Hermes (YAML) and Kiro (per-agent JSON) use schemas the generic
             // hook_config path below cannot emit, so they're special-cased here.
-            let hermes_hooks = tool == "hermes";
-            let kiro_hooks = tool == "kiro";
+            let hermes_hooks = agent.name == "hermes";
+            let kiro_hooks = agent.name == "kiro";
             if hermes_hooks || kiro_hooks || agent.hook_config.is_some() {
                 let hook_dir = crate::hooks::hook_status_dir(instance_id);
                 if let Err(e) = std::fs::create_dir_all(&hook_dir) {
-                    tracing::warn!(
+                    tracing::warn!(target: "session.profile",
                         "Failed to create hook directory {}: {}",
                         hook_dir.display(),
                         e
@@ -1009,28 +1165,35 @@ pub(crate) fn build_container_config(
                 let sandbox_dir = home.join(".hermes").join(SANDBOX_SUBDIR);
                 let config_file = sandbox_dir.join("config.yaml");
                 if let Err(e) = crate::hooks::install_hermes_hooks(&config_file) {
-                    tracing::warn!("Failed to install hermes hooks in sandbox: {}", e);
+                    tracing::warn!(target: "session.profile", "Failed to install hermes hooks in sandbox: {}", e);
                 }
             } else if kiro_hooks {
                 let sandbox_dir = home.join(".kiro").join(SANDBOX_SUBDIR);
                 let config_file = sandbox_dir.join("agents").join("aoe-hooks.json");
                 if let Err(e) = crate::hooks::install_kiro_hooks(&config_file) {
-                    tracing::warn!("Failed to install kiro hooks in sandbox: {}", e);
+                    tracing::warn!(target: "session.profile", "Failed to install kiro hooks in sandbox: {}", e);
                 }
             } else if let Some(hook_cfg) = &agent.hook_config {
-                // Install hooks into sandbox settings.json for the containerized agent.
+                // Install hooks into the sandbox config file for the containerized agent.
                 // Shell one-liners work inside containers since they only use sh/mkdir/printf.
-                let config_dir_name = std::path::Path::new(hook_cfg.settings_rel_path)
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."));
+                let rel_path = std::path::Path::new(hook_cfg.settings_rel_path);
+                let config_dir_name = rel_path.parent().unwrap_or(std::path::Path::new("."));
+                let config_file_name = rel_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("settings.json");
                 // Find the matching agent config mount to locate the sandbox dir
                 for mount in AGENT_CONFIG_MOUNTS {
-                    if mount.host_rel == config_dir_name.to_string_lossy() {
+                    if std::path::Path::new(mount.host_rel) == config_dir_name {
                         let sandbox_dir = home.join(mount.host_rel).join(SANDBOX_SUBDIR);
-                        let settings_file = sandbox_dir.join("settings.json");
-                        if let Err(e) = crate::hooks::install_hooks(&settings_file, hook_cfg.events)
-                        {
-                            tracing::warn!("Failed to install hooks in sandbox settings: {}", e);
+                        let settings_file = sandbox_dir.join(config_file_name);
+                        let result = if agent.name == "codex" {
+                            crate::hooks::install_codex_hooks(&settings_file, hook_cfg.events)
+                        } else {
+                            crate::hooks::install_hooks(&settings_file, hook_cfg.events)
+                        };
+                        if let Err(e) = result {
+                            tracing::warn!(target: "session.profile", "Failed to install hooks in sandbox config: {}", e);
                         }
                         break;
                     }
@@ -1039,9 +1202,7 @@ pub(crate) fn build_container_config(
         }
     }
 
-    let mut environment = collect_environment(&sandbox_config, sandbox_info);
-
-    if let Some(agent) = crate::agents::get_agent(tool) {
+    if let Some(agent) = active_agent {
         for &(key, value) in agent.container_env {
             environment.push(EnvEntry::Literal {
                 key: key.to_string(),
@@ -1060,7 +1221,7 @@ pub(crate) fn build_container_config(
 
     // Add extra_volumes from config (host:container format)
     // Also collect container paths to filter conflicting volume_ignores later
-    tracing::debug!(
+    tracing::debug!(target: "session.profile",
         "extra_volumes from config: {:?}",
         sandbox_config.extra_volumes
     );
@@ -1069,7 +1230,7 @@ pub(crate) fn build_container_config(
     for entry in &sandbox_config.extra_volumes {
         let parts: Vec<&str> = entry.splitn(3, ':').collect();
         if parts.len() >= 2 {
-            tracing::info!(
+            tracing::info!(target: "session.profile",
                 "Mounting extra volume: {} -> {} (ro: {})",
                 parts[0],
                 parts[1],
@@ -1082,7 +1243,7 @@ pub(crate) fn build_container_config(
                 read_only: parts.get(2) == Some(&"ro"),
             });
         } else {
-            tracing::warn!("Ignoring malformed extra_volume entry: {}", entry);
+            tracing::warn!(target: "session.profile", "Ignoring malformed extra_volume entry: {}", entry);
         }
     }
 
@@ -1117,7 +1278,7 @@ pub(crate) fn build_container_config(
         if seen.insert(vol.container_path.clone()) {
             deduped.push(vol);
         } else {
-            tracing::debug!("Dropping duplicate mount for {}", vol.container_path);
+            tracing::debug!(target: "session.profile", "Dropping duplicate mount for {}", vol.container_path);
         }
     }
     deduped.reverse();
@@ -1795,6 +1956,17 @@ mod tests {
         assert_eq!(hermes_mounts.len(), 1);
         assert_eq!(hermes_mounts[0].host_rel, ".hermes");
 
+        let antigravity_mounts: Vec<_> = AGENT_CONFIG_MOUNTS
+            .iter()
+            .filter(|m| m.tool_name == "antigravity")
+            .collect();
+        assert_eq!(antigravity_mounts.len(), 1);
+        assert_eq!(antigravity_mounts[0].host_rel, ".gemini/antigravity-cli");
+        assert_eq!(
+            antigravity_mounts[0].container_suffix,
+            ".gemini/antigravity-cli"
+        );
+
         // Unknown tool should match nothing
         let unknown_mounts: Vec<_> = AGENT_CONFIG_MOUNTS
             .iter()
@@ -2336,7 +2508,7 @@ extra_volumes = ["/host/data:/container/data:ro"]
         let config = build_container_config(
             project_path_str,
             &sandbox_info,
-            "claude",
+            ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
             None,
@@ -2383,6 +2555,414 @@ extra_volumes = ["/host/data:/container/data:ro"]
             "extra_volumes should include /host/data:/container/data, got: {:?}",
             volume_pairs
         );
+    }
+
+    /// Regression: when project_path is a sibling worktree, `.agent-of-empires/config.toml`
+    /// lives in the main repo, not the worktree. `build_container_config` must
+    /// resolve repo config from the main repo path so extra_volumes still mount.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_sibling_worktree_loads_main_repo_extra_volumes() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(target_os = "linux")]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        // Main repo with repo config under .agent-of-empires/
+        let parent = TempDir::new().unwrap();
+        let main_repo = parent.path().join("main");
+        fs::create_dir_all(&main_repo).unwrap();
+        let repo = git2::Repository::init(&main_repo).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Initial", &tree, &[])
+            .unwrap();
+
+        let config_dir = main_repo.join(".agent-of-empires");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            r#"
+[sandbox]
+extra_volumes = ["/host/screenshots:/root/screenshots"]
+"#,
+        )
+        .unwrap();
+
+        // Sibling worktree under <parent>/worktrees/feat
+        let worktree_path = parent.path().join("worktrees").join("feat");
+        fs::create_dir_all(worktree_path.parent().unwrap()).unwrap();
+        let out = std::process::Command::new("git")
+            .args(["worktree", "add", worktree_path.to_str().unwrap(), "HEAD"])
+            .current_dir(&main_repo)
+            .output()
+            .expect("git worktree add");
+        if !out.status.success() {
+            // git not available or worktree add failed; skip.
+            return;
+        }
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+
+        let config = build_container_config(
+            worktree_path.to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("claude", None),
+            false,
+            "test-instance-id",
+            None,
+            "",
+        )
+        .unwrap();
+
+        let volume_pairs: Vec<(&str, &str)> = config
+            .volumes
+            .iter()
+            .map(|v| (v.host_path.as_str(), v.container_path.as_str()))
+            .collect();
+        assert!(
+            volume_pairs.contains(&("/host/screenshots", "/root/screenshots")),
+            "extra_volumes from main-repo config should mount in sibling worktree session, got: {:?}",
+            volume_pairs
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_installs_codex_hooks_files() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(target_os = "linux")]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+        let instance_id = "codex-sandbox-hooks-test";
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            false,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
+
+        let codex_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
+        assert!(codex_sandbox.join("config.toml").exists());
+        assert!(!codex_sandbox.join("hooks.json").exists());
+        assert!(!codex_sandbox.join("settings.json").exists());
+        let codex_config = fs::read_to_string(codex_sandbox.join("config.toml")).unwrap();
+        assert!(codex_config.contains("[[hooks.PreToolUse]]"));
+        assert!(codex_config.contains("aoe-hooks"));
+        assert!(config.volumes.iter().any(|v| {
+            v.host_path == codex_sandbox.to_string_lossy() && v.container_path == "/root/.codex"
+        }));
+
+        let hook_dir = crate::hooks::hook_status_dir(instance_id);
+        assert!(
+            config
+                .volumes
+                .iter()
+                .any(|v| v.host_path == hook_dir.to_string_lossy()),
+            "status hook directory should be mounted"
+        );
+        crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_respects_profile_hooks_disabled() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(target_os = "linux")]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let profile_dir = crate::session::get_profile_dir("sandbox-hooks-disabled").unwrap();
+        fs::write(
+            profile_dir.join("config.toml"),
+            "[session]\nagent_status_hooks = false\n",
+        )
+        .unwrap();
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+        let instance_id = "codex-sandbox-hooks-disabled-test";
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            false,
+            instance_id,
+            None,
+            "sandbox-hooks-disabled",
+        )
+        .unwrap();
+
+        let codex_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
+        assert!(!codex_sandbox.join("config.toml").exists());
+
+        let hook_dir = crate::hooks::hook_status_dir(instance_id);
+        assert!(
+            !config
+                .volumes
+                .iter()
+                .any(|v| v.host_path == hook_dir.to_string_lossy()),
+            "status hook directory should not be mounted when profile disables hooks"
+        );
+        crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_uses_detected_codex_for_custom_wrapper_hooks() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(target_os = "linux")]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let mut global = crate::session::config::Config::default();
+        global.session.agent_status_hooks = false;
+        crate::session::config::save_config(&global).unwrap();
+
+        let profile_dir = crate::session::get_profile_dir("sandbox-wrapped-codex").unwrap();
+        fs::write(
+            profile_dir.join("config.toml"),
+            r#"[session]
+agent_status_hooks = true
+agent_detect_as = { "wrapped-codex" = "codex" }
+"#,
+        )
+        .unwrap();
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+        let instance_id = "wrapped-codex-sandbox-hooks-test";
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("wrapped-codex", None),
+            false,
+            instance_id,
+            None,
+            "sandbox-wrapped-codex",
+        )
+        .unwrap();
+
+        let codex_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
+        assert!(codex_sandbox.join("config.toml").exists());
+        assert!(config.volumes.iter().any(|v| {
+            v.host_path == codex_sandbox.to_string_lossy() && v.container_path == "/root/.codex"
+        }));
+
+        let codex_config = fs::read_to_string(codex_sandbox.join("config.toml")).unwrap();
+        assert!(codex_config.contains("[[hooks.PreToolUse]]"));
+        assert!(codex_config.contains("aoe-hooks"));
+
+        let hook_dir = crate::hooks::hook_status_dir(instance_id);
+        assert!(
+            config
+                .volumes
+                .iter()
+                .any(|v| v.host_path == hook_dir.to_string_lossy()),
+            "status hook directory should be mounted for custom Codex wrappers"
+        );
+        crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_refresh_agent_configs_preserves_codex_hooks_and_trust_state() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(target_os = "linux")]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let codex_dir = temp_home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(codex_dir.join("config.toml"), r#"model = "initial""#).unwrap();
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+        let instance_id = "codex-sandbox-refresh-hooks-test";
+        build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            false,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
+
+        let codex_sandbox = codex_dir.join(SANDBOX_SUBDIR);
+        let sandbox_config_path = codex_sandbox.join("config.toml");
+        let mut sandbox_config = fs::read_to_string(&sandbox_config_path).unwrap();
+        sandbox_config.push_str(
+            r#"
+
+[hooks.state.trusted]
+enabled = true
+trusted_hash = "keep"
+"#,
+        );
+        fs::write(&sandbox_config_path, sandbox_config).unwrap();
+        fs::write(codex_dir.join("config.toml"), r#"model = "updated""#).unwrap();
+
+        refresh_agent_configs();
+
+        let config_text = fs::read_to_string(&sandbox_config_path).unwrap();
+        let config: toml::Value = toml::from_str(&config_text).unwrap();
+        assert_eq!(config["model"].as_str(), Some("updated"));
+        assert_eq!(
+            config["hooks"]["state"]["trusted"]["trusted_hash"].as_str(),
+            Some("keep")
+        );
+        assert!(config_text.contains("[[hooks.PreToolUse]]"));
+        assert!(config_text.contains("aoe-hooks"));
+        crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_mounts_codex_home_from_extra_env() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(target_os = "linux")]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: Some(vec!["CODEX_HOME=/root/custom-codex".to_string()]),
+            custom_instruction: None,
+        };
+        let instance_id = "codex-sandbox-extra-env-hooks-test";
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            false,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
+
+        let codex_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
+        assert!(codex_sandbox.join("config.toml").exists());
+        assert!(config.volumes.iter().any(|v| {
+            v.host_path == codex_sandbox.to_string_lossy()
+                && v.container_path == "/root/custom-codex"
+        }));
+        assert!(!config.volumes.iter().any(|v| {
+            v.host_path == codex_sandbox.to_string_lossy() && v.container_path == "/root/.codex"
+        }));
+        crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_mounts_codex_home_from_sandbox_environment() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(target_os = "linux")]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project_dir = TempDir::new().unwrap();
+        let config_dir = project_dir.path().join(".agent-of-empires");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            r#"
+[sandbox]
+environment = ["CODEX_HOME=/root/profile-codex"]
+"#,
+        )
+        .unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+        let instance_id = "codex-sandbox-config-env-hooks-test";
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            false,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
+
+        let codex_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
+        assert!(codex_sandbox.join("config.toml").exists());
+        assert!(config.volumes.iter().any(|v| {
+            v.host_path == codex_sandbox.to_string_lossy()
+                && v.container_path == "/root/profile-codex"
+        }));
+        assert!(!config.volumes.iter().any(|v| {
+            v.host_path == codex_sandbox.to_string_lossy() && v.container_path == "/root/.codex"
+        }));
+        crate::hooks::cleanup_hook_status_dir(instance_id);
     }
 
     /// Regression test: when an instance was created under a non-default profile,
@@ -2464,7 +3044,7 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
         let cfg_personal = build_container_config(
             project_path_str,
             &sandbox_info,
-            "claude",
+            ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
             None,
@@ -2502,7 +3082,7 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
         let cfg_default = build_container_config(
             project_path_str,
             &sandbox_info,
-            "claude",
+            ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
             None,
@@ -2523,7 +3103,7 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
         let cfg_empty = build_container_config(
             project_path_str,
             &sandbox_info,
-            "claude",
+            ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
             None,
@@ -2576,8 +3156,10 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
             return; // git not available, skip
         }
 
-        // Write repo-level config with volume_ignores
-        let config_dir = worktree_path.join(".agent-of-empires");
+        // Write repo-level config in the main repo dir, since
+        // resolve_config_with_repo loads it from there (find_main_repo) even
+        // when the session targets a sibling worktree.
+        let config_dir = repo_path.join(".agent-of-empires");
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
             config_dir.join("config.toml"),
@@ -2601,7 +3183,7 @@ volume_ignores = ["target", "node_modules"]
         let config = build_container_config(
             project_path_str,
             &sandbox_info,
-            "claude",
+            ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
             None,
@@ -2667,8 +3249,10 @@ volume_ignores = ["target", "node_modules"]
             return; // git worktree add failed, skip
         }
 
-        // Write repo-level config with volume_ignores
-        let config_dir = worktree_path.join(".agent-of-empires");
+        // Write repo-level config in the main repo dir, since
+        // resolve_config_with_repo loads it from there (find_main_repo) even
+        // when the session targets a sibling worktree.
+        let config_dir = main_repo_path.join(".agent-of-empires");
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
             config_dir.join("config.toml"),
@@ -2692,7 +3276,7 @@ volume_ignores = ["target"]
         let config = build_container_config(
             project_path_str,
             &sandbox_info,
-            "claude",
+            ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
             None,
@@ -2857,7 +3441,7 @@ volume_ignores = ["target"]
         build_container_config(
             project_dir.to_str().unwrap(),
             &info,
-            tool,
+            ContainerAgentSelection::new(tool, None),
             false,
             "test-instance-id",
             None,

@@ -12,7 +12,7 @@
 //! mpsc channel into ACP requests until shutdown.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -22,26 +22,32 @@ use agent_client_protocol::schema::{
     KillTerminalResponse, LoadSessionRequest, NewSessionRequest, PermissionOptionKind,
     PromptRequest, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
     ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome, SessionId,
-    SessionNotification, SessionUpdate, SetSessionModeRequest, TerminalId, TerminalOutputRequest,
-    TerminalOutputResponse, TextContent, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
-    WriteTextFileRequest, WriteTextFileResponse,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionConfigId, SessionConfigValueId, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TerminalId,
+    TerminalOutputRequest, TerminalOutputResponse, TextContent, WaitForTerminalExitRequest,
+    WaitForTerminalExitResponse, WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
+use super::agent_compat::{self, ExpectedAgent};
+use super::agent_profiles;
 use super::agent_registry::AgentSpec;
 use super::approvals::{is_destructive, ApprovalDecision, Nonce};
-use super::fs_handler::{self, FsPolicy};
+use super::fs_handler::{self, FsPolicy, SandboxPathMap};
 use super::permissions::build_approval;
 use super::state::{
-    AvailableCommand, CockpitSessionId, DiffPreview, Event, ModeInfo, Plan, PlanStep,
-    PlanStepStatus, SessionMode, SessionUsage, ToolCall, UsageCost,
+    AvailableCommand, CockpitSessionId, ConfigOptionCategory, ConfigOptionChoice,
+    ConfigOptionDescriptor, DiffPreview, Event, MemoryRecall, ModeInfo, Plan, PlanStep,
+    PlanStepStatus, RateLimitInfo, SessionMode, SessionUsage, StartupErrorDetail, ToolCall,
+    UsageCost,
 };
 use super::terminal_handler::TerminalManager;
+use crate::session::SandboxInfo;
 
 #[derive(Debug, Error)]
 pub enum AcpError {
@@ -55,6 +61,17 @@ pub enum AcpError {
     /// adapter" copy. See issue #1089.
     #[error("project path no longer exists: {path}")]
     ProjectPathMissing { path: PathBuf },
+    /// The ACP `initialize` handshake completed but the adapter failed
+    /// the per-adapter compatibility policy (see
+    /// `src/cockpit/agent_compat.rs`). Carries the structured detail so
+    /// the supervisor can publish a matching `Event::IncompatibleAgent`
+    /// through the broadcast sink (the in-process event_tx the failed
+    /// `AcpClient::spawn` opened is never delivered, so the structured
+    /// payload has to ride out of band on the typed error). The payload
+    /// is boxed to keep `AcpError` small on the Ok hot path (clippy's
+    /// `result_large_err`).
+    #[error("incompatible agent: {0}")]
+    IncompatibleAgent(Box<IncompatibleAgentError>),
     #[error("transport error: {0}")]
     Transport(String),
     #[error("protocol violation: {0}")]
@@ -67,6 +84,23 @@ pub enum AcpError {
     UnknownNonce,
     #[error("agent did not offer a {0:?} option")]
     NoMatchingOption(ApprovalDecision),
+}
+
+/// Boxed payload for `AcpError::IncompatibleAgent`. Carries the
+/// structured `StartupErrorDetail` plus a pre-formatted free-form
+/// summary the supervisor mirrors into the legacy
+/// `Event::AgentStartupError { message }` channel for status-derivation
+/// callers that don't yet read the structured detail.
+#[derive(Debug)]
+pub struct IncompatibleAgentError {
+    pub detail: super::state::StartupErrorDetail,
+    pub message: String,
+}
+
+impl std::fmt::Display for IncompatibleAgentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 impl AcpError {
@@ -95,20 +129,80 @@ impl AcpError {
     }
 }
 
+/// Inspect an ACP-level error response from a `session/prompt` request
+/// and return a `RateLimitInfo` if the adapter reported a quota/usage
+/// limit hit. claude-agent-acp signals this via `data.errorKind ==
+/// "rate_limit"` on the JSON-RPC error object. Other adapters may
+/// surface the same signal differently; the catch-all message regex in
+/// `classify_rate_limit_from_message` is the defensive fallback.
+///
+/// Reset time is recovered from `data.resets_at` (RFC3339) when
+/// present. Some claude-agent-acp versions only embed the time in the
+/// message text ("resets 12:10pm (Europe/Paris)"); robustly parsing
+/// arbitrary locale strings would require chrono-tz, so the fallback
+/// is `now + 1h` and the message is preserved verbatim in
+/// `RateLimitInfo.status` so the UI can surface the exact text.
+pub(crate) fn classify_rate_limit_error(
+    err: &agent_client_protocol::Error,
+) -> Option<RateLimitInfo> {
+    let data = err.data.as_ref()?;
+    let kind = data.get("errorKind").and_then(|v| v.as_str())?;
+    if kind != "rate_limit" {
+        return None;
+    }
+    let resets_at = data
+        .get("resets_at")
+        .or_else(|| data.get("resetsAt"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::hours(1));
+    Some(RateLimitInfo {
+        status: err.message.clone(),
+        resets_at,
+        kind: kind.to_string(),
+    })
+}
+
+/// Defensive fallback for the connection-task end path. The outer
+/// error type carries no structured `data`, only a Display string, so
+/// match on the fingerprint claude-agent-acp embeds in its error
+/// payload. Hit rate is intentionally narrow: a substring match on
+/// `errorKind":"rate_limit"` only matches the JSON the adapter pastes
+/// into its error message; unrelated logs that mention "rate_limit"
+/// won't trigger.
+pub(crate) fn classify_rate_limit_from_message(message: &str) -> Option<RateLimitInfo> {
+    if !message.contains("\"errorKind\":\"rate_limit\"")
+        && !message.contains("\"errorKind\": \"rate_limit\"")
+    {
+        return None;
+    }
+    Some(RateLimitInfo {
+        status: message.to_string(),
+        resets_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        kind: "rate_limit".to_string(),
+    })
+}
+
 /// Configuration for spawning an ACP agent.
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
+    /// Registry key of the agent (e.g. `"claude"`, `"codex"`,
+    /// `"opencode"`). Used to resolve the static `AgentProfile` that
+    /// gates server-side claude-specific event synthesis and routes
+    /// per-agent slash commands. Defaults to `"claude"` for legacy
+    /// callers; the supervisor passes the real key when it spawns.
+    pub agent_key: String,
     pub spec: AgentSpec,
     pub cwd: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
     /// Provider env vars to forward (after applying the agent's allowlist).
     pub provider_env: Vec<(String, String)>,
-    /// When set, aoe creates a unix socket at this path BEFORE spawning
-    /// the agent and exports `AOE_ACP_SOCKET=<path>` to the agent's env.
-    /// The agent connects to the socket instead of using stdio. Used
-    /// for sandboxed cockpit sessions: the same socket path is bind-
-    /// mounted into the container so the in-container agent can reach
-    /// the host-side aoe.
+    /// Reserved for a future agent-in-container that natively speaks
+    /// the socket transport. The current cockpit sandbox path runs
+    /// `docker exec` from the host-side runner (which already holds the
+    /// daemon↔runner socket) and proxies the agent's stdio across the
+    /// container boundary, so no bind-mount is needed today.
     pub socket_path: Option<PathBuf>,
     /// ACP session id from a previous run, captured during the last
     /// `session/new` and persisted on `Instance.cockpit_acp_session_id`.
@@ -118,6 +212,16 @@ pub struct SpawnConfig {
     /// load failure the task falls back to `session/new` and emits a
     /// `SessionContextReset` event.
     pub stored_acp_session_id: Option<String>,
+    /// When `Some`, the agent runs inside the named Docker container.
+    /// Daemon-side spawn wraps the argv in `docker exec` and the
+    /// fs/terminal handlers route across the container boundary using
+    /// the container_workdir / mount map.
+    pub sandbox_info: Option<SandboxInfo>,
+    /// Source profile of the session. Used together with `sandbox_info`
+    /// to resolve profile-level `sandbox.environment` entries so the
+    /// cockpit sandbox env mirrors the tmux substrate. `None` for
+    /// non-sandboxed sessions.
+    pub source_profile: Option<String>,
 }
 
 /// Commands sent from `AcpClient` methods to the background connection task.
@@ -125,6 +229,14 @@ enum ClientCmd {
     Prompt(String),
     Cancel,
     SetMode(String),
+    /// Send `session/set_config_option` for the given (`config_id`,
+    /// `value`) pair. The connection task fires the request detached so
+    /// the cmd_rx loop keeps polling for Cancel during the round-trip.
+    /// See #1403.
+    SetConfigOption {
+        config_id: String,
+        value: String,
+    },
     Shutdown,
 }
 
@@ -167,6 +279,513 @@ enum ConnectMode {
 /// bounded.
 const RESUME_IDLE_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Grace window between the first `session/cancel` notification (sent
+/// during an in-flight `session/prompt`) and the daemon declaring the
+/// agent unresponsive. When this fires, the connection task ends with
+/// `Stopped { reason: "agent_unresponsive" }` and the supervisor
+/// SIGTERMs the runner before respawning via `session/load`. 10s is
+/// long enough for claude-agent-acp to resolve a real cancel through
+/// the SDK message boundary but short enough that a user who clicked
+/// "Force end turn" isn't watching a frozen UI for 30s while the
+/// daemon waits.
+///
+/// claude-agent-acp >=0.37.0 (upstream #694) now resolves cancel by
+/// returning `PromptResponse { stop_reason: StopReason::Cancelled }`
+/// promptly; in that path the watchdog never fires and the terminal
+/// Stopped reason is `cancelled` (set by `prompt_cancelled` in the
+/// prompt loop) instead of `agent_unresponsive`. The 10s watchdog
+/// stays as a transport-wedge defense: native cancel only protects
+/// against the adapter ignoring the signal, not against socket /
+/// stdout / process-level wedges that prevent the PromptResponse from
+/// reaching the daemon at all. See #1196.
+const CANCEL_ESCALATION_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Vendor-agnostic silent-orphan grace fallback used when no config
+/// value is available. Mirrors `CockpitConfig::silent_orphan_grace_secs`
+/// default. Bumped from 60s to 120s in #1360 so async-agent flows
+/// (Claude SDK `Agent` tool with `isAsync: true`) survive normal sub-
+/// agent wait windows. See `silent_orphan_grace()`.
+const SILENT_ORPHAN_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Minimum effective grace applied when the prompt loop has observed
+/// off-protocol work in the current turn: an async-agent launch
+/// (`OffProtocolWorkKind::AsyncAgent`, see #1360) or a backgrounded
+/// Bash launch (`OffProtocolWorkKind::BackgroundCommand`, see #1401).
+/// The watchdog stays armed but uses this as a floor against the
+/// configured base grace, so an operator who deliberately set a higher
+/// `silent_orphan_grace_secs` still wins. Finite by design: if claude-
+/// agent-acp hangs DURING the off-protocol wait, the watchdog still
+/// recovers after 30 minutes rather than holding the turn open forever.
+/// See #1360, #1401, and upstream `agentclientprotocol/claude-agent-acp#336`.
+const OFF_PROTOCOL_WORK_GRACE_FLOOR: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Accelerated silent-orphan grace fallback used when a cost-populated
+/// `UsageUpdate` notification has arrived for the current prompt. The
+/// daemon treats that frame as claude-agent-acp's "wrap up accounting"
+/// terminal-candidate marker emitted just before `PromptResponse`;
+/// when the prompt response then fails to arrive, recovery doesn't
+/// need the full vendor-agnostic grace. Mirrors
+/// `CockpitConfig::silent_orphan_fast_grace_secs` default. See
+/// `silent_orphan_fast_grace()`.
+const SILENT_ORPHAN_FAST_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Cadence at which the silent-orphan select arm wakes up to evaluate
+/// whether the watchdog should fire. Polling cadence rather than reset-
+/// on-signal so the prompt loop owns the timer without needing the
+/// notification handler to reach back into a pinned `tokio::time::sleep`.
+const SILENT_ORPHAN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Classification of an inbound ACP `SessionUpdate` for the silent-
+/// orphan watchdog state machine. Sent from the notification handler
+/// to the prompt loop via a dedicated mpsc; the prompt loop owns the
+/// `Instant`-based timers and the tool-id map, so the handler doesn't
+/// need to touch shared atomics on the hot path.
+#[derive(Debug, Clone)]
+pub(crate) enum LifecycleSignal {
+    /// Transcript-producing event that resets the silent-orphan timer:
+    /// `AgentMessageChunk`, `AgentThoughtChunk`, `Plan`, or a
+    /// non-terminal `ToolCallUpdate` other than `InProgress`.
+    Progress,
+    /// A new tool call has started (`SessionUpdate::ToolCall`) or
+    /// transitioned to `InProgress` (`ToolCallUpdate`). Added to the
+    /// prompt-loop's `tool_calls_in_flight` map; while non-empty, the
+    /// watchdog stays suppressed so long-running tools (npm install,
+    /// Playwright runs, Task subagents) never false-positive.
+    /// `is_background_task` carries the Claude SDK `run_in_background`
+    /// flag from `raw_input` when available; the prompt loop uses it to
+    /// flip `off_protocol_work_seen` at completion time even if the
+    /// completion content marker is stripped or reshaped. See #1401.
+    ToolStarted {
+        id: String,
+        is_background_task: bool,
+    },
+    /// A tool call reached terminal status (`Completed` or `Failed`).
+    /// Removed from `tool_calls_in_flight`; when the map drains to
+    /// empty after at least one progress event, the watchdog arms.
+    /// `off_protocol_work` is `Some(_)` when the completion content
+    /// text carries one of the Claude SDK markers detected by
+    /// `detect_off_protocol_work_completed`. The matching `ToolStarted`'s
+    /// `is_background_task` flag is only honored when `succeeded == true`
+    /// (the prompt loop branches on this in `apply_signal`); a failed
+    /// background launch must not pin the watchdog open for 30 minutes.
+    /// See #1360, #1401, and upstream
+    /// `agentclientprotocol/claude-agent-acp#336`.
+    ToolCompleted {
+        id: String,
+        succeeded: bool,
+        off_protocol_work: Option<OffProtocolWorkKind>,
+    },
+    /// Cost-populated `UsageUpdate`: claude-agent-acp's "wrap up
+    /// accounting" marker. Switches the effective grace from the
+    /// vendor-agnostic default to the accelerated value for this
+    /// prompt only. Does NOT count as progress (it's accounting
+    /// telemetry, not lifecycle), so the silent-orphan timer keeps
+    /// running from the previous progress event.
+    TerminalUsage,
+    /// The Claude SDK `ScheduleWakeup` tool registered an absolute wake
+    /// timestamp. Suppresses the watchdog until `at + base_grace`,
+    /// converted to a monotonic `Instant` deadline at signal receipt so
+    /// wall-clock jumps don't perturb the suppression. After the
+    /// deadline the watchdog rearms with its normal grace. See #1401.
+    WakeupPending { at: chrono::DateTime<chrono::Utc> },
+}
+
+/// Classify a `SessionUpdate` into a `LifecycleSignal`, or `None` for
+/// ambient state (mode changes, available_commands, raw metadata,
+/// usage-without-cost) that shouldn't influence the silent-orphan
+/// watchdog timer. Out-of-band notifications must NOT reset the timer:
+/// claude-agent-acp can interleave mode and command refreshes mid-turn
+/// or after final accounting, and treating those as progress would
+/// mask the exact wedge the watchdog is designed to detect. See #1240.
+fn classify_lifecycle_signal(
+    update: &agent_client_protocol::schema::SessionUpdate,
+) -> Option<LifecycleSignal> {
+    use agent_client_protocol::schema::{SessionUpdate, ToolCallStatus};
+    match update {
+        SessionUpdate::UsageUpdate(u) if u.cost.is_some() => Some(LifecycleSignal::TerminalUsage),
+        SessionUpdate::AgentMessageChunk(_)
+        | SessionUpdate::AgentThoughtChunk(_)
+        | SessionUpdate::Plan(_) => Some(LifecycleSignal::Progress),
+        SessionUpdate::ToolCall(tc) => {
+            let is_background_task = tc
+                .raw_input
+                .as_ref()
+                .and_then(|v| v.as_object())
+                .and_then(|obj| obj.get("run_in_background"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            Some(LifecycleSignal::ToolStarted {
+                id: tc.tool_call_id.0.to_string(),
+                is_background_task,
+            })
+        }
+        SessionUpdate::ToolCallUpdate(update) => {
+            let id = update.tool_call_id.0.to_string();
+            match update.fields.status {
+                Some(ToolCallStatus::Completed) => {
+                    // Only successful completions can mark a real off-protocol
+                    // work launch. A `Failed` update may carry arbitrary error
+                    // content that happens to mention one of the SDK markers
+                    // (e.g. as part of a stack trace or echoed input), and
+                    // treating that as off-protocol work would pin the watchdog
+                    // suppression for 30 minutes even though no background work
+                    // is actually running. See CodeRabbit feedback on PR #1364.
+                    let off_protocol_work =
+                        detect_off_protocol_work_completed(&update.fields.content);
+                    Some(LifecycleSignal::ToolCompleted {
+                        id,
+                        succeeded: true,
+                        off_protocol_work,
+                    })
+                }
+                Some(ToolCallStatus::Failed) => Some(LifecycleSignal::ToolCompleted {
+                    id,
+                    succeeded: false,
+                    off_protocol_work: None,
+                }),
+                Some(ToolCallStatus::InProgress) => Some(LifecycleSignal::ToolStarted {
+                    id,
+                    // `InProgress` updates never carry the original
+                    // `raw_input` so we cannot re-derive the flag here.
+                    // `apply_signal` ORs this with any existing
+                    // metadata so a later `InProgress` cannot
+                    // overwrite a `true` from the original `ToolCall`.
+                    is_background_task: false,
+                }),
+                _ => Some(LifecycleSignal::Progress),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Kind of off-protocol work the daemon has observed during the current
+/// prompt. Both variants flip the silent-orphan watchdog to its
+/// `OFF_PROTOCOL_WORK_GRACE_FLOOR` window so a legitimately quiet turn
+/// doesn't get cancelled. See #1360 (`AsyncAgent`) and #1401
+/// (`BackgroundCommand`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OffProtocolWorkKind {
+    /// Claude SDK `Agent` tool with `isAsync: true`. Sub-agent runs inside
+    /// the claude binary, polled via an internal SDK channel that is
+    /// invisible at the ACP layer.
+    AsyncAgent,
+    /// Claude SDK `Bash` tool with `run_in_background: true`. The visible
+    /// `ToolCall` completes immediately while the underlying subprocess
+    /// keeps running off-protocol; the agent polls later via `BashOutput`.
+    BackgroundCommand,
+}
+
+/// Per-tool metadata stored in the silent-orphan watchdog's
+/// `tool_calls_in_flight` map. Lets the watchdog remember the original
+/// `run_in_background` flag observed at `ToolStarted` time so the
+/// completion path can flip `off_protocol_work_seen` even if the
+/// completion content marker is missing or reshaped. See #1401.
+#[derive(Debug, Clone, Copy)]
+struct ToolMetadata {
+    is_background_task: bool,
+}
+
+/// Runtime configuration handed to `SilentOrphanWatchdog::should_fire`
+/// and `apply_signal`. Decoupled from `CockpitConfig` and the env-var
+/// overrides so unit tests can drive synthetic graces deterministically
+/// without touching process-global state.
+#[derive(Debug, Clone, Copy)]
+struct SilentOrphanWatchdogConfig {
+    base_grace: std::time::Duration,
+    fast_grace: std::time::Duration,
+    off_protocol_grace_floor: std::time::Duration,
+}
+
+/// Pure state machine for the silent-orphan watchdog. The prompt loop
+/// owns one instance per prompt; the `apply_signal` method consumes
+/// `LifecycleSignal`s from the notification handler and `should_fire`
+/// returns the firing predicate on each polling tick.
+///
+/// All wall-clock and monotonic time inputs are injected by the caller
+/// (`now: Instant`, `wall_now: DateTime<Utc>`) so the unit tests can
+/// step the clock forward synthetically. The struct never reaches into
+/// `Instant::now()` or `chrono::Utc::now()` directly.
+///
+/// Invariants:
+///
+/// - `tool_calls_in_flight` non-empty → watchdog is always suppressed.
+/// - `off_protocol_work_seen.is_some()` → effective grace lifts to at
+///   least `off_protocol_grace_floor` for the rest of this prompt.
+/// - `wakeup_suppress_until.is_some()` and `now < deadline` →
+///   suppressed regardless of grace.
+/// - `cost_seen` switches the no-off-protocol case to fast grace; any
+///   subsequent `Progress` / `ToolStarted` / `ToolCompleted` /
+///   `WakeupPending` clears it.
+///
+/// See #1240 (original wedge), #1360 (async-agent floor), and #1401
+/// (backgrounded Bash + ScheduleWakeup).
+#[derive(Debug, Default)]
+struct SilentOrphanWatchdog {
+    saw_first_progress: bool,
+    last_progress_at: Option<tokio::time::Instant>,
+    cost_seen: bool,
+    tool_calls_in_flight: std::collections::HashMap<String, ToolMetadata>,
+    off_protocol_work_seen: Option<OffProtocolWorkKind>,
+    wakeup_suppress_until: Option<tokio::time::Instant>,
+}
+
+impl SilentOrphanWatchdog {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold a lifecycle signal into the state machine. Called once per
+    /// signal received from the notification handler's mpsc.
+    fn apply_signal(
+        &mut self,
+        sig: LifecycleSignal,
+        now: tokio::time::Instant,
+        wall_now: chrono::DateTime<chrono::Utc>,
+        cfg: SilentOrphanWatchdogConfig,
+    ) {
+        match sig {
+            LifecycleSignal::Progress => {
+                self.saw_first_progress = true;
+                self.last_progress_at = Some(now);
+                self.cost_seen = false;
+            }
+            LifecycleSignal::ToolStarted {
+                id,
+                is_background_task,
+            } => {
+                self.saw_first_progress = true;
+                self.last_progress_at = Some(now);
+                self.cost_seen = false;
+                // OR the new flag with any existing metadata. A late
+                // `ToolCallUpdate(InProgress)` lacks `raw_input` and
+                // classifies as `is_background_task = false`; without
+                // the OR it would erase the `true` captured from the
+                // original `ToolCall` and break the raw-input arm of
+                // the defense-in-depth detection. See #1401 review.
+                self.tool_calls_in_flight
+                    .entry(id)
+                    .and_modify(|m| m.is_background_task |= is_background_task)
+                    .or_insert(ToolMetadata { is_background_task });
+            }
+            LifecycleSignal::ToolCompleted {
+                id,
+                succeeded,
+                off_protocol_work,
+            } => {
+                let started_as_background = self
+                    .tool_calls_in_flight
+                    .remove(&id)
+                    .map(|m| m.is_background_task)
+                    .unwrap_or(false);
+                self.saw_first_progress = true;
+                self.last_progress_at = Some(now);
+                self.cost_seen = false;
+                // Defense in depth: trust either the completion-content
+                // marker OR the original raw_input flag. Either path
+                // alone is enough to mark this prompt as having
+                // off-protocol work pending. The raw-input fallback is
+                // ONLY trusted on successful completion: a Failed
+                // backgrounded Bash means the subprocess never
+                // actually started, so suppressing for 30 minutes
+                // would create a fresh false-positive class. See
+                // #1401 and the post-impl review notes.
+                let kind = off_protocol_work.or({
+                    if succeeded && started_as_background {
+                        Some(OffProtocolWorkKind::BackgroundCommand)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(kind) = kind {
+                    self.off_protocol_work_seen = Some(kind);
+                }
+            }
+            LifecycleSignal::TerminalUsage => {
+                self.cost_seen = true;
+            }
+            LifecycleSignal::WakeupPending { at } => {
+                self.saw_first_progress = true;
+                self.last_progress_at = Some(now);
+                self.cost_seen = false;
+                // Convert the wall-clock `at` to a monotonic `Instant`
+                // deadline now, so wall-clock jumps between signal
+                // receipt and the next firing check can't perturb
+                // suppression. Add the base grace as a tail so the
+                // watchdog doesn't snap-fire the instant the sleep
+                // ends; the agent needs time after `at` to actually
+                // emit the wake's first `UserPromptSent` or other
+                // progress. See #1401.
+                let until_wakeup = at
+                    .signed_duration_since(wall_now)
+                    .to_std()
+                    .unwrap_or(std::time::Duration::ZERO);
+                let deadline = now + until_wakeup + cfg.base_grace;
+                // Multiple wakeups should EXTEND (not shorten)
+                // suppression. The agent may re-issue a longer
+                // ScheduleWakeup mid-turn; only the later deadline
+                // wins.
+                self.wakeup_suppress_until = Some(
+                    self.wakeup_suppress_until
+                        .map_or(deadline, |existing| existing.max(deadline)),
+                );
+            }
+        }
+    }
+
+    fn effective_grace(&self, cfg: SilentOrphanWatchdogConfig) -> std::time::Duration {
+        if self.off_protocol_work_seen.is_some() {
+            cfg.base_grace.max(cfg.off_protocol_grace_floor)
+        } else if self.cost_seen && cfg.fast_grace > std::time::Duration::ZERO {
+            cfg.fast_grace
+        } else {
+            cfg.base_grace
+        }
+    }
+
+    /// Returns `true` iff the watchdog must fire now. Also clears any
+    /// expired `wakeup_suppress_until` deadline as a side effect so
+    /// subsequent ticks don't re-evaluate stale state.
+    fn should_fire(&mut self, now: tokio::time::Instant, cfg: SilentOrphanWatchdogConfig) -> bool {
+        if self
+            .wakeup_suppress_until
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.wakeup_suppress_until = None;
+        }
+        let wakeup_suppressed = self
+            .wakeup_suppress_until
+            .is_some_and(|deadline| now < deadline);
+        let elapsed = self.last_progress_at.map(|t| now.duration_since(t));
+        self.saw_first_progress
+            && self.tool_calls_in_flight.is_empty()
+            && !wakeup_suppressed
+            && elapsed
+                .map(|d| d >= self.effective_grace(cfg))
+                .unwrap_or(false)
+    }
+
+    fn tool_calls_in_flight_len(&self) -> usize {
+        self.tool_calls_in_flight.len()
+    }
+
+    fn off_protocol_work_seen(&self) -> Option<OffProtocolWorkKind> {
+        self.off_protocol_work_seen
+    }
+}
+
+/// Tagged lifecycle signal carried over the watchdog mpsc. The
+/// `epoch` field is captured at signal-construction time from the
+/// shared `current_prompt_epoch` atomic; the prompt loop discards
+/// envelopes whose epoch doesn't match the prompt currently being
+/// drained. This keeps a notification handler parked on a full
+/// channel from leaking its previous-prompt signal into the next
+/// prompt's watchdog state when it eventually unblocks. See #1401
+/// post-impl review.
+#[derive(Debug, Clone)]
+pub(crate) struct LifecycleEnvelope {
+    pub epoch: u64,
+    pub signal: LifecycleSignal,
+}
+
+/// Deliver a lifecycle envelope from the notification handler to the
+/// prompt loop with the right backpressure policy.
+///
+/// `Progress` uses `try_send` first to avoid blocking the notification
+/// handler under streaming-chunk bursts; if the channel is full it
+/// falls back to an awaited `send`. The fallback preserves correctness
+/// (a dropped `Progress` after a `TerminalUsage` would leave
+/// `cost_seen = true` with a stale `last_progress_at`, false-firing
+/// the fast-grace path on a healthy turn).
+///
+/// All other lifecycle variants use an awaited `send` directly because
+/// their loss can flip the watchdog into a false-positive state that
+/// only the next equivalent signal would clear. See #1401 design
+/// rationale.
+async fn send_lifecycle_signal(
+    tx: &mpsc::Sender<LifecycleEnvelope>,
+    env: LifecycleEnvelope,
+    session_label: &str,
+) {
+    match &env.signal {
+        LifecycleSignal::Progress => {
+            let env = match tx.try_send(env) {
+                Ok(()) => return,
+                Err(mpsc::error::TrySendError::Full(env)) => env,
+                Err(mpsc::error::TrySendError::Closed(_)) => return,
+            };
+            if tx.send(env).await.is_err() {
+                trace!(
+                    target: "cockpit.acp",
+                    session = session_label,
+                    "lifecycle channel closed; dropping Progress fallback"
+                );
+            }
+        }
+        _ => {
+            if tx.send(env).await.is_err() {
+                trace!(
+                    target: "cockpit.acp",
+                    session = session_label,
+                    "lifecycle channel closed; dropping load-bearing signal"
+                );
+            }
+        }
+    }
+}
+
+/// Detect whether a `ToolCallUpdate` completion content array carries a
+/// Claude SDK marker that the underlying work continues off-protocol after
+/// the visible tool call completes. Two markers today:
+///
+/// - `"Async agent launched successfully"`: the `Agent` tool with
+///   `isAsync: true` spawned a sub-agent polled via an internal SDK
+///   channel (#1360).
+/// - `"Command running in background with ID: "`: the `Bash` tool with
+///   `run_in_background: true` left a subprocess running; the agent will
+///   poll later via `BashOutput` / `KillShell` (#1401).
+///
+/// Text detection is intentionally narrow. Both prefixes are hardcoded in
+/// the Anthropic Claude SDK and are the most stable identifiers available
+/// short of upstream `agentclientprotocol/claude-agent-acp#336` forwarding
+/// the off-protocol notifications natively. If a prefix ever changes,
+/// this detector returns `None` and the watchdog falls back to the base
+/// grace. For backgrounded Bash, the daemon also tracks
+/// `raw_input.run_in_background == true` at `ToolStarted` time as a
+/// defense in depth, so a single broken signal cannot reintroduce the
+/// false-positive class this fix targets.
+///
+/// Match anchors at the start of a text block (or any line within it)
+/// rather than substring `contains`. The SDK emits these markers as the
+/// FIRST line of the completion content; user output from a regular
+/// `Bash` that happens to print `Command running in background with
+/// ID: ...` would otherwise trip the watchdog to its 30-minute floor.
+/// See CodeRabbit review on PR #1406.
+fn detect_off_protocol_work_completed(
+    content: &Option<Vec<agent_client_protocol::schema::ToolCallContent>>,
+) -> Option<OffProtocolWorkKind> {
+    use agent_client_protocol::schema::ToolCallContent;
+    let blocks = content.as_ref()?;
+    for block in blocks {
+        let ToolCallContent::Content(c) = block else {
+            continue;
+        };
+        let ContentBlock::Text(t) = &c.content else {
+            continue;
+        };
+        for line in t.text.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("Async agent launched successfully") {
+                return Some(OffProtocolWorkKind::AsyncAgent);
+            }
+            if trimmed.starts_with("Command running in background with ID: ") {
+                return Some(OffProtocolWorkKind::BackgroundCommand);
+            }
+        }
+    }
+    None
+}
+
 /// Monotonic counter appended to synthetic tool-call IDs so two events
 /// minted within the same millisecond don't collide on the
 /// `(session_id, tool_id)` keys used by the cockpit event store.
@@ -187,6 +806,122 @@ fn resume_idle_grace() -> std::time::Duration {
         }
     }
     RESUME_IDLE_GRACE_DEFAULT
+}
+
+/// Resolve the session's effective `CockpitConfig` so per-profile
+/// `silent_orphan_*` overrides set in the settings TUI actually apply
+/// at runtime. Returns `None` if no config exists yet (fresh install,
+/// pre-migration); the helpers fall back to constants in that case.
+fn resolved_cockpit_config(profile: Option<&str>) -> Option<crate::session::config::CockpitConfig> {
+    match profile {
+        Some(p) => Some(crate::session::profile_config::resolve_config_or_warn(p).cockpit),
+        None => crate::session::load_config()
+            .ok()
+            .flatten()
+            .map(|c| c.cockpit),
+    }
+}
+
+/// Deadline for the runner unix socket to appear after spawning the
+/// `aoe __cockpit-runner` shim. 10s is enough in production, but a
+/// debug-build cold-start under heavy CI load (v8 coverage + multiple
+/// parallel `aoe serve` binaries + a runner subprocess that re-execs
+/// the same debug binary) can blow past it deterministically. Honors
+/// `AOE_COCKPIT_RUNNER_SOCKET_TIMEOUT_MS` in debug builds so the
+/// Playwright harness can lift it; release builds keep the original
+/// 10s ceiling.
+fn runner_socket_deadline() -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(raw) = std::env::var("AOE_COCKPIT_RUNNER_SOCKET_TIMEOUT_MS") {
+        if let Ok(ms) = raw.parse::<u64>() {
+            // Clamp to a floor of 100ms so a typo like
+            // `AOE_COCKPIT_RUNNER_SOCKET_TIMEOUT_MS=0` does not make
+            // wait_for_socket fail immediately and surface as a
+            // mysterious "runner socket did not appear" without ever
+            // polling.
+            return std::time::Duration::from_millis(ms.max(100));
+        }
+    }
+    std::time::Duration::from_secs(10)
+}
+
+/// Read the silent-orphan watchdog grace for the given source profile.
+/// In debug builds, honors `AOE_SILENT_ORPHAN_GRACE_MS` so the
+/// integration test can drive a sub-second cadence without making
+/// real failures racy. Otherwise reads
+/// `cockpit.silent_orphan_grace_secs` from the profile-resolved
+/// config so per-profile overrides set in the settings TUI take
+/// effect. A value of `0` means "disabled" and the caller skips the
+/// watchdog entirely; non-zero values smaller than 120s clamp up at
+/// runtime to the new production floor so a typo cannot produce an
+/// absurdly tight grace that false-positives on healthy turns. The
+/// floor was raised from 10s to 120s in #1360 alongside the default
+/// bump from 60 to 120; users who explicitly want a shorter grace
+/// must set `0` to disable instead.
+fn silent_orphan_grace(profile: Option<&str>) -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(raw) = std::env::var("AOE_SILENT_ORPHAN_GRACE_MS") {
+        if let Ok(ms) = raw.parse::<u64>() {
+            if ms == 0 {
+                return std::time::Duration::ZERO;
+            }
+            return std::time::Duration::from_millis(ms);
+        }
+    }
+    match resolved_cockpit_config(profile) {
+        Some(cockpit) => {
+            let secs = cockpit.silent_orphan_grace_secs;
+            if secs == 0 {
+                std::time::Duration::ZERO
+            } else {
+                std::time::Duration::from_secs(u64::from(secs).max(120))
+            }
+        }
+        None => SILENT_ORPHAN_GRACE_DEFAULT,
+    }
+}
+
+/// Read the accelerated silent-orphan grace for the given source
+/// profile. Same env-var override pattern as `silent_orphan_grace`;
+/// reads `cockpit.silent_orphan_fast_grace_secs` from the profile-
+/// resolved config. A value of `0` disables the accelerator: the
+/// watchdog keeps using the default grace even after a cost-populated
+/// `UsageUpdate` arrives. Non-zero values smaller than 5s clamp up.
+fn silent_orphan_fast_grace(profile: Option<&str>) -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(raw) = std::env::var("AOE_SILENT_ORPHAN_FAST_GRACE_MS") {
+        if let Ok(ms) = raw.parse::<u64>() {
+            if ms == 0 {
+                return std::time::Duration::ZERO;
+            }
+            return std::time::Duration::from_millis(ms.max(100));
+        }
+    }
+    match resolved_cockpit_config(profile) {
+        Some(cockpit) => {
+            let secs = cockpit.silent_orphan_fast_grace_secs;
+            if secs == 0 {
+                std::time::Duration::ZERO
+            } else {
+                std::time::Duration::from_secs(u64::from(secs).max(5))
+            }
+        }
+        None => SILENT_ORPHAN_FAST_GRACE_DEFAULT,
+    }
+}
+
+/// Read the silent-orphan polling cadence. Constant in production;
+/// tunable in debug builds via `AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS`
+/// so the disabled-path integration test can verify the watchdog
+/// stays silent without waiting a full polling tick.
+fn silent_orphan_check_interval() -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    if let Ok(raw) = std::env::var("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS") {
+        if let Ok(ms) = raw.parse::<u64>() {
+            return std::time::Duration::from_millis(ms.max(10));
+        }
+    }
+    SILENT_ORPHAN_CHECK_INTERVAL
 }
 
 /// Resolution channel + the option set the agent offered. Stored in the
@@ -219,6 +954,84 @@ pub struct AcpClient {
     _child: Option<Arc<Mutex<tokio::process::Child>>>,
 }
 
+/// Sandbox handles a connection task needs to route ACP fs/* and
+/// terminal/* requests across the container boundary.
+#[derive(Debug, Clone)]
+pub struct SessionSandbox {
+    pub container_name: String,
+    pub container_workdir: PathBuf,
+    /// Snapshot of the session's sandbox info, used to re-resolve env on
+    /// every `terminal/create` so the agent's shell commands see the same
+    /// env entries (including any rotated host values) as the interactive
+    /// tmux pane.
+    pub sandbox_info: SandboxInfo,
+    /// Profile the session was created under. Required for
+    /// `resolved_sandbox_config` to pick up per-profile env overrides.
+    pub source_profile: Option<String>,
+    /// Host-side project path. `resolved_sandbox_config` walks up from
+    /// here to find any repo-local config overrides.
+    pub project_path: PathBuf,
+}
+
+impl SessionSandbox {
+    /// Build a `SessionSandbox` + `SandboxPathMap` from a `SandboxInfo`
+    /// and the session's host-side project_path. Path-map entries
+    /// cover only the workspace volume(s) the container was built
+    /// with; see `docs/cockpit.md` for the known-limitations note on
+    /// agent-config and `extra_volumes`.
+    pub fn from_info(
+        sandbox: &SandboxInfo,
+        project_path: &Path,
+        source_profile: Option<String>,
+    ) -> Result<(Self, SandboxPathMap), AcpError> {
+        let project_path_str = project_path.to_string_lossy().to_string();
+        let (volumes, workdir) =
+            crate::session::container_config::compute_volume_paths(project_path, &project_path_str)
+                .map_err(|e| AcpError::Spawn(format!("compute container workdir: {e}")))?;
+        let mounts: Vec<(PathBuf, PathBuf)> = volumes
+            .into_iter()
+            .map(|v| (PathBuf::from(v.container_path), PathBuf::from(v.host_path)))
+            .collect();
+        Ok((
+            Self {
+                container_name: sandbox.container_name.clone(),
+                container_workdir: PathBuf::from(workdir),
+                sandbox_info: sandbox.clone(),
+                source_profile,
+                project_path: project_path.to_path_buf(),
+            },
+            SandboxPathMap::new(mounts),
+        ))
+    }
+
+    /// Re-resolve env entries for this session's sandbox. Called on every
+    /// `terminal/create` so rotated host values (e.g. refreshed tokens)
+    /// reach the agent's shell commands without requiring a container
+    /// recreate.
+    ///
+    /// A missing `source_profile` only happens for legacy `WorkerRecord`
+    /// entries written before the field was persisted. Warns once per
+    /// call rather than failing, since refusing resolution would break
+    /// `terminal/create` for sessions that are otherwise healthy.
+    pub fn current_env_entries(&self) -> Vec<crate::containers::container_interface::EnvEntry> {
+        let profile = match self.source_profile.as_deref() {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    target: "cockpit.terminal",
+                    container = %self.container_name,
+                    "SessionSandbox has no source_profile (likely a legacy WorkerRecord); \
+                     resolving terminal/create env against the global default profile"
+                );
+                ""
+            }
+        };
+        let sandbox_config =
+            crate::session::environment::resolved_sandbox_config(profile, &self.project_path);
+        crate::session::environment::collect_environment(&sandbox_config, &self.sandbox_info)
+    }
+}
+
 /// Per-session resources the connection task uses to handle ACP fs/* and
 /// terminal/* requests delegated by the agent.
 #[derive(Clone)]
@@ -227,6 +1040,7 @@ struct SessionResources {
     terminals: TerminalManager,
     cwd: PathBuf,
     label: String,
+    sandbox: Option<SessionSandbox>,
 }
 
 impl AcpClient {
@@ -278,8 +1092,21 @@ impl AcpClient {
         let mode = ConnectMode::Fresh {
             stored_acp_session_id: config.stored_acp_session_id.clone(),
         };
+        let sandbox_pair = if let Some(info) = &config.sandbox_info {
+            Some(SessionSandbox::from_info(
+                info,
+                config.cwd.as_path(),
+                config.source_profile.clone(),
+            )?)
+        } else {
+            None
+        };
+        let runner_sandbox = sandbox_pair.as_ref().map(|(handle, _)| handle);
+        let profile = agent_profiles::resolve(&config.agent_key);
+        let install_binary = config.spec.command.clone();
+        let source_profile_for_task = config.source_profile.clone();
         if let Some(socket_path) = config.socket_path.clone() {
-            spawn_runner_detached(&config, &socket_path, session_id.0.clone())?;
+            spawn_runner_detached(&config, &socket_path, session_id.0.clone(), runner_sandbox)?;
             return Self::connect_via_socket(
                 socket_path,
                 config.cwd,
@@ -291,6 +1118,10 @@ impl AcpClient {
                 cmd_rx,
                 event_tx,
                 event_rx,
+                sandbox_pair,
+                profile,
+                install_binary,
+                source_profile_for_task,
             )
             .await;
         }
@@ -308,6 +1139,10 @@ impl AcpClient {
             cmd_rx,
             event_tx,
             event_rx,
+            sandbox_pair,
+            profile,
+            install_binary,
+            source_profile_for_task,
         )
         .await
     }
@@ -324,6 +1159,10 @@ impl AcpClient {
         cmd_rx: mpsc::Receiver<ClientCmd>,
         event_tx: mpsc::Sender<Event>,
         event_rx: mpsc::Receiver<Event>,
+        sandbox: Option<(SessionSandbox, SandboxPathMap)>,
+        profile: &'static agent_profiles::AgentProfile,
+        install_binary: String,
+        source_profile: Option<String>,
     ) -> Result<Self, AcpError> {
         let (stdin, stdout) = {
             let mut guard = child.lock().await;
@@ -342,15 +1181,24 @@ impl AcpClient {
         let session_label = session_id.0.clone();
         let child_for_task = child.clone();
         let pending_for_task = pending_responders.clone();
+        let expected_agent = ExpectedAgent::from_command(&install_binary);
 
         // Allowed fs roots: cwd + any explicit additional directories.
         let mut roots = vec![cwd.clone()];
         roots.extend(additional_dirs);
+        let (sandbox_handle, fs_policy) = match sandbox {
+            Some((handle, path_map)) => (
+                Some(handle),
+                Arc::new(FsPolicy::with_sandbox_map(roots, path_map)),
+            ),
+            None => (None, Arc::new(FsPolicy::new(roots))),
+        };
         let resources = SessionResources {
-            fs_policy: Arc::new(FsPolicy::new(roots)),
+            fs_policy,
             terminals: TerminalManager::new(),
             cwd: cwd.clone(),
             label: session_label.clone(),
+            sandbox: sandbox_handle,
         };
 
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
@@ -367,9 +1215,12 @@ impl AcpClient {
             None,
             mode,
             Some(ready_tx),
+            profile,
+            expected_agent,
+            source_profile,
         ));
 
-        wait_for_handshake(&session_label, ready_rx, Some(&child)).await?;
+        wait_for_handshake(&session_label, ready_rx, Some(&child), &install_binary).await?;
 
         Ok(Self {
             session_id,
@@ -398,26 +1249,39 @@ impl AcpClient {
         cmd_rx: mpsc::Receiver<ClientCmd>,
         event_tx: mpsc::Sender<Event>,
         event_rx: mpsc::Receiver<Event>,
+        sandbox: Option<(SessionSandbox, SandboxPathMap)>,
+        profile: &'static agent_profiles::AgentProfile,
+        install_binary: String,
+        source_profile: Option<String>,
     ) -> Result<Self, AcpError> {
         // Poll for the runner to finish binding the socket. The runner
         // binds before it spawns the agent so this is usually fast (a
         // few ms) but bound the wait so a wedged runner returns a typed
         // error instead of parking the supervisor.
-        let stream = wait_for_socket(&socket_path, std::time::Duration::from_secs(10)).await?;
+        let stream = wait_for_socket(&socket_path, runner_socket_deadline()).await?;
         let (read_half, write_half) = stream.into_split();
         let transport = ByteStreams::new(write_half.compat_write(), read_half.compat());
 
         let mut roots = vec![cwd.clone()];
         roots.extend(additional_dirs);
+        let (sandbox_handle, fs_policy) = match sandbox {
+            Some((handle, path_map)) => (
+                Some(handle),
+                Arc::new(FsPolicy::with_sandbox_map(roots, path_map)),
+            ),
+            None => (None, Arc::new(FsPolicy::new(roots))),
+        };
         let resources = SessionResources {
-            fs_policy: Arc::new(FsPolicy::new(roots)),
+            fs_policy,
             terminals: TerminalManager::new(),
             cwd: cwd.clone(),
             label: session_id.0.clone(),
+            sandbox: sandbox_handle,
         };
 
         let session_label = session_id.0.clone();
         let pending_for_task = pending_responders.clone();
+        let expected_agent = ExpectedAgent::from_command(&install_binary);
 
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
 
@@ -433,9 +1297,12 @@ impl AcpClient {
             None,
             mode,
             Some(ready_tx),
+            profile,
+            expected_agent,
+            source_profile,
         ));
 
-        wait_for_handshake(&session_label, ready_rx, None).await?;
+        wait_for_handshake(&session_label, ready_rx, None, &install_binary).await?;
 
         Ok(Self {
             session_id,
@@ -467,6 +1334,7 @@ impl AcpClient {
     /// request id this client never issued and is dropped silently by
     /// the underlying transport, leaving the UI otherwise stuck on
     /// "thinking".
+    #[allow(clippy::too_many_arguments)]
     pub async fn attach(
         socket_path: PathBuf,
         cwd: PathBuf,
@@ -474,6 +1342,9 @@ impl AcpClient {
         stored_acp_session_id: String,
         in_flight_turn: bool,
         session_id: CockpitSessionId,
+        sandbox: Option<(SessionSandbox, SandboxPathMap)>,
+        agent_key: String,
+        source_profile: Option<String>,
     ) -> Result<Self, AcpError> {
         let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(16);
         let (event_tx, event_rx) = mpsc::channel::<Event>(64);
@@ -482,6 +1353,20 @@ impl AcpClient {
             acp_session_id: stored_acp_session_id,
             in_flight_turn,
         };
+        let profile = agent_profiles::resolve(&agent_key);
+        // Resolve the binary name from the registry so the resume path
+        // still routes through the per-adapter compatibility gate
+        // (`agent_compat::ExpectedAgent::from_command`). Reattaching to
+        // a stale claude-agent-acp@0.32.0 worker that survived an aoe
+        // serve restart should re-trigger the >=0.37.0 check, not
+        // silently skip it just because the resume path has no install
+        // hint to surface. Empty fallback only when the agent key is
+        // not in the registry (an unknown user-configured agent);
+        // policy maps that to Other anyway.
+        let install_binary = super::AgentRegistry::with_defaults()
+            .get(&agent_key)
+            .map(|spec| spec.command.clone())
+            .unwrap_or_default();
         Self::connect_via_socket(
             socket_path,
             cwd,
@@ -493,6 +1378,10 @@ impl AcpClient {
             cmd_rx,
             event_tx,
             event_rx,
+            sandbox,
+            profile,
+            install_binary,
+            source_profile,
         )
         .await
     }
@@ -522,6 +1411,22 @@ impl AcpClient {
         let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
         cmd_tx
             .send(ClientCmd::SetMode(mode_id.to_string()))
+            .await
+            .map_err(|_| AcpError::AgentExited)
+    }
+
+    /// Set a per-session selector (model, reasoning effort, etc.) via
+    /// ACP `session/set_config_option`. The cockpit treats every
+    /// adapter-advertised category through this one path; specific
+    /// helpers per category would just duplicate the wiring. See
+    /// #1403.
+    pub async fn set_config_option(&self, config_id: &str, value: &str) -> Result<(), AcpError> {
+        let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
+        cmd_tx
+            .send(ClientCmd::SetConfigOption {
+                config_id: config_id.to_string(),
+                value: value.to_string(),
+            })
             .await
             .map_err(|_| AcpError::AgentExited)
     }
@@ -728,6 +1633,7 @@ fn spawn_runner_detached(
     config: &SpawnConfig,
     socket_path: &std::path::Path,
     session_id: String,
+    session_sandbox: Option<&SessionSandbox>,
 ) -> Result<(), AcpError> {
     use std::process::Command as StdCommand;
     let current_exe =
@@ -738,15 +1644,41 @@ fn spawn_runner_detached(
         let _ = std::fs::create_dir_all(parent);
     }
 
+    // Sandboxed sessions wrap the agent in `docker exec`. Host-side
+    // PATH resolution is skipped because the agent binary lives inside
+    // the container; the container's own PATH resolves it. The
+    // container_workdir is reused from the SessionSandbox built upstream
+    // so we don't redo `compute_volume_paths`.
+    let sandbox_argv = match (&config.sandbox_info, session_sandbox) {
+        (Some(sandbox), Some(handle)) => Some(build_sandbox_docker_argv(
+            config,
+            sandbox,
+            handle.container_workdir.to_string_lossy().as_ref(),
+        )?),
+        (Some(_), None) => {
+            return Err(AcpError::Spawn(
+                "sandbox_info set but SessionSandbox handle missing; \
+                 SessionSandbox::from_info must run before spawn_runner_detached"
+                    .into(),
+            ));
+        }
+        (None, _) => None,
+    };
+
     // Resolve the agent binary against PATH + known node-manager dirs so
     // the runner spawns the right binary even when the daemon's frozen
     // PATH doesn't contain it. See #1048. The resolved bin dir is also
     // prepended to PATH below so the adapter's own `node`/`npx`
     // subprocesses land in the same install.
-    let resolved = resolve_agent_command(&config.spec.command);
-    let (spawn_command, extra_path_dir) = match &resolved {
-        Some((abs, dir)) => (abs.to_string_lossy().into_owned(), Some(dir.clone())),
-        None => (config.spec.command.clone(), None),
+    let resolved = if sandbox_argv.is_some() {
+        None
+    } else {
+        resolve_agent_command(&config.spec.command)
+    };
+    let (spawn_command, extra_path_dir) = match (&sandbox_argv, &resolved) {
+        (Some(s), _) => (s.docker_binary.clone(), None),
+        (None, Some((abs, dir))) => (abs.to_string_lossy().into_owned(), Some(dir.clone())),
+        (None, None) => (config.spec.command.clone(), None),
     };
 
     let mut cmd = StdCommand::new(&current_exe);
@@ -757,6 +1689,8 @@ fn spawn_runner_detached(
         .arg(&session_id)
         .arg("--agent-name")
         .arg(&config.spec.command)
+        .arg("--agent-key")
+        .arg(&config.agent_key)
         .arg("--cwd")
         .arg(&config.cwd);
     if !config.additional_dirs.is_empty() {
@@ -777,16 +1711,26 @@ fn spawn_runner_detached(
     if !provider_keys.is_empty() {
         cmd.arg("--provider-env-keys").arg(provider_keys.join(","));
     }
+    if let Some(profile) = config.source_profile.as_deref().filter(|s| !s.is_empty()) {
+        cmd.arg("--source-profile").arg(profile);
+    }
     if let Some(stored) = &config.stored_acp_session_id {
         cmd.arg("--stored-acp-session-id").arg(stored);
     }
     cmd.arg("--");
-    // Pass the resolved absolute path (or fall back to the bare command).
-    // The runner spawns whatever it receives, so an absolute path bypasses
-    // any PATH lookup inside the runner.
-    cmd.arg(&spawn_command);
-    for a in &config.spec.args {
-        cmd.arg(a);
+    if let Some(s) = &sandbox_argv {
+        cmd.arg(&s.docker_binary);
+        for a in &s.docker_args {
+            cmd.arg(a);
+        }
+    } else {
+        // Pass the resolved absolute path (or fall back to the bare command).
+        // The runner spawns whatever it receives, so an absolute path bypasses
+        // any PATH lookup inside the runner.
+        cmd.arg(&spawn_command);
+        for a in &config.spec.args {
+            cmd.arg(a);
+        }
     }
 
     // Env: apply the same allowlist + provider_env filtering that the
@@ -796,6 +1740,15 @@ fn spawn_runner_detached(
     // either process.
     cmd.env_clear();
     apply_env_filter(&mut cmd, config);
+    if let Some(s) = &sandbox_argv {
+        // The agent runs inside the container; docker reads each
+        // `-e KEY` flag's value from its own process env. Set the
+        // corresponding values on the runner so docker (its child)
+        // can forward them across the container boundary.
+        for (key, value) in &s.inherit_env {
+            cmd.env(key, value);
+        }
+    }
     if let Some(extra) = &extra_path_dir {
         // Prepend the resolved bin dir to the PATH we just forwarded so
         // the adapter's own `node`/`npx` lookups land in the same install
@@ -823,9 +1776,9 @@ fn spawn_runner_detached(
     }
 
     // Redirect stdio: the runner writes its own log file. Inheriting our
-    // stdio would (a) pollute serve.log with the per-session noise and
-    // (b) keep a pipe open to the daemon, which then closes when we die,
-    // making the runner observe EOF on its own stdin/stdout.
+    // stdio would (a) pollute the shared debug.log with the per-session
+    // noise and (b) keep a pipe open to the daemon, which then closes
+    // when we die, making the runner observe EOF on its own stdin/stdout.
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -854,6 +1807,110 @@ fn spawn_runner_detached(
     Ok(())
 }
 
+/// Result of constructing the `docker exec` argv for a sandboxed cockpit
+/// spawn. `docker_binary` is argv[0] (the docker/podman runtime);
+/// `docker_args` is everything after it (including the container name
+/// and the in-container agent argv). `inherit_env` is the set of
+/// (key, value) pairs the parent process must export so docker can
+/// forward them via the matching `-e KEY` flags already in `docker_args`.
+struct SandboxArgv {
+    docker_binary: String,
+    docker_args: Vec<String>,
+    inherit_env: Vec<(String, String)>,
+}
+
+/// Build the `docker exec` argv for a sandboxed cockpit spawn. The
+/// resulting command is what the runner executes; docker proxies the
+/// agent's stdio across the container boundary. Mirrors the tmux
+/// substrate's env handling so the same `sandbox.environment` and
+/// `extra_env` entries take effect.
+///
+/// `container_workdir` is the in-container working directory for the
+/// session, pre-computed by `SessionSandbox::from_info` and passed
+/// through to avoid re-running `compute_volume_paths`.
+fn build_sandbox_docker_argv(
+    config: &SpawnConfig,
+    sandbox: &SandboxInfo,
+    container_workdir: &str,
+) -> Result<SandboxArgv, AcpError> {
+    use crate::containers::container_interface::docker_env_args;
+
+    let runtime = crate::containers::get_container_runtime();
+    let docker_binary = runtime.base.binary.to_string();
+
+    let project_path = config.cwd.as_path();
+    let profile_for_env = config.source_profile.as_deref().unwrap_or("");
+    let sandbox_config =
+        crate::session::environment::resolved_sandbox_config(profile_for_env, project_path);
+    let env_entries = crate::session::environment::collect_environment(&sandbox_config, sandbox);
+
+    let mut docker_args: Vec<String> = vec![
+        "exec".into(),
+        "-i".into(),
+        "-w".into(),
+        container_workdir.to_string(),
+    ];
+    // `collect_environment` already dedupes by key, so the entry list is
+    // unique. We still track `seen_keys` so the provider-auth block below
+    // can skip keys we've already forwarded.
+    let mut seen_keys: std::collections::HashSet<String> =
+        env_entries.iter().map(|e| e.key().to_string()).collect();
+    let (env_argv, inherit_pairs) = docker_env_args(&env_entries);
+    docker_args.extend(env_argv);
+    let mut inherit_env: Vec<(String, String)> = inherit_pairs;
+
+    // Provider auth keys: forward into the container only when set on
+    // the host AND not already in the sandbox env list. Value-typed
+    // only; host filesystem paths (e.g. `CLAUDE_CONFIG_DIR`) must not
+    // cross the namespace boundary because they reference paths that
+    // don't exist inside the container. The agent's config dir is
+    // already bind-mounted at the canonical container path via
+    // `AGENT_CONFIG_MOUNTS`.
+    const PROVIDER_AUTH_KEYS: &[&str] = &[
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ];
+    for &key in PROVIDER_AUTH_KEYS {
+        if seen_keys.contains(key) {
+            continue;
+        }
+        if let Ok(value) = std::env::var(key) {
+            seen_keys.insert(key.to_string());
+            docker_args.push("-e".into());
+            docker_args.push(key.into());
+            inherit_env.push((key.into(), value));
+        }
+    }
+
+    // Per-spawn provider_env entries (the request's auth payload).
+    for (key, value) in &config.provider_env {
+        if provider_env_denyreason(key).is_some() {
+            continue;
+        }
+        if seen_keys.insert(key.clone()) {
+            docker_args.push("-e".into());
+            docker_args.push(key.clone());
+            inherit_env.push((key.clone(), value.clone()));
+        }
+    }
+
+    // Model override (AOE_AGENT_MODEL): the supervisor folds the
+    // requested model into provider_env above, so it's already covered.
+
+    docker_args.push(sandbox.container_name.clone());
+    docker_args.push(config.spec.command.clone());
+    for a in &config.spec.args {
+        docker_args.push(a.clone());
+    }
+
+    Ok(SandboxArgv {
+        docker_binary,
+        docker_args,
+        inherit_env,
+    })
+}
+
 /// Apply the env_clear + allowlist + provider_env filtering used by both
 /// the detached-runner path and the in-proc stdio path. Pulled out so
 /// the two spawn sites share the same security posture.
@@ -861,6 +1918,18 @@ fn apply_env_filter(cmd: &mut std::process::Command, config: &SpawnConfig) {
     const ALWAYS_FORWARD: &[&str] = &[
         "PATH",
         "HOME",
+        // XDG_CONFIG_HOME drives `get_app_dir()` on Linux (see
+        // src/session/mod.rs). Without forwarding, the runner falls
+        // back to `$HOME/.config/agent-of-empires[-dev]`, which
+        // diverges from the daemon when the operator (or live test
+        // harness) has set XDG_CONFIG_HOME to a non-default value.
+        // The runner then writes its WorkerRecord to a path the
+        // daemon never reads, the daemon's `reap_user_stopped`
+        // observes the registry as missing on the next tick, emits
+        // `Stopped { user_stopped }`, and respawns, turning a fine
+        // worker into a respawn loop. See #1383 (CI Linux live
+        // specs under an isolated $XDG_CONFIG_HOME).
+        "XDG_CONFIG_HOME",
         "LANG",
         "LC_ALL",
         "TERM",
@@ -948,6 +2017,11 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
     let always_forward = [
         "PATH",
         "HOME",
+        // Mirror the runner-mode ALWAYS_FORWARD: XDG_CONFIG_HOME drives
+        // `get_app_dir()` on Linux, so the stdio agent must see the
+        // same value the daemon resolved against (otherwise a custom
+        // XDG_CONFIG_HOME diverges between daemon and agent).
+        "XDG_CONFIG_HOME",
         "LANG",
         "LC_ALL",
         "TERM",
@@ -1251,6 +2325,51 @@ fn wakeup_event_from_raw(raw_input: &serde_json::Value) -> Option<Event> {
     Some(Event::WakeupScheduled { at, reason })
 }
 
+/// Derive a `LifecycleSignal::WakeupPending` from a `SessionUpdate`.
+///
+/// The watchdog must not suppress on every `Event::WakeupScheduled`:
+/// the initial `ToolCall` frame is emitted eagerly before the tool is
+/// known to have succeeded, and a later `Failed` status means no
+/// wakeup was ever registered. Either case would let a real adapter
+/// wedge masquerade as a pending wake and pin the prompt open for
+/// `delay + base_grace`.
+///
+/// Gate: source must be a `ToolCallUpdate` whose status is NOT
+/// `Failed` (Completed or InProgress are both acceptable; real
+/// `claude-agent-acp` lands the raw_input on an interim
+/// `ToolCallUpdate` before the final `Completed` arrives, and the
+/// Completed update often strips `raw_input`, so requiring strictly
+/// `Completed` would miss the wakeup in production). The title
+/// must be `ScheduleWakeup` and `raw_input.delaySeconds` must
+/// parse.
+///
+/// UI emit of `Event::WakeupScheduled` keeps its current best-effort
+/// behavior so the sidebar countdown lights up immediately. See
+/// CodeRabbit review on PR #1406.
+fn wakeup_lifecycle_signal_from_update(
+    update: &agent_client_protocol::schema::SessionUpdate,
+    profile: &agent_profiles::AgentProfile,
+) -> Option<LifecycleSignal> {
+    use agent_client_protocol::schema::{SessionUpdate, ToolCallStatus};
+    if !profile.supports_wakeup_tools {
+        return None;
+    }
+    let SessionUpdate::ToolCallUpdate(u) = update else {
+        return None;
+    };
+    if matches!(u.fields.status, Some(ToolCallStatus::Failed)) {
+        return None;
+    }
+    if u.fields.title.as_deref() != Some("ScheduleWakeup") {
+        return None;
+    }
+    let raw = u.fields.raw_input.as_ref()?;
+    match wakeup_event_from_raw(raw)? {
+        Event::WakeupScheduled { at, .. } => Some(LifecycleSignal::WakeupPending { at }),
+        _ => None,
+    }
+}
+
 /// Parse Claude's ExitPlanMode tool input into a structured `Plan`.
 /// Claude ships the plan markdown in `raw_input.plan`; we extract its
 /// bullet- or number-prefixed lines as `PlanStep`s with status=Pending,
@@ -1340,27 +2459,17 @@ fn is_compact_completion(text: &str) -> bool {
     text.contains("Compacting completed.")
 }
 
-/// Extract a sub-agent parent tool-call id from an ACP `_meta` blob.
-///
-/// claude-agent-acp tags child tool calls launched by Claude's `Task`
-/// tool with `_meta.claudeCode.parentToolUseId` pointing at the parent
-/// Task's `tool_call_id`. Other adapters may grow their own keys
-/// later; this helper only knows about the `claudeCode` namespace for
-/// now. See #1041.
-fn parent_tool_use_id_from_meta(
-    meta: &Option<agent_client_protocol::schema::Meta>,
-) -> Option<String> {
-    meta.as_ref()
-        .and_then(|m| m.get("claudeCode"))
-        .and_then(|cc| cc.get("parentToolUseId"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_owned())
-}
-
 /// Map an ACP `SessionUpdate` to the cockpit's typed `Event`. Variants we
 /// don't yet handle pass through as `RawAgentUpdate` so UI clients can at
 /// least see them; we'll narrow these as the schema stabilises.
-fn map_update_to_events(update: SessionUpdate) -> Vec<Event> {
+///
+/// `profile` carries per-agent gates for claude-specific synthesis
+/// (subagent linkage namespace, ExitPlanMode-to-Plan, ScheduleWakeup);
+/// other agents pass these through as plain tool calls.
+fn map_update_to_events(
+    update: SessionUpdate,
+    profile: &'static agent_profiles::AgentProfile,
+) -> Vec<Event> {
     match update {
         SessionUpdate::AgentMessageChunk(chunk) => match chunk.content {
             ContentBlock::Text(text) => {
@@ -1401,7 +2510,7 @@ fn map_update_to_events(update: SessionUpdate) -> Vec<Event> {
         SessionUpdate::ToolCall(tc) => {
             let raw_args = tc.raw_input.clone().unwrap_or(serde_json::Value::Null);
             let args_preview = preview_args(&raw_args);
-            let parent_tool_call_id = parent_tool_use_id_from_meta(&tc.meta);
+            let parent_tool_call_id = profile.parent_tool_use_id_from_meta(&tc.meta);
             if let Some(parent) = parent_tool_call_id.as_deref() {
                 // Breadcrumb so AOE_ACP_TRACE=1 sessions can verify the
                 // subagent linkage round-trip (parent Task id → child
@@ -1414,6 +2523,11 @@ fn map_update_to_events(update: SessionUpdate) -> Vec<Event> {
                     "subagent child tool_call linked to parent via _meta.claudeCode.parentToolUseId"
                 );
             }
+            let memory_recall = if profile.supports_memory_recall_tool() {
+                extract_memory_recall(&tc.meta, &tc.locations, &tc.content)
+            } else {
+                None
+            };
             let tool_call = ToolCall {
                 id: tc.tool_call_id.0.to_string(),
                 name: tc.title.clone(),
@@ -1421,6 +2535,7 @@ fn map_update_to_events(update: SessionUpdate) -> Vec<Event> {
                 args_preview: args_preview.clone(),
                 started_at: chrono::Utc::now(),
                 parent_tool_call_id,
+                memory_recall,
             };
             let mut events = vec![Event::ToolCallStarted { tool_call }];
             if is_destructive(&tc.title, &args_preview) {
@@ -1435,8 +2550,11 @@ fn map_update_to_events(update: SessionUpdate) -> Vec<Event> {
             // raw_input.plan) instead of the structured SessionUpdate::Plan
             // channel. Synthesise a PlanUpdated event so the cockpit's
             // PlanStrip and the rest of the plan-aware UI light up. See
-            // #1059.
-            if matches!(tc.kind, agent_client_protocol::schema::ToolKind::SwitchMode) {
+            // #1059. Gated on the agent's profile so codex / opencode /
+            // gemini mode switches don't spuriously emit empty Plans.
+            if profile.supports_exit_plan_mode
+                && matches!(tc.kind, agent_client_protocol::schema::ToolKind::SwitchMode)
+            {
                 if let Some(plan) = extract_plan_from_switch_mode(&raw_args) {
                     events.push(Event::PlanUpdated { plan });
                 }
@@ -1446,8 +2564,10 @@ fn map_update_to_events(update: SessionUpdate) -> Vec<Event> {
             // mode self-firing a fresh prompt when the wake triggers.
             // Capture an absolute `at` timestamp here so the sidebar
             // countdown survives daemon restarts and never has to parse
-            // the natural-language output string. See #1091.
-            if tc.title == "ScheduleWakeup" {
+            // the natural-language output string. See #1091. Gated on
+            // the agent's profile (claude-only today) so coincidental
+            // tool names on other agents don't fire a wakeup event.
+            if profile.supports_wakeup_tools && tc.title == "ScheduleWakeup" {
                 if let Some(event) = wakeup_event_from_raw(&raw_args) {
                     events.push(event);
                 }
@@ -1518,8 +2638,11 @@ fn map_update_to_events(update: SessionUpdate) -> Vec<Event> {
             // emit path in the `ToolCall` branch above therefore never
             // sees real args and `wakeup_event_from_raw` returns None,
             // so re-check here when the update carries both the title
-            // and a populated raw_input. See #1091.
-            if matches!(update.fields.title.as_deref(), Some("ScheduleWakeup")) {
+            // and a populated raw_input. See #1091. Gated on profile so
+            // non-claude agents don't fire WakeupScheduled on coincidence.
+            if profile.supports_wakeup_tools
+                && matches!(update.fields.title.as_deref(), Some("ScheduleWakeup"))
+            {
                 if let Some(raw) = update.fields.raw_input.as_ref() {
                     if let Some(event) = wakeup_event_from_raw(raw) {
                         events.push(event);
@@ -1581,6 +2704,7 @@ fn map_update_to_events(update: SessionUpdate) -> Vec<Event> {
                         args_preview,
                         started_at: now,
                         parent_tool_call_id: None,
+                        memory_recall: None,
                     },
                 },
                 Event::PlanUpdated {
@@ -1646,11 +2770,102 @@ fn map_update_to_events(update: SessionUpdate) -> Vec<Event> {
             );
             vec![Event::AvailableCommandsUpdated { commands }]
         }
+        SessionUpdate::ConfigOptionUpdate(update) => {
+            let options: Vec<ConfigOptionDescriptor> = update
+                .config_options
+                .into_iter()
+                .filter_map(map_acp_config_option)
+                .collect();
+            debug!(
+                target: "cockpit.acp",
+                count = options.len(),
+                "received ConfigOptionUpdate from agent"
+            );
+            vec![Event::ConfigOptionsUpdated { options }]
+        }
         // Variants we don't have a typed mapping for yet pass through as
         // RawAgentUpdate so the UI can render best-effort and we can
         // narrow these as we go.
         other => vec![raw_event(&other)],
     }
+}
+
+/// Map a snapshot of ACP `SessionConfigOption`s (typically pulled
+/// from `NewSessionResponse.config_options` or
+/// `LoadSessionResponse.config_options`) into one
+/// `Event::ConfigOptionsUpdated`. Returns `None` only when the
+/// snapshot itself is absent (the adapter did not include the field).
+/// A present-but-empty snapshot is still a real full replacement and
+/// must be propagated, otherwise stale cached selectors never clear
+/// when an adapter intentionally drops them. See #1403.
+fn config_options_event(
+    options: Option<Vec<agent_client_protocol::schema::SessionConfigOption>>,
+) -> Option<Event> {
+    let raw = options?;
+    let mapped: Vec<ConfigOptionDescriptor> =
+        raw.into_iter().filter_map(map_acp_config_option).collect();
+    Some(Event::ConfigOptionsUpdated { options: mapped })
+}
+
+/// Build a cockpit `ConfigOptionDescriptor` from an ACP
+/// `SessionConfigOption`. Returns `None` when the option has a kind
+/// the cockpit does not yet render (today everything except `Select`).
+/// See #1403.
+fn map_acp_config_option(
+    option: agent_client_protocol::schema::SessionConfigOption,
+) -> Option<ConfigOptionDescriptor> {
+    use agent_client_protocol::schema::{
+        SessionConfigKind, SessionConfigOptionCategory, SessionConfigSelectOptions,
+    };
+
+    let category = option.category.map(|c| match c {
+        SessionConfigOptionCategory::Mode => ConfigOptionCategory::Mode,
+        SessionConfigOptionCategory::Model => ConfigOptionCategory::Model,
+        SessionConfigOptionCategory::ThoughtLevel => ConfigOptionCategory::ThoughtLevel,
+        SessionConfigOptionCategory::Other(s) => ConfigOptionCategory::Other(s),
+        _ => ConfigOptionCategory::Other(String::new()),
+    });
+
+    // Only `Select` is rendered today; future kinds (boolean toggles
+    // behind `unstable_boolean_config`) skip until the cockpit grows a
+    // matching widget. The schema enum is `#[non_exhaustive]` so a
+    // catch-all is required.
+    let select = match option.kind {
+        SessionConfigKind::Select(s) => s,
+        _ => return None,
+    };
+
+    let choices: Vec<ConfigOptionChoice> = match select.options {
+        SessionConfigSelectOptions::Ungrouped(opts) => opts
+            .into_iter()
+            .map(|o| ConfigOptionChoice {
+                value: o.value.0.to_string(),
+                name: o.name,
+                description: o.description,
+            })
+            .collect(),
+        SessionConfigSelectOptions::Grouped(groups) => groups
+            .into_iter()
+            .flat_map(|g| {
+                g.options.into_iter().map(|o| ConfigOptionChoice {
+                    value: o.value.0.to_string(),
+                    name: o.name,
+                    description: o.description,
+                })
+            })
+            .collect(),
+        // Catch-all for `#[non_exhaustive]` future variants.
+        _ => Vec::new(),
+    };
+
+    Some(ConfigOptionDescriptor {
+        id: option.id.0.to_string(),
+        name: option.name,
+        description: option.description,
+        category: category.unwrap_or(ConfigOptionCategory::Other(String::new())),
+        current_value: select.current_value.0.to_string(),
+        options: choices,
+    })
 }
 
 fn map_plan_status(status: agent_client_protocol::schema::PlanEntryStatus) -> PlanStepStatus {
@@ -1741,6 +2956,53 @@ fn extract_tool_content_text(blocks: &[agent_client_protocol::schema::ToolCallCo
     out
 }
 
+/// Inspect a `tool_call` payload for the `memory_recall` shape
+/// claude-agent-acp v0.37.0 routes through the tool channel (upstream
+/// #703). The adapter sends `_meta.claudeCode.toolName == "memory_recall"`
+/// plus either `locations` (recall mode, one entry per loaded memory
+/// file) or `content` (synthesize mode, one text block with the
+/// synthesised reply). Returns `None` when the meta marker is absent.
+/// Caller gates this on `AgentProfile::supports_memory_recall_tool`
+/// so unrelated agents that happen to share field shapes don't trip
+/// the classifier.
+fn extract_memory_recall(
+    meta: &Option<serde_json::Map<String, serde_json::Value>>,
+    locations: &[agent_client_protocol::schema::ToolCallLocation],
+    content: &[agent_client_protocol::schema::ToolCallContent],
+) -> Option<MemoryRecall> {
+    let map = meta.as_ref()?;
+    let claude_code = map.get("claudeCode")?;
+    let tool_name = claude_code.get("toolName").and_then(|v| v.as_str())?;
+    if tool_name != "memory_recall" {
+        return None;
+    }
+    let mode = claude_code
+        .get("toolResponse")
+        .and_then(|tr| tr.get("mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("recall")
+        .to_string();
+    let paths: Vec<String> = locations
+        .iter()
+        .map(|loc| loc.path.to_string_lossy().to_string())
+        .collect();
+    let synthesized_text = if mode == "synthesize" {
+        let text = extract_tool_content_text(content);
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    } else {
+        None
+    };
+    Some(MemoryRecall {
+        mode,
+        paths,
+        synthesized_text,
+    })
+}
+
 fn extract_diff_from_locations(
     _locations: &[agent_client_protocol::schema::ToolCallLocation],
 ) -> Option<DiffPreview> {
@@ -1763,6 +3025,9 @@ async fn run_connection_task<W, R>(
     socket_path: Option<PathBuf>,
     mode: ConnectMode,
     ready_tx: Option<oneshot::Sender<Result<(), AcpError>>>,
+    profile: &'static agent_profiles::AgentProfile,
+    expected_agent: ExpectedAgent,
+    source_profile: Option<String>,
 ) where
     W: futures_util::AsyncWrite + Send + 'static,
     R: futures_util::AsyncRead + Send + 'static,
@@ -1777,6 +3042,31 @@ async fn run_connection_task<W, R>(
     let pending_for_perm = pending_responders.clone();
     let mut cmd_rx = cmd_rx;
     let session_label_for_log = session_label.clone();
+
+    // Silent-orphan watchdog plumbing. The notification handler
+    // classifies each inbound `SessionUpdate` into a `LifecycleSignal`
+    // (or `None` for ambient state like mode/available_commands) and
+    // sends it over a dedicated mpsc to the prompt loop, which owns the
+    // `Instant` timers and the in-flight tool map. Keeping the timer
+    // state inside the prompt loop avoids the cross-task contention of
+    // a shared atomic and scopes liveness cleanly to the current
+    // prompt. See #1240.
+    //
+    // Signals are wrapped in `LifecycleEnvelope { epoch, signal }`
+    // tagged with the prompt epoch that was current at signal-
+    // construction time. The prompt loop increments
+    // `current_prompt_epoch` before issuing each `session/prompt` and
+    // discards envelopes whose epoch is not the current one. This
+    // makes the awaited `send` paths safe across prompt boundaries:
+    // a notification handler parked on a full channel from the
+    // previous prompt cannot leak its stale signal into the next
+    // prompt's watchdog state when it eventually wakes up. See #1401
+    // post-impl review.
+    let (lifecycle_signal_tx, lifecycle_signal_rx) = mpsc::channel::<LifecycleEnvelope>(128);
+    let lifecycle_signal_tx_for_notif = lifecycle_signal_tx.clone();
+    let mut lifecycle_signal_rx = lifecycle_signal_rx;
+    let current_prompt_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let current_prompt_epoch_for_notif = current_prompt_epoch.clone();
     let res_read = resources.clone();
     let res_write = resources.clone();
     let res_term_create = resources.clone();
@@ -1824,11 +3114,83 @@ async fn run_connection_task<W, R>(
                 let suppress = suppress_for_notif.clone();
                 let session_label = session_label_for_notif.clone();
                 let last_event_at = last_event_at_for_notif.clone();
+                let lifecycle_signal_tx = lifecycle_signal_tx_for_notif.clone();
+                let current_prompt_epoch = current_prompt_epoch_for_notif.clone();
                 async move {
                     last_event_at
                         .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
                     let suppressing = suppress.load(Ordering::Relaxed);
-                    for event in map_update_to_events(notification.update) {
+                    // Snapshot the prompt epoch ONCE per notification so
+                    // every signal derived from this update shares the
+                    // same epoch. If the prompt loop bumps the atomic
+                    // between the classifier call and the send, the
+                    // envelope's epoch reflects the prompt the signal
+                    // semantically belongs to (the one current when
+                    // the notification arrived), not the one that
+                    // started racing it.
+                    let envelope_epoch =
+                        current_prompt_epoch.load(Ordering::Relaxed);
+                    // Classify before consuming `notification.update` in
+                    // the event mapping below; emit only when we're not
+                    // in the post-load history-replay window so stale
+                    // chunks from a prior turn can't influence the
+                    // current prompt's silent-orphan state machine.
+                    let lifecycle_signal = if suppressing {
+                        None
+                    } else {
+                        classify_lifecycle_signal(&notification.update)
+                    };
+                    // Derive `WakeupPending` directly from the source
+                    // update so it only fires on a successful
+                    // `ToolCallUpdate { status: Completed, title:
+                    // ScheduleWakeup }`. Scanning `mapped_events` for
+                    // `Event::WakeupScheduled` instead would let the
+                    // initial `ToolCall` frame (tool not yet completed)
+                    // and any in-progress / failed completion trip
+                    // suppression for `delay + base_grace`, masking a
+                    // real adapter wedge. See CodeRabbit review on
+                    // PR #1406.
+                    let wakeup_signal = if suppressing {
+                        None
+                    } else {
+                        wakeup_lifecycle_signal_from_update(&notification.update, profile)
+                    };
+                    let mapped_events = map_update_to_events(notification.update, profile);
+                    // Deliver lifecycle signals BEFORE publishing the
+                    // user-visible event vector. The watchdog uses
+                    // ToolStarted / ToolCompleted / WakeupPending /
+                    // TerminalUsage to decide whether to fire; if
+                    // `event_tx.send().await` backpressures (slow web
+                    // consumer, replay drain), the prompt-loop tick
+                    // could otherwise evaluate `should_fire` before
+                    // ever seeing the suppression-bearing signal and
+                    // cancel a legitimate wait. Watchdog correctness
+                    // wins; UI ordering is reconciled by the event
+                    // store's monotonic seq anyway. See #1401 post-
+                    // impl review.
+                    if let Some(sig) = lifecycle_signal {
+                        send_lifecycle_signal(
+                            &lifecycle_signal_tx,
+                            LifecycleEnvelope {
+                                epoch: envelope_epoch,
+                                signal: sig,
+                            },
+                            &session_label,
+                        )
+                        .await;
+                    }
+                    if let Some(sig) = wakeup_signal {
+                        send_lifecycle_signal(
+                            &lifecycle_signal_tx,
+                            LifecycleEnvelope {
+                                epoch: envelope_epoch,
+                                signal: sig,
+                            },
+                            &session_label,
+                        )
+                        .await;
+                    }
+                    for event in mapped_events {
                         // During the post-load replay window, drop only
                         // events that would reproduce the prior turns'
                         // visible transcript (assistant chunks, tool
@@ -1862,7 +3224,8 @@ async fn run_connection_task<W, R>(
                 let event_tx = event_tx_for_perm.clone();
                 let pending = pending_for_perm.clone();
                 async move {
-                    handle_permission_request(request, responder, event_tx, pending).await
+                    handle_permission_request(request, responder, event_tx, pending, profile)
+                        .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -1948,6 +3311,41 @@ async fn run_connection_task<W, R>(
                 )
                 .block_task()
                 .await?;
+
+            // Per-adapter compatibility check (see src/cockpit/agent_compat.rs).
+            // Currently only gates claude-agent-acp at >=0.37.0; other
+            // adapters pass through. On rejection: route the structured
+            // detail through the typed `AcpError::IncompatibleAgent`
+            // variant on ready_tx so the supervisor sees it on the
+            // spawn-failure path. The supervisor mirrors the detail into
+            // `Event::IncompatibleAgent` + `Event::AgentStartupError`
+            // through the broadcast sink (the in-process `event_tx`
+            // here is dropped on the floor when spawn() returns Err, so
+            // any events emitted from this closure would never reach the
+            // reducer). The supervisor also terminates the detached
+            // runner; we close the connection cleanly via `return Ok(())`
+            // so the outer cleanup at line ~3500 doesn't double-emit an
+            // AgentStartupError on top of the structured one.
+            if let Err(err) = agent_compat::validate(expected_agent, &init) {
+                let user_message = err.user_message();
+                warn!(
+                    target: "cockpit.acp",
+                    session = %session_label,
+                    kind = err.kind(),
+                    message = %user_message,
+                    "agent compatibility check failed; refusing to enter session"
+                );
+                let detail = StartupErrorDetail::from(&err);
+                if let Some(tx) = ready_for_block.lock().await.take() {
+                    let _ = tx.send(Err(AcpError::IncompatibleAgent(Box::new(
+                        IncompatibleAgentError {
+                            detail,
+                            message: user_message,
+                        },
+                    ))));
+                }
+                return Ok(());
+            }
 
             let load_session_capable = init.agent_capabilities.load_session;
             // Snapshot the watchdog-arming flag before `mode` is moved
@@ -2039,7 +3437,7 @@ async fn run_connection_task<W, R>(
                             suppress_for_block.store(true, Ordering::Relaxed);
                             let req = LoadSessionRequest::new(stored.clone(), cwd.clone());
                             match connection.send_request(req).block_task().await {
-                                Ok(_resp) => {
+                                Ok(resp) => {
                                     info!(
                                         target: "cockpit.acp",
                                         session = %session_label,
@@ -2058,6 +3456,15 @@ async fn run_connection_task<W, R>(
                                             acp_session_id: stored.clone(),
                                         })
                                         .await;
+                                    // Per ACP schema 0.12, LoadSessionResponse
+                                    // carries config_options. Surface them so
+                                    // the cockpit picker hydrates on resume
+                                    // without waiting for a notification. See
+                                    // #1403.
+                                    if let Some(event) = config_options_event(resp.config_options)
+                                    {
+                                        let _ = event_tx_for_block.send(event).await;
+                                    }
                                     acp_session_id = Some(SessionId::from(stored));
                                 }
                                 Err(e) => {
@@ -2119,6 +3526,17 @@ async fn run_connection_task<W, R>(
                                     modes: infos,
                                 })
                                 .await;
+                        }
+
+                        // Per ACP schema 0.12, NewSessionResponse carries
+                        // config_options (claude-agent-acp v0.37.0 emits the
+                        // initial model + effort + mode set here, not as a
+                        // subsequent notification). Surface them so the
+                        // cockpit pickers render immediately. See #1403.
+                        if let Some(event) =
+                            config_options_event(new_session.config_options.clone())
+                        {
+                            let _ = event_tx_for_block.send(event).await;
                         }
 
                         // Tell the server-side listener so it can persist the
@@ -2214,6 +3632,55 @@ async fn run_connection_task<W, R>(
                         // we serialise the loop on the prompt's await, the
                         // cancel sits idle in the channel and only goes
                         // out after the turn already finished.
+                        // Bump the prompt epoch BEFORE issuing the new
+                        // `session/prompt`. Notification-handler tasks
+                        // parked on a full lifecycle channel from the
+                        // previous prompt may still wake and send their
+                        // envelopes; tagged with the old epoch, they
+                        // get discarded in the select arm below
+                        // instead of contaminating this prompt's
+                        // watchdog state. Drain any envelopes already
+                        // sitting in the channel too, to bound the
+                        // number we'd otherwise re-check via the
+                        // discard path. See #1401 post-impl review.
+                        let this_prompt_epoch = current_prompt_epoch
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            + 1;
+                        while lifecycle_signal_rx.try_recv().is_ok() {}
+
+                        // Per-prompt silent-orphan state machine. Owned
+                        // by the prompt loop, mutated only via
+                        // `apply_signal`, queried only via `should_fire`.
+                        // The watchdog stays disarmed until
+                        // `saw_first_progress` becomes true (some
+                        // progress notification arrived for this turn)
+                        // AND `tool_calls_in_flight` is empty (no open
+                        // tool to legitimately be silent for) AND no
+                        // active `wakeup_suppress_until` deadline. The
+                        // effective grace adapts to off-protocol work
+                        // (async-agent, backgrounded Bash) and the
+                        // cost-populated UsageUpdate "wrap up accounting"
+                        // marker. See #1240, #1360, #1401.
+                        let mut watchdog = SilentOrphanWatchdog::new();
+                        let mut orphan_cancel_sent = false;
+                        let mut prompt_orphaned = false;
+
+                        let silent_orphan_grace_default =
+                            silent_orphan_grace(source_profile.as_deref());
+                        let silent_orphan_grace_fast =
+                            silent_orphan_fast_grace(source_profile.as_deref());
+                        let silent_orphan_enabled =
+                            silent_orphan_grace_default > std::time::Duration::ZERO;
+                        let silent_orphan_check_period = silent_orphan_check_interval();
+                        let watchdog_cfg = SilentOrphanWatchdogConfig {
+                            base_grace: silent_orphan_grace_default,
+                            fast_grace: silent_orphan_grace_fast,
+                            off_protocol_grace_floor: OFF_PROTOCOL_WORK_GRACE_FLOOR,
+                        };
+                        let silent_orphan_check =
+                            tokio::time::sleep(silent_orphan_check_period);
+                        tokio::pin!(silent_orphan_check);
+
                         let prompt_fut = connection
                             .send_request(PromptRequest::new(
                                 acp_session_id.clone(),
@@ -2222,11 +3689,210 @@ async fn run_connection_task<W, R>(
                             .block_task();
                         tokio::pin!(prompt_fut);
 
+                        // Debug-only fault injection: when this env var
+                        // is set, the prompt_fut select arm is gated
+                        // off so the response is never observed even
+                        // if it arrives. The silent-orphan watchdog
+                        // must then fire to break the loop, which is
+                        // the entire point of the manual repro recipe
+                        // for #1240. Single-shot: the env var is
+                        // cleared after first read so subsequent
+                        // prompts are healthy. Release builds set
+                        // this to `false` const and the prompt_fut
+                        // arm is unconditionally polled.
+                        #[cfg(debug_assertions)]
+                        let simulate_orphan = {
+                            let on = std::env::var("AOE_COCKPIT_SIMULATE_ORPHAN_NEXT_PROMPT")
+                                .ok()
+                                .as_deref()
+                                == Some("1");
+                            if on {
+                                warn!(
+                                    target: "cockpit.acp",
+                                    session = %session_label,
+                                    "AOE_COCKPIT_SIMULATE_ORPHAN_NEXT_PROMPT set; suppressing prompt_fut completion to trigger silent-orphan watchdog"
+                                );
+                                std::env::remove_var("AOE_COCKPIT_SIMULATE_ORPHAN_NEXT_PROMPT");
+                            }
+                            on
+                        };
+                        #[cfg(not(debug_assertions))]
+                        let simulate_orphan = false;
+
                         let mut shutdown = false;
+                        // Cancel-escalation watchdog. The first
+                        // `session/cancel` sent while the prompt future is
+                        // still pending arms a 10s timer; if the agent
+                        // doesn't resolve the prompt before it fires (or
+                        // the user submits a follow-up prompt while we're
+                        // already cancelling, which means they've already
+                        // clicked "Force end turn" and re-typed), we
+                        // declare the agent unresponsive, end the
+                        // connection task, and let the supervisor drain
+                        // path SIGTERM the runner and respawn with
+                        // session/load for transcript continuity. Without
+                        // this, claude-agent-acp ignoring cancel in the
+                        // middle of a `block: true` TaskOutput leaves the
+                        // daemon's `prompt_fut` pinned forever and every
+                        // follow-up prompt is silently dropped. See #1196.
+                        let mut agent_unresponsive = false;
+                        let mut rate_limited = false;
+                        // True when the adapter resolves the in-flight
+                        // session/prompt with `StopReason::Cancelled`,
+                        // i.e. the user cancelled and the adapter
+                        // acknowledged cleanly. claude-agent-acp >=0.37.0
+                        // emits this natively per upstream #694; older
+                        // adapters surfaced cancellation as `EndTurn` so
+                        // the cancel-escalation watchdog was aoe's only
+                        // signal. The 10s watchdog still runs as a
+                        // transport-wedge defense; this flag only
+                        // affects the terminal Stopped reason string so
+                        // the reducer can distinguish a user-driven
+                        // stop from a clean turn completion.
+                        let mut prompt_cancelled = false;
+                        let mut cancelling = false;
+                        let cancel_grace = tokio::time::sleep(CANCEL_ESCALATION_GRACE);
+                        tokio::pin!(cancel_grace);
+
                         loop {
                             tokio::select! {
-                                res = &mut prompt_fut => {
-                                    let _ = res?;
+                                res = &mut prompt_fut, if !simulate_orphan => {
+                                    match res {
+                                        Ok(resp) => {
+                                            // Capture the native stop reason so
+                                            // the terminal emission downstream
+                                            // can distinguish a cancelled turn
+                                            // (StopReason::Cancelled, claude-agent-acp
+                                            // >=0.37.0 per upstream #694) from a
+                                            // clean turn completion. EndTurn /
+                                            // MaxTokens / MaxTurnRequests / Refusal
+                                            // all collapse to `prompt_complete`
+                                            // for compatibility with the existing
+                                            // reducer; we only surface
+                                            // `cancelled` because it has a
+                                            // distinct UI implication.
+                                            if matches!(resp.stop_reason, StopReason::Cancelled) {
+                                                prompt_cancelled = true;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            // Rate-limit on session/prompt is not
+                                            // a worker crash. Emit a typed
+                                            // RateLimit event so the UI banner
+                                            // surfaces reset time, then mark the
+                                            // turn rate_limited and exit the
+                                            // connection task cleanly. The drain
+                                            // task watches for Stopped{rate_limited}
+                                            // and short-circuits restart_decision
+                                            // so the supervisor doesn't burn
+                                            // restart budget respawning a worker
+                                            // that will hit the same limit
+                                            // immediately on retry. See #1281.
+                                            if let Some(info) = classify_rate_limit_error(&e) {
+                                                info!(
+                                                    target: "cockpit.acp",
+                                                    session = %session_label,
+                                                    resets_at = %info.resets_at,
+                                                    "session/prompt returned rate_limit; parking session"
+                                                );
+                                                let _ = event_tx_for_block
+                                                    .send(Event::RateLimit { info })
+                                                    .await;
+                                                rate_limited = true;
+                                                shutdown = true;
+                                                break;
+                                            }
+                                            return Err(e);
+                                        }
+                                    }
+                                    break;
+                                }
+                                env = lifecycle_signal_rx.recv() => {
+                                    if let Some(env) = env {
+                                        if env.epoch != this_prompt_epoch {
+                                            // Stale envelope from a prior
+                                            // prompt (handler was parked on
+                                            // a full channel and only
+                                            // unblocked after the next
+                                            // prompt began). Discard.
+                                            trace!(
+                                                target: "cockpit.acp",
+                                                session = %session_label,
+                                                envelope_epoch = env.epoch,
+                                                current_epoch = this_prompt_epoch,
+                                                "discarding stale lifecycle envelope across prompt boundary"
+                                            );
+                                        } else {
+                                            watchdog.apply_signal(
+                                                env.signal,
+                                                tokio::time::Instant::now(),
+                                                chrono::Utc::now(),
+                                                watchdog_cfg,
+                                            );
+                                        }
+                                    }
+                                    // None means the notification handler dropped; the
+                                    // prompt_fut or cancel_grace arm will end the loop.
+                                }
+                                _ = &mut silent_orphan_check,
+                                    if silent_orphan_enabled && !orphan_cancel_sent =>
+                                {
+                                    let now = tokio::time::Instant::now();
+                                    let should_fire = watchdog.should_fire(now, watchdog_cfg);
+                                    if should_fire {
+                                        warn!(
+                                            target: "cockpit.acp",
+                                            session = %session_label,
+                                            off_protocol_work = ?watchdog.off_protocol_work_seen(),
+                                            in_flight_tools = watchdog.tool_calls_in_flight_len(),
+                                            grace_secs = watchdog.effective_grace(watchdog_cfg).as_secs(),
+                                            "silent-orphan watchdog fired: no progress past grace and no in-flight tools; sending session/cancel"
+                                        );
+                                        // Best-effort cancel; reuse
+                                        // existing escalation path. If
+                                        // the adapter resolves within
+                                        // CANCEL_ESCALATION_GRACE the
+                                        // prompt_fut arm wins; if not,
+                                        // the cancel_grace arm fires
+                                        // and we synthesize Stopped
+                                        // with reason "prompt_orphaned".
+                                        if let Err(err) = connection.send_notification(
+                                            CancelNotification::new(acp_session_id.clone()),
+                                        ) {
+                                            warn!(
+                                                target: "cockpit.acp",
+                                                session = %session_label,
+                                                error = %err,
+                                                "silent-orphan: session/cancel send failed; escalating immediately"
+                                            );
+                                            prompt_orphaned = true;
+                                            shutdown = true;
+                                            break;
+                                        }
+                                        orphan_cancel_sent = true;
+                                        prompt_orphaned = true;
+                                        if !cancelling {
+                                            cancelling = true;
+                                            cancel_grace.as_mut().reset(
+                                                tokio::time::Instant::now()
+                                                    + CANCEL_ESCALATION_GRACE,
+                                            );
+                                        }
+                                    }
+                                    silent_orphan_check.as_mut().reset(
+                                        tokio::time::Instant::now()
+                                            + silent_orphan_check_period,
+                                    );
+                                }
+                                _ = &mut cancel_grace, if cancelling => {
+                                    warn!(
+                                        target: "cockpit.acp",
+                                        session = %session_label,
+                                        grace_secs = CANCEL_ESCALATION_GRACE.as_secs(),
+                                        "agent ignored session/cancel past grace window; escalating to runner restart"
+                                    );
+                                    agent_unresponsive = true;
+                                    shutdown = true;
                                     break;
                                 }
                                 cmd = cmd_rx.recv() => {
@@ -2239,9 +3905,65 @@ async fn run_connection_task<W, R>(
                                             connection.send_notification(
                                                 CancelNotification::new(acp_session_id.clone()),
                                             )?;
-                                            // Keep awaiting the prompt; the
-                                            // agent should resolve it with
-                                            // StopReason::Cancelled.
+                                            // Arm the escalation watchdog on
+                                            // the first cancel only; later
+                                            // cancels just resend the
+                                            // notification.
+                                            if !cancelling {
+                                                cancelling = true;
+                                                cancel_grace.as_mut().reset(
+                                                    tokio::time::Instant::now()
+                                                        + CANCEL_ESCALATION_GRACE,
+                                                );
+                                            }
+                                        }
+                                        Some(ClientCmd::SetConfigOption { config_id, value }) => {
+                                            info!(
+                                                target: "cockpit.acp",
+                                                "sending session/set_config_option {config_id}={value} during in-flight prompt"
+                                            );
+                                            let sent = connection.send_request(
+                                                SetSessionConfigOptionRequest::new(
+                                                    acp_session_id.clone(),
+                                                    SessionConfigId::new(config_id.clone()),
+                                                    SessionConfigValueId::new(value.clone()),
+                                                ),
+                                            );
+                                            let tx = event_tx_for_block.clone();
+                                            tokio::spawn(async move {
+                                                match sent.block_task().await {
+                                                    Ok(resp) => {
+                                                        // claude-agent-acp's setSessionConfigOption
+                                                        // returns the full updated config_options
+                                                        // list in the response but does NOT emit a
+                                                        // follow-up `config_option_update`
+                                                        // notification (see acp-agent.js:1003-1057).
+                                                        // Synthesize ConfigOptionsUpdated from the
+                                                        // response so the frontend reducer clears
+                                                        // pending state and shows the new current
+                                                        // value. See #1403.
+                                                        if let Some(event) =
+                                                            config_options_event(Some(resp.config_options))
+                                                        {
+                                                            let _ = tx.send(event).await;
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        let reason = format!("{e}");
+                                                        warn!(
+                                                            target: "cockpit.acp",
+                                                            "session/set_config_option failed mid-turn: {reason}"
+                                                        );
+                                                        let _ = tx
+                                                            .send(Event::ConfigOptionSwitchFailed {
+                                                                config_id,
+                                                                value,
+                                                                reason,
+                                                            })
+                                                            .await;
+                                                    }
+                                                }
+                                            });
                                         }
                                         Some(ClientCmd::SetMode(mode_id)) => {
                                             info!(
@@ -2281,21 +4003,64 @@ async fn run_connection_task<W, R>(
                                                             .await;
                                                     }
                                                     Err(e) => {
+                                                        let reason = format!("{e}");
                                                         warn!(
                                                             target: "cockpit.acp",
-                                                            "session/set_mode failed mid-turn: {e}"
+                                                            "session/set_mode failed mid-turn: {reason}"
                                                         );
+                                                        let _ = tx
+                                                            .send(Event::ModeSwitchFailed {
+                                                                mode_id,
+                                                                reason,
+                                                            })
+                                                            .await;
                                                     }
                                                 }
                                             });
                                         }
-                                        Some(ClientCmd::Prompt(_)) => {
-                                            // Client-side prompt queueing is
-                                            // tracked separately in #1031.
+                                        Some(ClientCmd::Prompt(rejected_text)) => {
+                                            // Surface the dropped prompt
+                                            // to the UI so the user can
+                                            // retry from a Rejected pill
+                                            // instead of having their
+                                            // message vanish silently.
+                                            // Client-side composer queueing
+                                            // is tracked separately in
+                                            // #1031; this event covers the
+                                            // server-side gap when a prompt
+                                            // does make it to the daemon
+                                            // while another is in flight.
                                             warn!(
                                                 target: "cockpit.acp",
-                                                "received Prompt while one is in flight; dropping (queueing tracked in #1031)"
+                                                "received Prompt while one is in flight; rejecting"
                                             );
+                                            let _ = event_tx_for_block
+                                                .send(Event::PromptRejected {
+                                                    reason: "agent_busy".into(),
+                                                    text: rejected_text,
+                                                })
+                                                .await;
+                                            // A follow-up arriving while
+                                            // a cancel is in flight means
+                                            // the user has clicked Force
+                                            // end turn (which optimistically
+                                            // unlocked the composer via the
+                                            // supervisor's synthetic Stopped)
+                                            // and then re-typed. That's a
+                                            // strong signal the agent is
+                                            // wedged; escalate immediately
+                                            // without waiting for the 10s
+                                            // grace.
+                                            if cancelling {
+                                                warn!(
+                                                    target: "cockpit.acp",
+                                                    session = %session_label,
+                                                    "follow-up prompt arrived while cancel pending; escalating to runner restart"
+                                                );
+                                                agent_unresponsive = true;
+                                                shutdown = true;
+                                                break;
+                                            }
                                         }
                                         Some(ClientCmd::Shutdown) | None => {
                                             info!(
@@ -2314,8 +4079,37 @@ async fn run_connection_task<W, R>(
                         // Consumers (reducer, persisted status) need a single
                         // turn-end event per turn or they sit on a stale
                         // "in flight" state forever.
-                        let reason = if shutdown {
+                        //
+                        // Reason precedence:
+                        //   - `rate_limited` wins because it's a typed
+                        //     non-crash signal from prompt_fut Err; the
+                        //     drain task short-circuits respawn on it
+                        //     (#1281), so collapsing it into a generic
+                        //     reason would burn restart budget.
+                        //   - `prompt_orphaned` next because the
+                        //     silent-orphan path is the proximate cause;
+                        //     if the cancel-escalation watchdog then
+                        //     fires it's a downstream effect of the same
+                        //     wedge, and collapsing both into
+                        //     "agent_unresponsive" would lose the
+                        //     failure signature in postmortems. See
+                        //     #1240.
+                        let reason = if rate_limited {
+                            "rate_limited"
+                        } else if prompt_orphaned {
+                            "prompt_orphaned"
+                        } else if agent_unresponsive {
+                            "agent_unresponsive"
+                        } else if shutdown {
                             "shutdown"
+                        } else if prompt_cancelled {
+                            // The adapter resolved cancel cleanly with
+                            // StopReason::Cancelled (upstream #694). The
+                            // 10s cancel-escalation watchdog never
+                            // promoted this to `agent_unresponsive`, so
+                            // surface the cleanly-cancelled signal
+                            // distinctly from `prompt_complete`.
+                            "cancelled"
                         } else {
                             "prompt_complete"
                         };
@@ -2352,7 +4146,55 @@ async fn run_connection_task<W, R>(
                                         .await;
                                 }
                                 Err(e) => {
-                                    warn!(target: "cockpit.acp", "session/set_mode failed: {e}");
+                                    let reason = format!("{e}");
+                                    warn!(target: "cockpit.acp", "session/set_mode failed: {reason}");
+                                    let _ = tx
+                                        .send(Event::ModeSwitchFailed { mode_id, reason })
+                                        .await;
+                                }
+                            }
+                        });
+                    }
+                    Some(ClientCmd::SetConfigOption { config_id, value }) => {
+                        info!(
+                            target: "cockpit.acp",
+                            "sending session/set_config_option {config_id}={value}"
+                        );
+                        let sent = connection.send_request(SetSessionConfigOptionRequest::new(
+                            acp_session_id.clone(),
+                            SessionConfigId::new(config_id.clone()),
+                            SessionConfigValueId::new(value.clone()),
+                        ));
+                        let tx = event_tx_for_block.clone();
+                        tokio::spawn(async move {
+                            match sent.block_task().await {
+                                Ok(resp) => {
+                                    // claude-agent-acp's setSessionConfigOption returns the
+                                    // full updated config_options list in the response but
+                                    // does NOT emit a follow-up `config_option_update`
+                                    // notification (see acp-agent.js:1003-1057). Synthesize
+                                    // ConfigOptionsUpdated from the response so the frontend
+                                    // reducer clears pending state and shows the new
+                                    // current value. See #1403.
+                                    if let Some(event) =
+                                        config_options_event(Some(resp.config_options))
+                                    {
+                                        let _ = tx.send(event).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    let reason = format!("{e}");
+                                    warn!(
+                                        target: "cockpit.acp",
+                                        "session/set_config_option failed: {reason}"
+                                    );
+                                    let _ = tx
+                                        .send(Event::ConfigOptionSwitchFailed {
+                                            config_id,
+                                            value,
+                                            reason,
+                                        })
+                                        .await;
                                 }
                             }
                         });
@@ -2381,6 +4223,24 @@ async fn run_connection_task<W, R>(
             // hint instead of a silent dead session.
             if let Some(tx) = ready_tx.lock().await.take() {
                 let _ = tx.send(Err(AcpError::Spawn(message.clone())));
+            } else if let Some(info) = classify_rate_limit_from_message(&message) {
+                // Defensive: rate-limit can also surface from paths the
+                // prompt arm doesn't cover (handshake-time, mid-handshake
+                // request). Treat it as a parked terminal state instead
+                // of a generic startup error so the supervisor drain
+                // task observes the same Stopped{rate_limited} signal
+                // and skips the restart loop.
+                info!(
+                    target: "cockpit.acp",
+                    session = %session_label_for_log,
+                    "connection task ended with rate_limit; emitting RateLimit + Stopped"
+                );
+                let _ = event_tx.send(Event::RateLimit { info }).await;
+                let _ = event_tx
+                    .send(Event::Stopped {
+                        reason: "rate_limited".into(),
+                    })
+                    .await;
             } else {
                 let _ = event_tx.send(Event::AgentStartupError { message }).await;
             }
@@ -2428,10 +4288,16 @@ async fn run_connection_task<W, R>(
 /// download stall) returns a clear typed error instead of leaving the
 /// supervisor parked indefinitely. Also watches for early child exit
 /// and surfaces stderr in the message so callers see why it died.
+///
+/// `install_binary` is the binary name from `AgentSpec.command` so the
+/// timeout message points users at the right install command for the
+/// specific agent (codex-acp / opencode / gemini, not always
+/// claude-agent-acp).
 async fn wait_for_handshake(
     session_label: &str,
     ready_rx: oneshot::Receiver<Result<(), AcpError>>,
     child: Option<&Arc<Mutex<tokio::process::Child>>>,
+    install_binary: &str,
 ) -> Result<(), AcpError> {
     let timeout = std::time::Duration::from_secs(30);
     match tokio::time::timeout(timeout, ready_rx).await {
@@ -2455,12 +4321,15 @@ async fn wait_for_handshake(
                 let mut guard = child.lock().await;
                 let _ = guard.kill().await;
             }
+            let install_hint = super::install_hints::install_hint_for(install_binary)
+                .unwrap_or("install the adapter for the configured agent and re-run");
             Err(AcpError::Spawn(format!(
                 "agent did not complete the ACP initialize handshake within {}s. \
-                 Common causes: `npx -y` is still downloading the adapter on first run, \
+                 Common causes: the adapter is still downloading on first run, \
                  or the configured agent command isn't a real ACP server. \
-                 Try `npm install -g @agentclientprotocol/claude-agent-acp` and re-run.",
-                timeout.as_secs()
+                 Try `{}` and re-run.",
+                timeout.as_secs(),
+                install_hint
             )))
         }
     }
@@ -2475,21 +4344,86 @@ async fn collect_child_failure(child: Option<&Arc<Mutex<tokio::process::Child>>>
     }
 }
 
+/// Issue #1147: monotonic ns-since-process-start, used as a thin
+/// correlation token in the cockpit ACP tool-dispatch trace. Wall-clock
+/// fields like `chrono::Utc::now()` jitter under NTP slew and are too
+/// coarse to detect interleaved entry/exit between concurrent handlers;
+/// `Instant` is monotonic and ns-resolved on every supported platform.
+/// Cast to `u64` because `Instant::elapsed()` returns `Duration` whose
+/// `as_nanos()` is `u128`, which `tracing` formats less compactly. A
+/// `u64` of ns gives ~584 years of headroom, which is plenty.
+fn enter_timestamp_ns() -> u64 {
+    use std::sync::OnceLock;
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    let epoch = EPOCH.get_or_init(std::time::Instant::now);
+    epoch.elapsed().as_nanos() as u64
+}
+
+/// Run a synchronous `fs_handler` operation on the blocking pool and
+/// flatten the join + handler result into a single `FsError`. Centralizes
+/// the panic / cancellation observability so future fs offload sites
+/// stay consistent (the offload series spans seven PRs).
+async fn spawn_blocking_fs<F, T>(handler: &'static str, f: F) -> Result<T, fs_handler::FsError>
+where
+    F: FnOnce() -> Result<T, fs_handler::FsError> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(inner) => inner,
+        Err(e) => {
+            warn!(
+                target: "cockpit.acp",
+                handler,
+                panic = e.is_panic(),
+                cancelled = e.is_cancelled(),
+                error = %e,
+                "fs blocking task join failed"
+            );
+            Err(fs_handler::FsError::Io(std::io::Error::other(format!(
+                "fs {handler} join: {e}"
+            ))))
+        }
+    }
+}
+
 async fn handle_read_text_file(
     request: ReadTextFileRequest,
     responder: Responder<ReadTextFileResponse>,
     res: SessionResources,
 ) -> agent_client_protocol::Result<()> {
-    match fs_handler::handle_read(&res.fs_policy, &res.label, &request.path) {
+    // Issue #1147: parallel-tool-call diagnostics. The `enter_ns` value is a
+    // monotonic ns-since-process-start counter; if the model dispatches N
+    // tool calls in parallel, the entries should interleave (close `enter_ns`
+    // values across handlers) rather than strictly increasing per-handler.
+    let enter_ns = enter_timestamp_ns();
+    trace!(
+        target: "cockpit.acp.tool_dispatch",
+        handler = "read_text_file",
+        path = %request.path.display(),
+        enter_ns,
+        "ACP request handler entered"
+    );
+    // Offload the synchronous file read to the blocking pool. ACP
+    // `fs/read_text_file` is agent driven; a multi-MB file or a slow
+    // disk would otherwise stall the runtime worker for the duration
+    // of the read, blocking every other ACP handler scheduled on the
+    // same worker. FsPolicy is Arc + Clone so the clone is cheap.
+    let policy = Arc::clone(&res.fs_policy);
+    let label = res.label.clone();
+    let ReadTextFileRequest {
+        path, line, limit, ..
+    } = request;
+    let read_outcome = spawn_blocking_fs("read", move || {
+        fs_handler::handle_read(&policy, &label, &path)
+    })
+    .await;
+    let result = match read_outcome {
         Ok(content) => {
             // Honor optional line/limit slicing for ACP semantics: 1-based.
-            let sliced = if request.line.is_some() || request.limit.is_some() {
+            let sliced = if line.is_some() || limit.is_some() {
                 let lines: Vec<&str> = content.lines().collect();
-                let start = request
-                    .line
-                    .map(|l| l.saturating_sub(1) as usize)
-                    .unwrap_or(0);
-                let limit = request.limit.map(|n| n as usize).unwrap_or(usize::MAX);
+                let start = line.map(|l| l.saturating_sub(1) as usize).unwrap_or(0);
+                let limit = limit.map(|n| n as usize).unwrap_or(usize::MAX);
                 let end = start.saturating_add(limit).min(lines.len());
                 if start >= lines.len() {
                     String::new()
@@ -2504,7 +4438,15 @@ async fn handle_read_text_file(
         Err(e) => {
             responder.respond_with_error(agent_client_protocol::util::internal_error(e.to_string()))
         }
-    }
+    };
+    trace!(
+        target: "cockpit.acp.tool_dispatch",
+        handler = "read_text_file",
+        enter_ns,
+        elapsed_ns = enter_timestamp_ns() - enter_ns,
+        "ACP request handler exited"
+    );
+    result
 }
 
 async fn handle_write_text_file(
@@ -2512,12 +4454,39 @@ async fn handle_write_text_file(
     responder: Responder<WriteTextFileResponse>,
     res: SessionResources,
 ) -> agent_client_protocol::Result<()> {
-    match fs_handler::handle_write(&res.fs_policy, &res.label, &request.path, &request.content) {
+    let enter_ns = enter_timestamp_ns();
+    trace!(
+        target: "cockpit.acp.tool_dispatch",
+        handler = "write_text_file",
+        path = %request.path.display(),
+        enter_ns,
+        "ACP request handler entered"
+    );
+    // Offload the synchronous file write to the blocking pool. ACP
+    // `fs/write_text_file` is agent driven; a large content payload
+    // or a slow disk would otherwise stall the runtime worker for
+    // the duration of the write.
+    let policy = Arc::clone(&res.fs_policy);
+    let label = res.label.clone();
+    let WriteTextFileRequest { path, content, .. } = request;
+    let write_outcome = spawn_blocking_fs("write", move || {
+        fs_handler::handle_write(&policy, &label, &path, &content)
+    })
+    .await;
+    let result = match write_outcome {
         Ok(()) => responder.respond(WriteTextFileResponse::new()),
         Err(e) => {
             responder.respond_with_error(agent_client_protocol::util::internal_error(e.to_string()))
         }
-    }
+    };
+    trace!(
+        target: "cockpit.acp.tool_dispatch",
+        handler = "write_text_file",
+        enter_ns,
+        elapsed_ns = enter_timestamp_ns() - enter_ns,
+        "ACP request handler exited"
+    );
+    result
 }
 
 async fn handle_create_terminal(
@@ -2525,23 +4494,62 @@ async fn handle_create_terminal(
     responder: Responder<CreateTerminalResponse>,
     res: SessionResources,
 ) -> agent_client_protocol::Result<()> {
+    let enter_ns = enter_timestamp_ns();
+    trace!(
+        target: "cockpit.acp.tool_dispatch",
+        handler = "create_terminal",
+        command = %request.command,
+        argc = request.args.len(),
+        enter_ns,
+        "ACP request handler entered"
+    );
     let cwd = request.cwd.clone().unwrap_or_else(|| res.cwd.clone());
     // Sandbox the cwd: must be inside session roots.
     if let Err(e) = res.fs_policy.resolve_inside(&cwd) {
-        return responder.respond_with_error(agent_client_protocol::util::internal_error(format!(
+        let r = responder.respond_with_error(agent_client_protocol::util::internal_error(format!(
             "terminal cwd outside session roots: {e}"
         )));
+        trace!(
+            target: "cockpit.acp.tool_dispatch",
+            handler = "create_terminal",
+            enter_ns,
+            elapsed_ns = enter_timestamp_ns() - enter_ns,
+            outcome = "cwd_outside_roots",
+            "ACP request handler exited"
+        );
+        return r;
     }
-    match res
+    let terminal_sandbox = res
+        .sandbox
+        .as_ref()
+        .map(|s| super::terminal_handler::TerminalSandbox {
+            container_name: s.container_name.clone(),
+            env_entries: s.current_env_entries(),
+        });
+    let result = match res
         .terminals
-        .create_and_run(&res.label, &request.command, request.args.clone(), cwd)
+        .create_and_run(
+            &res.label,
+            &request.command,
+            request.args.clone(),
+            cwd,
+            terminal_sandbox.as_ref(),
+        )
         .await
     {
         Ok(id) => responder.respond(CreateTerminalResponse::new(TerminalId::new(id))),
         Err(e) => {
             responder.respond_with_error(agent_client_protocol::util::internal_error(e.to_string()))
         }
-    }
+    };
+    trace!(
+        target: "cockpit.acp.tool_dispatch",
+        handler = "create_terminal",
+        enter_ns,
+        elapsed_ns = enter_timestamp_ns() - enter_ns,
+        "ACP request handler exited"
+    );
+    result
 }
 
 fn build_exit_status(exit_code: Option<i32>) -> agent_client_protocol::schema::TerminalExitStatus {
@@ -2555,7 +4563,15 @@ async fn handle_terminal_output(
     responder: Responder<TerminalOutputResponse>,
     res: SessionResources,
 ) -> agent_client_protocol::Result<()> {
-    match res.terminals.output(request.terminal_id.0.as_ref()).await {
+    let enter_ns = enter_timestamp_ns();
+    trace!(
+        target: "cockpit.acp.tool_dispatch",
+        handler = "terminal_output",
+        terminal_id = %request.terminal_id.0,
+        enter_ns,
+        "ACP request handler entered"
+    );
+    let result = match res.terminals.output(request.terminal_id.0.as_ref()).await {
         Ok(out) => {
             let combined = format!("{}{}", out.stdout, out.stderr);
             responder.respond(
@@ -2566,7 +4582,15 @@ async fn handle_terminal_output(
         Err(e) => {
             responder.respond_with_error(agent_client_protocol::util::internal_error(e.to_string()))
         }
-    }
+    };
+    trace!(
+        target: "cockpit.acp.tool_dispatch",
+        handler = "terminal_output",
+        enter_ns,
+        elapsed_ns = enter_timestamp_ns() - enter_ns,
+        "ACP request handler exited"
+    );
+    result
 }
 
 async fn handle_wait_for_terminal_exit(
@@ -2574,26 +4598,58 @@ async fn handle_wait_for_terminal_exit(
     responder: Responder<WaitForTerminalExitResponse>,
     res: SessionResources,
 ) -> agent_client_protocol::Result<()> {
+    let enter_ns = enter_timestamp_ns();
+    trace!(
+        target: "cockpit.acp.tool_dispatch",
+        handler = "wait_for_terminal_exit",
+        terminal_id = %request.terminal_id.0,
+        enter_ns,
+        "ACP request handler entered"
+    );
     // For our one-shot terminal model, the command has already finished by
     // the time `create_and_run` returns. So `output()` immediately yields
     // the captured exit status.
-    match res.terminals.output(request.terminal_id.0.as_ref()).await {
+    let result = match res.terminals.output(request.terminal_id.0.as_ref()).await {
         Ok(out) => responder.respond(WaitForTerminalExitResponse::new(build_exit_status(
             out.exit_code,
         ))),
         Err(e) => {
             responder.respond_with_error(agent_client_protocol::util::internal_error(e.to_string()))
         }
-    }
+    };
+    trace!(
+        target: "cockpit.acp.tool_dispatch",
+        handler = "wait_for_terminal_exit",
+        enter_ns,
+        elapsed_ns = enter_timestamp_ns() - enter_ns,
+        "ACP request handler exited"
+    );
+    result
 }
 
 async fn handle_kill_terminal(
-    _request: KillTerminalRequest,
+    request: KillTerminalRequest,
     responder: Responder<KillTerminalResponse>,
     _res: SessionResources,
 ) -> agent_client_protocol::Result<()> {
+    let enter_ns = enter_timestamp_ns();
+    trace!(
+        target: "cockpit.acp.tool_dispatch",
+        handler = "kill_terminal",
+        terminal_id = %request.terminal_id.0,
+        enter_ns,
+        "ACP request handler entered"
+    );
     // One-shot terminals are already finished; kill is a no-op.
-    responder.respond(KillTerminalResponse::new())
+    let result = responder.respond(KillTerminalResponse::new());
+    trace!(
+        target: "cockpit.acp.tool_dispatch",
+        handler = "kill_terminal",
+        enter_ns,
+        elapsed_ns = enter_timestamp_ns() - enter_ns,
+        "ACP request handler exited"
+    );
+    result
 }
 
 async fn handle_release_terminal(
@@ -2601,12 +4657,28 @@ async fn handle_release_terminal(
     responder: Responder<ReleaseTerminalResponse>,
     res: SessionResources,
 ) -> agent_client_protocol::Result<()> {
-    match res.terminals.release(request.terminal_id.0.as_ref()).await {
+    let enter_ns = enter_timestamp_ns();
+    trace!(
+        target: "cockpit.acp.tool_dispatch",
+        handler = "release_terminal",
+        terminal_id = %request.terminal_id.0,
+        enter_ns,
+        "ACP request handler entered"
+    );
+    let result = match res.terminals.release(request.terminal_id.0.as_ref()).await {
         Ok(()) => responder.respond(ReleaseTerminalResponse::new()),
         Err(e) => {
             responder.respond_with_error(agent_client_protocol::util::internal_error(e.to_string()))
         }
-    }
+    };
+    trace!(
+        target: "cockpit.acp.tool_dispatch",
+        handler = "release_terminal",
+        enter_ns,
+        elapsed_ns = enter_timestamp_ns() - enter_ns,
+        "ACP request handler exited"
+    );
+    result
 }
 
 async fn handle_permission_request(
@@ -2614,7 +4686,17 @@ async fn handle_permission_request(
     responder: Responder<RequestPermissionResponse>,
     event_tx: mpsc::Sender<Event>,
     pending: PendingResponders,
+    profile: &'static agent_profiles::AgentProfile,
 ) -> agent_client_protocol::Result<()> {
+    let enter_ns = enter_timestamp_ns();
+    let tool_call_id = request.tool_call.tool_call_id.0.to_string();
+    trace!(
+        target: "cockpit.acp.tool_dispatch",
+        handler = "permission_request",
+        tool_call_id = %tool_call_id,
+        enter_ns,
+        "ACP request handler entered"
+    );
     // Build our cockpit-side approval card.
     let title = request
         .tool_call
@@ -2641,7 +4723,8 @@ async fn handle_permission_request(
             .unwrap_or_else(|| "other".into()),
         args_preview,
         started_at: chrono::Utc::now(),
-        parent_tool_call_id: parent_tool_use_id_from_meta(&request.tool_call.meta),
+        parent_tool_call_id: profile.parent_tool_use_id_from_meta(&request.tool_call.meta),
+        memory_recall: None,
     };
     let approval = build_approval(tool_call);
     let nonce = approval.nonce.clone();
@@ -2661,12 +4744,37 @@ async fn handle_permission_request(
     {
         // Receiver gone: cancel.
         pending.lock().await.remove(&nonce);
+        trace!(
+            target: "cockpit.acp.tool_dispatch",
+            handler = "permission_request",
+            tool_call_id = %tool_call_id,
+            enter_ns,
+            elapsed_ns = enter_timestamp_ns() - enter_ns,
+            outcome = "receiver_gone",
+            "ACP request handler exited"
+        );
         return responder.respond(RequestPermissionResponse::new(
             RequestPermissionOutcome::Cancelled,
         ));
     }
 
-    let outcome = match resolve_rx.await {
+    // Issue #1147: this `await` is the suspected serializer for the user-felt
+    // slowness. Log the moment we begin awaiting so a wall-clock comparison
+    // with later "responder.respond" emissions exposes how long each pending
+    // approval blocked the agent's turn.
+    let await_enter_ns = enter_timestamp_ns();
+    trace!(
+        target: "cockpit.acp.tool_dispatch",
+        handler = "permission_request",
+        tool_call_id = %tool_call_id,
+        enter_ns,
+        await_offset_ns = await_enter_ns - enter_ns,
+        "awaiting approval resolution"
+    );
+    // Build outcome + its label together so the exit event never re-matches on
+    // a foreign `#[non_exhaustive]` enum it doesn't fully own.
+    let (outcome, outcome_label): (RequestPermissionOutcome, &'static str) = match resolve_rx.await
+    {
         Ok(ApprovalResolutionMessage::Decision { decision }) => {
             if let Some(option_id) = pick_option_id(&request.options, decision) {
                 // Surface the resolution to UI clients via the typed event channel.
@@ -2676,18 +4784,33 @@ async fn handle_permission_request(
                         decision,
                     })
                     .await;
-                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option_id))
+                (
+                    RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option_id)),
+                    "selected",
+                )
             } else {
                 warn!(
                     target: "cockpit.acp",
                     "agent did not offer a {decision:?}-compatible option; cancelling"
                 );
-                RequestPermissionOutcome::Cancelled
+                (RequestPermissionOutcome::Cancelled, "cancelled")
             }
         }
-        Ok(ApprovalResolutionMessage::Cancelled) | Err(_) => RequestPermissionOutcome::Cancelled,
+        Ok(ApprovalResolutionMessage::Cancelled) | Err(_) => {
+            (RequestPermissionOutcome::Cancelled, "cancelled")
+        }
     };
-
+    let exit_ns = enter_timestamp_ns();
+    trace!(
+        target: "cockpit.acp.tool_dispatch",
+        handler = "permission_request",
+        tool_call_id = %tool_call_id,
+        enter_ns,
+        elapsed_ns = exit_ns - enter_ns,
+        await_ns = exit_ns - await_enter_ns,
+        outcome = outcome_label,
+        "responding to permission request"
+    );
     responder.respond(RequestPermissionResponse::new(outcome))
 }
 
@@ -2703,9 +4826,592 @@ mod tests {
         assert!(matches!(event, Event::ThinkingStarted));
     }
 
+    // -------------------------------------------------------------------
+    // SilentOrphanWatchdog: pure-state-machine unit tests
+    //
+    // The watchdog used to live inline in the prompt loop, where the only
+    // way to verify behavior was through real `tokio::time::sleep` and
+    // the integration shim. After #1401 the state machine is a free-
+    // standing struct that takes synthetic `Instant` / `DateTime<Utc>`
+    // inputs, so these tests can step the clock forward in microseconds
+    // without flakiness. The covered shapes deliberately overlap the
+    // production false-positive class so a regression would be caught
+    // before it ever reached the shim.
+    // -------------------------------------------------------------------
+
+    fn watchdog_test_cfg() -> SilentOrphanWatchdogConfig {
+        SilentOrphanWatchdogConfig {
+            base_grace: std::time::Duration::from_secs(120),
+            fast_grace: std::time::Duration::from_secs(20),
+            off_protocol_grace_floor: std::time::Duration::from_secs(30 * 60),
+        }
+    }
+
+    #[tokio::test]
+    async fn watchdog_fires_on_cost_then_silence() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::TerminalUsage,
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        // Fast grace is 20s; 25s after the last progress with cost_seen
+        // and no in-flight work must fire.
+        assert!(w.should_fire(t0 + std::time::Duration::from_secs(25), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_progress_after_terminal_usage_clears_fast_grace() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::TerminalUsage,
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        // A later Progress event must clear cost_seen so the fast grace
+        // no longer applies. The watchdog now waits for the full base
+        // grace (120s) from the latest progress.
+        w.apply_signal(
+            LifecycleSignal::Progress,
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(30), cfg));
+        // Still must not fire well past the old fast grace window.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60), cfg));
+        // And must eventually fire after the full base grace.
+        assert!(w.should_fire(t0 + std::time::Duration::from_secs(125), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_background_command_lifts_grace_above_fast_grace() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        // Tool started without the background flag.
+        w.apply_signal(
+            LifecycleSignal::ToolStarted {
+                id: "tc-bg-1".into(),
+                is_background_task: false,
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        // Completion content carries the background marker.
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-bg-1".into(),
+                succeeded: true,
+                off_protocol_work: Some(OffProtocolWorkKind::BackgroundCommand),
+            },
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        w.apply_signal(
+            LifecycleSignal::TerminalUsage,
+            t0 + std::time::Duration::from_secs(3),
+            wall,
+            cfg,
+        );
+        // 60s after last progress: well past fast grace (20s) and past
+        // base grace (120s)? No. Past fast but inside base. Off-protocol
+        // floor lifts grace to 30 min so we must NOT fire here.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60), cfg));
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60 * 25), cfg));
+        // Past the 30-min floor: watchdog finally recovers.
+        assert!(w.should_fire(t0 + std::time::Duration::from_secs(60 * 35), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_async_agent_lifts_grace_above_fast_grace() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::ToolStarted {
+                id: "tc-async-1".into(),
+                is_background_task: false,
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-async-1".into(),
+                succeeded: true,
+                off_protocol_work: Some(OffProtocolWorkKind::AsyncAgent),
+            },
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        w.apply_signal(
+            LifecycleSignal::TerminalUsage,
+            t0 + std::time::Duration::from_secs(3),
+            wall,
+            cfg,
+        );
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60), cfg));
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60 * 25), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_background_via_raw_input_lifts_grace_without_content_marker() {
+        // Defense in depth: even if the completion content marker is
+        // missing (SDK string drift, content stripped), the
+        // `is_background_task` flag captured at ToolStarted should
+        // still flip `off_protocol_work_seen`.
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::ToolStarted {
+                id: "tc-bg-2".into(),
+                is_background_task: true,
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-bg-2".into(),
+                succeeded: true,
+                off_protocol_work: None,
+            },
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        assert_eq!(
+            w.off_protocol_work_seen(),
+            Some(OffProtocolWorkKind::BackgroundCommand),
+            "raw_input.run_in_background must trip off-protocol suppression alone"
+        );
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60 * 20), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_wakeup_suppresses_until_at_plus_base_grace() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        // Schedule wakeup 1 second in the future.
+        w.apply_signal(
+            LifecycleSignal::WakeupPending {
+                at: wall + chrono::Duration::seconds(1),
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        // 1 second after wakeup ARMED (i.e. at the wakeup `at` itself):
+        // suppression must still hold for the tail.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(2), cfg));
+        // 30 seconds after `at`: still inside the 120s base-grace tail.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(30), cfg));
+        // Past `at + base_grace`: watchdog rearms with normal elapsed
+        // semantics; elapsed since last progress (122s) > base_grace
+        // (120s) → fires.
+        assert!(w.should_fire(t0 + std::time::Duration::from_secs(125), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_wakeup_suppression_eventually_expires() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::WakeupPending {
+                at: wall + chrono::Duration::seconds(1),
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        // Step very far past the deadline; should_fire clears the
+        // deadline as a side effect and rearms the watchdog.
+        assert!(w.should_fire(t0 + std::time::Duration::from_secs(60 * 60), cfg));
+        // A subsequent check at any later time without new progress
+        // must still fire (the deadline was cleared, so suppression
+        // does not re-engage).
+        assert!(w.should_fire(t0 + std::time::Duration::from_secs(60 * 60 + 1), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_later_wakeup_extends_not_shortens_suppression() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        // First wakeup: 10s out.
+        w.apply_signal(
+            LifecycleSignal::WakeupPending {
+                at: wall + chrono::Duration::seconds(10),
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        // Second wakeup: 100s out (further). The deadline must extend.
+        w.apply_signal(
+            LifecycleSignal::WakeupPending {
+                at: wall + chrono::Duration::seconds(100),
+            },
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        // At t0 + 50s: the first wakeup's tail (10s + 120s = 130s) is
+        // still alive, AND the second wakeup's tail (100s + 120s =
+        // 220s) is alive. Watchdog must be suppressed by the larger.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(50), cfg));
+        // At t0 + 215s: still inside the second wakeup's tail.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(215), cfg));
+        // At t0 + 225s: past the second wakeup's tail.
+        assert!(w.should_fire(t0 + std::time::Duration::from_secs(225), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_shorter_followup_wakeup_does_not_shorten_suppression() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        // First wakeup: far in the future.
+        w.apply_signal(
+            LifecycleSignal::WakeupPending {
+                at: wall + chrono::Duration::seconds(100),
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        // Second wakeup: closer (should NOT shorten suppression).
+        w.apply_signal(
+            LifecycleSignal::WakeupPending {
+                at: wall + chrono::Duration::seconds(10),
+            },
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        // First wakeup's tail still wins.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(50), cfg));
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(200), cfg));
+        assert!(w.should_fire(t0 + std::time::Duration::from_secs(225), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_tool_in_flight_suppresses_even_after_terminal_usage() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::ToolStarted {
+                id: "tc-1".into(),
+                is_background_task: false,
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        w.apply_signal(
+            LifecycleSignal::TerminalUsage,
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        // Tool still in flight: watchdog never fires regardless of grace.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60 * 60), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_does_not_fire_without_first_progress() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        // No Progress signal ever received: watchdog stays disarmed.
+        w.apply_signal(
+            LifecycleSignal::TerminalUsage,
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60 * 60), cfg));
+    }
+
+    #[test]
+    fn classify_rate_limit_recognises_data_errorkind() {
+        let mut err = agent_client_protocol::Error::internal_error();
+        err.message = "You've hit your limit · resets 12:10pm (Europe/Paris)".into();
+        err.data = Some(serde_json::json!({ "errorKind": "rate_limit" }));
+        let info = classify_rate_limit_error(&err).expect("classified");
+        assert_eq!(info.kind, "rate_limit");
+        assert!(info.status.contains("hit your limit"));
+        assert!(info.resets_at > chrono::Utc::now());
+    }
+
+    #[test]
+    fn classify_rate_limit_prefers_rfc3339_resets_at() {
+        let mut err = agent_client_protocol::Error::internal_error();
+        err.message = "rate limited".into();
+        err.data = Some(serde_json::json!({
+            "errorKind": "rate_limit",
+            "resets_at": "2099-01-01T00:00:00Z",
+        }));
+        let info = classify_rate_limit_error(&err).expect("classified");
+        assert_eq!(info.resets_at.to_rfc3339(), "2099-01-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn classify_rate_limit_ignores_unrelated_errors() {
+        let mut err = agent_client_protocol::Error::internal_error();
+        err.message = "transport closed".into();
+        err.data = Some(serde_json::json!({ "errorKind": "internal" }));
+        assert!(classify_rate_limit_error(&err).is_none());
+
+        let err = agent_client_protocol::Error::invalid_params();
+        assert!(classify_rate_limit_error(&err).is_none());
+    }
+
+    #[test]
+    fn classify_rate_limit_from_message_matches_acp_fingerprint() {
+        let msg = "ACP connection failed: Internal error: You've hit your limit · resets 12:10pm (Europe/Paris): {\n  \"errorKind\":\"rate_limit\"\n}";
+        let info = classify_rate_limit_from_message(msg).expect("classified");
+        assert_eq!(info.kind, "rate_limit");
+        // Spaced variant the adapter sometimes emits.
+        let info_spaced = classify_rate_limit_from_message("{\n  \"errorKind\": \"rate_limit\"\n}")
+            .expect("classified");
+        assert_eq!(info_spaced.kind, "rate_limit");
+        assert!(classify_rate_limit_from_message("connection refused").is_none());
+    }
+
+    /// Sandboxed cockpit spawn must wrap the agent command in
+    /// `docker exec` argv with `-i`, the container workdir, an `-e`
+    /// flag per env entry, then the container name, then the agent
+    /// argv. The docker binary must be argv[0]. Mirrors the tmux
+    /// substrate's wrap so the same `claude-agent-acp` invocation
+    /// goes inside the container instead of running on the host.
+    #[test]
+    fn build_sandbox_docker_argv_wraps_agent_in_docker_exec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_path_buf();
+        let sandbox = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "alpine:latest".into(),
+            container_name: "aoe-sandbox-abc12345".into(),
+            extra_env: Some(vec!["MY_LITERAL=hello".into()]),
+            custom_instruction: None,
+        };
+        let config = SpawnConfig {
+            agent_key: "claude".into(),
+            spec: AgentSpec {
+                command: "claude-agent-acp".into(),
+                args: vec!["--stdio".into()],
+                description: "test".into(),
+                env_allowlist: None,
+            },
+            cwd,
+            additional_dirs: vec![],
+            provider_env: vec![],
+            socket_path: None,
+            stored_acp_session_id: None,
+            sandbox_info: Some(sandbox.clone()),
+            source_profile: None,
+        };
+        let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
+            .expect("docker argv built");
+        assert!(
+            argv.docker_binary == "docker" || argv.docker_binary == "podman",
+            "expected docker/podman binary, got {:?}",
+            argv.docker_binary
+        );
+        assert_eq!(argv.docker_args[0], "exec");
+        assert_eq!(argv.docker_args[1], "-i");
+        assert_eq!(argv.docker_args[2], "-w");
+        let cn_idx = argv
+            .docker_args
+            .iter()
+            .position(|a| a == "aoe-sandbox-abc12345")
+            .expect("container name in argv");
+        let cmd_idx = cn_idx + 1;
+        assert_eq!(argv.docker_args[cmd_idx], "claude-agent-acp");
+        assert_eq!(argv.docker_args[cmd_idx + 1], "--stdio");
+        // Literal env entry lands as `-e KEY=VALUE`.
+        assert!(
+            argv.docker_args.iter().any(|a| a == "MY_LITERAL=hello"),
+            "literal env entry must be propagated as `-e KEY=VALUE`"
+        );
+        // The literal entry's KEY=VALUE form must NOT also appear in
+        // `inherit_env` (that vec is for Inherit-style entries whose
+        // value comes from the parent process env, not for literals).
+        assert!(
+            !argv.inherit_env.iter().any(|(k, _)| k == "MY_LITERAL"),
+            "literal entries must not duplicate into inherit_env"
+        );
+    }
+
+    /// Inherit-style env entries (provider auth keys) must lower into a
+    /// pair of `-e KEY` (key only) in docker_args plus a `(KEY, VALUE)`
+    /// pair in inherit_env so the runner can re-export the value and
+    /// docker can forward it into the container.
+    #[test]
+    fn build_sandbox_docker_argv_inherit_env_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().to_path_buf();
+        let sandbox = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "alpine:latest".into(),
+            container_name: "aoe-sandbox-abc12345".into(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+        let config = SpawnConfig {
+            agent_key: "claude".into(),
+            spec: AgentSpec {
+                command: "claude-agent-acp".into(),
+                args: vec![],
+                description: "test".into(),
+                env_allowlist: None,
+            },
+            cwd,
+            additional_dirs: vec![],
+            // Per-spawn provider_env entry: must end up Inherit-style.
+            provider_env: vec![("ANTHROPIC_API_KEY".into(), "sk-test-value".into())],
+            socket_path: None,
+            stored_acp_session_id: None,
+            sandbox_info: Some(sandbox.clone()),
+            source_profile: None,
+        };
+        let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
+            .expect("docker argv built");
+        // The `-e KEY` flag (without value) must appear consecutively.
+        let key_flag_idx = argv
+            .docker_args
+            .windows(2)
+            .position(|w| w[0] == "-e" && w[1] == "ANTHROPIC_API_KEY")
+            .expect("ANTHROPIC_API_KEY -e flag must be present");
+        // Value-typed forms like `-e ANTHROPIC_API_KEY=...` must NOT
+        // appear; that would leak the secret into argv.
+        assert!(
+            !argv
+                .docker_args
+                .iter()
+                .any(|a| a.starts_with("ANTHROPIC_API_KEY=")),
+            "secret must not appear as `KEY=VALUE` in argv (slot {key_flag_idx})"
+        );
+        // The value must travel via inherit_env so the parent process
+        // sets it before exec-ing docker.
+        assert_eq!(
+            argv.inherit_env
+                .iter()
+                .find(|(k, _)| k == "ANTHROPIC_API_KEY")
+                .map(|(_, v)| v.as_str()),
+            Some("sk-test-value"),
+        );
+    }
+
+    /// `CLAUDE_CONFIG_DIR` is a host filesystem path, not a value, so
+    /// it must NOT be auto-forwarded into the container even when set
+    /// on the host. The agent's config dir is bind-mounted at the
+    /// canonical container path by `AGENT_CONFIG_MOUNTS`.
+    ///
+    /// Tagged `#[serial]` because the test mutates the process-wide
+    /// env; parallel readers of `std::env::var` would race.
+    #[test]
+    #[serial_test::serial]
+    fn build_sandbox_docker_argv_drops_host_only_claude_config_dir() {
+        // Set the env var to simulate the host having it; the function
+        // under test must still skip it.
+        let prev = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("CLAUDE_CONFIG_DIR", "/Users/operator/.claude");
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "alpine:latest".into(),
+            container_name: "aoe-sandbox-cfgdir".into(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+        let config = SpawnConfig {
+            agent_key: "claude".into(),
+            spec: AgentSpec {
+                command: "claude-agent-acp".into(),
+                args: vec![],
+                description: "test".into(),
+                env_allowlist: None,
+            },
+            cwd: tmp.path().to_path_buf(),
+            additional_dirs: vec![],
+            provider_env: vec![],
+            socket_path: None,
+            stored_acp_session_id: None,
+            sandbox_info: Some(sandbox.clone()),
+            source_profile: None,
+        };
+        let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
+            .expect("docker argv built");
+        match prev {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        assert!(
+            !argv.docker_args.iter().any(|a| a == "CLAUDE_CONFIG_DIR"),
+            "CLAUDE_CONFIG_DIR is a host path and must not be forwarded as `-e KEY`"
+        );
+        assert!(
+            !argv
+                .docker_args
+                .iter()
+                .any(|a| a.starts_with("CLAUDE_CONFIG_DIR=")),
+            "CLAUDE_CONFIG_DIR must not appear as a literal `KEY=VALUE` either"
+        );
+        assert!(
+            !argv
+                .inherit_env
+                .iter()
+                .any(|(k, _)| k == "CLAUDE_CONFIG_DIR"),
+            "CLAUDE_CONFIG_DIR must not land in inherit_env"
+        );
+    }
+
     #[tokio::test]
     async fn spawn_with_nonexistent_command_errors_cleanly() {
         let config = SpawnConfig {
+            agent_key: "claude".into(),
             spec: AgentSpec {
                 command: "/nonexistent/agent/binary/aoe-test".into(),
                 args: vec![],
@@ -2717,6 +5423,8 @@ mod tests {
             provider_env: vec![],
             socket_path: None,
             stored_acp_session_id: None,
+            sandbox_info: None,
+            source_profile: None,
         };
         let result = AcpClient::spawn(config, CockpitSessionId("s-1".into())).await;
         assert!(matches!(result, Err(AcpError::Spawn(_))));
@@ -2733,6 +5441,7 @@ mod tests {
         // Ensure the path truly does not exist.
         let _ = std::fs::remove_dir_all(&missing);
         let config = SpawnConfig {
+            agent_key: "claude".into(),
             spec: AgentSpec {
                 command: "/bin/true".into(),
                 args: vec![],
@@ -2744,6 +5453,8 @@ mod tests {
             provider_env: vec![],
             socket_path: None,
             stored_acp_session_id: None,
+            sandbox_info: None,
+            source_profile: None,
         };
         let result = AcpClient::spawn(config, CockpitSessionId("s-1".into())).await;
         match result {
@@ -2795,41 +5506,6 @@ mod tests {
     }
 
     #[test]
-    fn parent_tool_use_id_from_meta_reads_claudecode_namespace() {
-        let mut meta = serde_json::Map::new();
-        meta.insert(
-            "claudeCode".to_string(),
-            serde_json::json!({ "parentToolUseId": "tc-parent-7" }),
-        );
-        assert_eq!(
-            parent_tool_use_id_from_meta(&Some(meta)),
-            Some("tc-parent-7".to_string())
-        );
-    }
-
-    #[test]
-    fn parent_tool_use_id_from_meta_returns_none_for_unrelated_keys() {
-        let mut meta = serde_json::Map::new();
-        meta.insert("terminalExit".to_string(), serde_json::json!({ "code": 0 }));
-        assert!(parent_tool_use_id_from_meta(&Some(meta)).is_none());
-    }
-
-    #[test]
-    fn parent_tool_use_id_from_meta_returns_none_for_none_meta() {
-        assert!(parent_tool_use_id_from_meta(&None).is_none());
-    }
-
-    #[test]
-    fn parent_tool_use_id_from_meta_returns_none_when_value_not_a_string() {
-        let mut meta = serde_json::Map::new();
-        meta.insert(
-            "claudeCode".to_string(),
-            serde_json::json!({ "parentToolUseId": 42 }),
-        );
-        assert!(parent_tool_use_id_from_meta(&Some(meta)).is_none());
-    }
-
-    #[test]
     fn map_update_to_events_threads_parent_tool_call_id() {
         use agent_client_protocol::schema::{SessionUpdate, ToolCall as AcpToolCall};
         let mut meta = serde_json::Map::new();
@@ -2840,7 +5516,7 @@ mod tests {
         let mut tc = AcpToolCall::new("tc-child-1", "Read");
         tc.raw_input = Some(serde_json::json!({"path": "x"}));
         tc.meta = Some(meta);
-        let events = map_update_to_events(SessionUpdate::ToolCall(tc));
+        let events = map_update_to_events(SessionUpdate::ToolCall(tc), &agent_profiles::CLAUDE);
         let started = events.iter().find_map(|e| match e {
             Event::ToolCallStarted { tool_call } => Some(tool_call),
             _ => None,
@@ -2854,7 +5530,29 @@ mod tests {
         use agent_client_protocol::schema::{SessionUpdate, ToolCall as AcpToolCall};
         let mut tc = AcpToolCall::new("tc-1", "Read");
         tc.raw_input = Some(serde_json::json!({"path": "x"}));
-        let events = map_update_to_events(SessionUpdate::ToolCall(tc));
+        let events = map_update_to_events(SessionUpdate::ToolCall(tc), &agent_profiles::CLAUDE);
+        let started = events.iter().find_map(|e| match e {
+            Event::ToolCallStarted { tool_call } => Some(tool_call),
+            _ => None,
+        });
+        assert!(started.unwrap().parent_tool_call_id.is_none());
+    }
+
+    #[test]
+    fn map_update_to_events_does_not_link_parent_for_unverified_agents() {
+        use agent_client_protocol::schema::{SessionUpdate, ToolCall as AcpToolCall};
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "claudeCode".to_string(),
+            serde_json::json!({ "parentToolUseId": "tc-task-1" }),
+        );
+        let mut tc = AcpToolCall::new("tc-child-1", "Read");
+        tc.raw_input = Some(serde_json::json!({"path": "x"}));
+        tc.meta = Some(meta);
+        // Codex profile lists no parent_meta_namespaces, so the linkage
+        // doesn't render even when claude's namespace happens to be on
+        // the wire.
+        let events = map_update_to_events(SessionUpdate::ToolCall(tc), &agent_profiles::CODEX);
         let started = events.iter().find_map(|e| match e {
             Event::ToolCallStarted { tool_call } => Some(tool_call),
             _ => None,
@@ -3039,6 +5737,404 @@ mod tests {
     }
 
     #[test]
+    fn detect_off_protocol_work_completed_matches_async_agent_prefix() {
+        use agent_client_protocol::schema::{Content, ToolCallContent};
+        let blocks = vec![ToolCallContent::Content(Content::new(
+            "Async agent launched successfully.\nagentId: af2a6a5d46bc21f91 (internal ID)",
+        ))];
+        assert_eq!(
+            detect_off_protocol_work_completed(&Some(blocks)),
+            Some(OffProtocolWorkKind::AsyncAgent)
+        );
+    }
+
+    #[test]
+    fn detect_off_protocol_work_completed_matches_background_command_prefix() {
+        use agent_client_protocol::schema::{Content, ToolCallContent};
+        let blocks = vec![ToolCallContent::Content(Content::new(
+            "Command running in background with ID: bgxe33hwb. Output is being written to: /tmp/x",
+        ))];
+        assert_eq!(
+            detect_off_protocol_work_completed(&Some(blocks)),
+            Some(OffProtocolWorkKind::BackgroundCommand)
+        );
+    }
+
+    #[test]
+    fn detect_off_protocol_work_completed_none_on_regular_completion() {
+        use agent_client_protocol::schema::{Content, ToolCallContent};
+        let blocks = vec![ToolCallContent::Content(Content::new(
+            "abc1234 first commit\nabc1235 second commit",
+        ))];
+        assert!(detect_off_protocol_work_completed(&Some(blocks)).is_none());
+    }
+
+    #[test]
+    fn detect_off_protocol_work_completed_none_on_none_content() {
+        assert!(detect_off_protocol_work_completed(&None).is_none());
+    }
+
+    #[test]
+    fn detect_off_protocol_work_completed_none_on_empty_content() {
+        assert!(detect_off_protocol_work_completed(&Some(vec![])).is_none());
+    }
+
+    #[test]
+    fn detect_off_protocol_work_completed_ignores_echoed_marker_mid_line() {
+        // CodeRabbit regression on PR #1406: a regular foreground Bash that
+        // prints the SDK marker substring as part of its output (e.g.
+        // an echo or grep that includes the phrase) must NOT trip
+        // off-protocol suppression. Match anchors at the start of a
+        // line, not anywhere in the content.
+        use agent_client_protocol::schema::{Content, ToolCallContent};
+        let blocks = vec![ToolCallContent::Content(Content::new(
+            "user typed: Command running in background with ID: pretend\nbye",
+        ))];
+        assert!(detect_off_protocol_work_completed(&Some(blocks)).is_none());
+
+        let blocks2 = vec![ToolCallContent::Content(Content::new(
+            "log line: Async agent launched successfully but actually not",
+        ))];
+        assert!(detect_off_protocol_work_completed(&Some(blocks2)).is_none());
+    }
+
+    #[test]
+    fn detect_off_protocol_work_completed_matches_marker_on_indented_line() {
+        // The marker may not be the first character of the block;
+        // a leading newline or whitespace must not break detection
+        // as long as the marker starts the (trimmed) line.
+        use agent_client_protocol::schema::{Content, ToolCallContent};
+        let blocks = vec![ToolCallContent::Content(Content::new(
+            "\n  Command running in background with ID: btest. log: /tmp/x",
+        ))];
+        assert_eq!(
+            detect_off_protocol_work_completed(&Some(blocks)),
+            Some(OffProtocolWorkKind::BackgroundCommand)
+        );
+    }
+
+    #[test]
+    fn wakeup_lifecycle_signal_from_completed_tool_call_update() {
+        use agent_client_protocol::schema::{ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields};
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .title("ScheduleWakeup".to_string())
+            .raw_input(serde_json::json!({ "delaySeconds": 60 }));
+        let update = ToolCallUpdate::new("tc-wake-1", fields);
+        let sig = wakeup_lifecycle_signal_from_update(
+            &SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
+        assert!(matches!(sig, Some(LifecycleSignal::WakeupPending { .. })));
+    }
+
+    #[test]
+    fn wakeup_lifecycle_signal_none_on_initial_tool_call() {
+        // The initial `ToolCall` frame is NOT yet a completion; the
+        // tool could still fail. Watchdog suppression must wait until
+        // a successful ToolCallUpdate { Completed }. See CodeRabbit
+        // review on PR #1406.
+        use agent_client_protocol::schema::ToolCall;
+        let mut tc = ToolCall::new("tc-wake-2", "ScheduleWakeup");
+        tc.raw_input = Some(serde_json::json!({ "delaySeconds": 60 }));
+        let sig = wakeup_lifecycle_signal_from_update(
+            &SessionUpdate::ToolCall(tc),
+            &agent_profiles::CLAUDE,
+        );
+        assert!(sig.is_none());
+    }
+
+    #[test]
+    fn wakeup_lifecycle_signal_none_on_failed_completion() {
+        // A failed ScheduleWakeup means no wakeup was actually
+        // registered; suppressing for `delay + base_grace` would
+        // hide a real adapter wedge.
+        use agent_client_protocol::schema::{ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields};
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Failed)
+            .title("ScheduleWakeup".to_string())
+            .raw_input(serde_json::json!({ "delaySeconds": 60 }));
+        let update = ToolCallUpdate::new("tc-wake-3", fields);
+        let sig = wakeup_lifecycle_signal_from_update(
+            &SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
+        assert!(sig.is_none());
+    }
+
+    #[test]
+    fn wakeup_lifecycle_signal_fires_on_in_progress_with_raw_input() {
+        // Real `claude-agent-acp` typically populates `raw_input` on an
+        // interim `ToolCallUpdate { status: InProgress }` and strips
+        // it from the final `Completed` frame. Requiring strictly
+        // Completed status would lose the wakeup; we gate only on
+        // not-Failed.
+        use agent_client_protocol::schema::{ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields};
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::InProgress)
+            .title("ScheduleWakeup".to_string())
+            .raw_input(serde_json::json!({ "delaySeconds": 60 }));
+        let update = ToolCallUpdate::new("tc-wake-4", fields);
+        let sig = wakeup_lifecycle_signal_from_update(
+            &SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
+        assert!(matches!(sig, Some(LifecycleSignal::WakeupPending { .. })));
+    }
+
+    #[test]
+    fn classify_lifecycle_signal_marks_async_agent_completion() {
+        use agent_client_protocol::schema::{
+            Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .content(vec![ToolCallContent::Content(Content::new(
+                "Async agent launched successfully. agentId: async-test-1",
+            ))]);
+        let update = ToolCallUpdate::new("tc-async-1", fields);
+        match classify_lifecycle_signal(&SessionUpdate::ToolCallUpdate(update)) {
+            Some(LifecycleSignal::ToolCompleted {
+                id,
+                succeeded,
+                off_protocol_work,
+            }) => {
+                assert_eq!(id, "tc-async-1");
+                assert!(succeeded);
+                assert_eq!(off_protocol_work, Some(OffProtocolWorkKind::AsyncAgent));
+            }
+            other => panic!(
+                "expected ToolCompleted {{ off_protocol_work: Some(AsyncAgent) }}, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn classify_lifecycle_signal_marks_background_command_completion() {
+        use agent_client_protocol::schema::{
+            Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .content(vec![ToolCallContent::Content(Content::new(
+                "Command running in background with ID: bgtest. Output is being written to: /tmp/x",
+            ))]);
+        let update = ToolCallUpdate::new("tc-bg-1", fields);
+        match classify_lifecycle_signal(&SessionUpdate::ToolCallUpdate(update)) {
+            Some(LifecycleSignal::ToolCompleted {
+                id,
+                succeeded,
+                off_protocol_work,
+            }) => {
+                assert_eq!(id, "tc-bg-1");
+                assert!(succeeded);
+                assert_eq!(
+                    off_protocol_work,
+                    Some(OffProtocolWorkKind::BackgroundCommand)
+                );
+            }
+            other => panic!(
+                "expected ToolCompleted {{ off_protocol_work: Some(BackgroundCommand) }}, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn classify_lifecycle_signal_clears_off_protocol_on_regular_completion() {
+        use agent_client_protocol::schema::{
+            Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .content(vec![ToolCallContent::Content(Content::new(
+                "ls /tmp/foo done",
+            ))]);
+        let update = ToolCallUpdate::new("tc-bash-1", fields);
+        match classify_lifecycle_signal(&SessionUpdate::ToolCallUpdate(update)) {
+            Some(LifecycleSignal::ToolCompleted {
+                id,
+                succeeded,
+                off_protocol_work,
+            }) => {
+                assert_eq!(id, "tc-bash-1");
+                assert!(succeeded);
+                assert!(off_protocol_work.is_none());
+            }
+            other => panic!("expected ToolCompleted {{ off_protocol_work: None }}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_lifecycle_signal_failed_ignores_off_protocol_marker() {
+        use agent_client_protocol::schema::{
+            Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Failed)
+            .content(vec![ToolCallContent::Content(Content::new(
+                "Async agent launched successfully. agentId: not-real",
+            ))]);
+        let update = ToolCallUpdate::new("tc-failed-1", fields);
+        match classify_lifecycle_signal(&SessionUpdate::ToolCallUpdate(update)) {
+            Some(LifecycleSignal::ToolCompleted {
+                succeeded,
+                off_protocol_work,
+                ..
+            }) => {
+                assert!(!succeeded, "Failed updates must mark succeeded=false");
+                assert!(
+                    off_protocol_work.is_none(),
+                    "Failed updates must not activate off-protocol suppression"
+                );
+            }
+            other => panic!("expected ToolCompleted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn watchdog_failed_background_tool_does_not_suppress() {
+        // Regression for the post-impl review: a backgrounded Bash that
+        // FAILS to launch (e.g., binary not found, raw_input parse
+        // error) must not spuriously enable off-protocol suppression
+        // via the raw_input fallback. The subprocess never actually
+        // started, so the watchdog must keep its base grace.
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::ToolStarted {
+                id: "tc-bg-fail".into(),
+                is_background_task: true,
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-bg-fail".into(),
+                succeeded: false,
+                off_protocol_work: None,
+            },
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        assert!(
+            w.off_protocol_work_seen().is_none(),
+            "Failed background tool must not enable off-protocol suppression",
+        );
+        // Watchdog uses base grace (120s) and fires after it elapses.
+        assert!(w.should_fire(t0 + std::time::Duration::from_secs(125), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_later_in_progress_does_not_clobber_background_flag() {
+        // Regression for the post-impl review: claude-agent-acp emits a
+        // `ToolCall` carrying `raw_input.run_in_background` followed by
+        // a `ToolCallUpdate { status: InProgress }` that lacks raw_input
+        // and classifies as `is_background_task: false`. A blind
+        // `insert` would overwrite the sticky `true` and silently
+        // disable the raw-input arm of the defense-in-depth detection.
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::ToolStarted {
+                id: "tc-bg-3".into(),
+                is_background_task: true,
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        // Later InProgress update with the same id but no background flag.
+        w.apply_signal(
+            LifecycleSignal::ToolStarted {
+                id: "tc-bg-3".into(),
+                is_background_task: false,
+            },
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        // Completion without content marker: only the raw-input flag is
+        // available, and it must still be `true` after the InProgress
+        // re-stamp.
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-bg-3".into(),
+                succeeded: true,
+                off_protocol_work: None,
+            },
+            t0 + std::time::Duration::from_secs(3),
+            wall,
+            cfg,
+        );
+        assert_eq!(
+            w.off_protocol_work_seen(),
+            Some(OffProtocolWorkKind::BackgroundCommand),
+            "background flag must survive an intervening ToolStarted without the flag",
+        );
+    }
+
+    #[test]
+    fn lifecycle_envelope_round_trips_epoch_and_signal() {
+        // Smoke test that `LifecycleEnvelope` carries both fields as
+        // expected: the prompt-loop discard path keys off `epoch`
+        // mismatch, so a regression that loses or zeroes the field
+        // would silently break cross-prompt stale-signal protection.
+        let env = LifecycleEnvelope {
+            epoch: 42,
+            signal: LifecycleSignal::WakeupPending {
+                at: chrono::Utc::now(),
+            },
+        };
+        assert_eq!(env.epoch, 42);
+        assert!(matches!(env.signal, LifecycleSignal::WakeupPending { .. }));
+    }
+
+    #[test]
+    fn classify_lifecycle_signal_tool_call_carries_run_in_background_flag() {
+        use agent_client_protocol::schema::ToolCall;
+        let mut tc = ToolCall::new("tc-bg-2", "Bash");
+        tc.raw_input = Some(serde_json::json!({
+            "command": "npm install",
+            "run_in_background": true,
+        }));
+        match classify_lifecycle_signal(&SessionUpdate::ToolCall(tc)) {
+            Some(LifecycleSignal::ToolStarted {
+                id,
+                is_background_task,
+            }) => {
+                assert_eq!(id, "tc-bg-2");
+                assert!(
+                    is_background_task,
+                    "raw_input.run_in_background=true must propagate"
+                );
+            }
+            other => panic!("expected ToolStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_lifecycle_signal_tool_call_defaults_run_in_background_false() {
+        use agent_client_protocol::schema::ToolCall;
+        let mut tc = ToolCall::new("tc-fg-1", "Bash");
+        tc.raw_input = Some(serde_json::json!({ "command": "ls" }));
+        match classify_lifecycle_signal(&SessionUpdate::ToolCall(tc)) {
+            Some(LifecycleSignal::ToolStarted {
+                is_background_task, ..
+            }) => assert!(!is_background_task),
+            other => panic!("expected ToolStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn map_tool_call_update_completed_carries_content() {
         use agent_client_protocol::schema::{
             Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
@@ -3049,7 +6145,10 @@ mod tests {
                 "abc1234 first commit",
             ))]);
         let update = ToolCallUpdate::new("tc-1", fields);
-        let events = map_update_to_events(SessionUpdate::ToolCallUpdate(update));
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
         assert_eq!(events.len(), 1);
         match &events[0] {
             Event::ToolCallCompleted {
@@ -3077,7 +6176,10 @@ mod tests {
                 "partial output",
             ))]);
         let update = ToolCallUpdate::new("tc-2", fields);
-        let events = map_update_to_events(SessionUpdate::ToolCallUpdate(update));
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
         // InProgress now emits a ToolCallUpdated re-stamping started_at
         // (#1060 follow-up) plus the streaming ToolCallContent.
         assert_eq!(events.len(), 2);
@@ -3109,7 +6211,10 @@ mod tests {
         use agent_client_protocol::schema::{ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields};
         let fields = ToolCallUpdateFields::new().status(ToolCallStatus::InProgress);
         let update = ToolCallUpdate::new("tc-3", fields);
-        let events = map_update_to_events(SessionUpdate::ToolCallUpdate(update));
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
         assert_eq!(events.len(), 1);
         match &events[0] {
             Event::ToolCallUpdated {
@@ -3149,7 +6254,10 @@ mod tests {
                 "reason": "Test 10-minute wake-up card countdown",
             }));
         let update = ToolCallUpdate::new("toolu_test", fields);
-        let events = map_update_to_events(SessionUpdate::ToolCallUpdate(update));
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
         let wakeup = events
             .iter()
             .find(|e| matches!(e, Event::WakeupScheduled { .. }))
@@ -3180,7 +6288,10 @@ mod tests {
         use agent_client_protocol::schema::{ToolCallUpdate, ToolCallUpdateFields};
         let fields = ToolCallUpdateFields::new().title("ScheduleWakeup".to_string());
         let update = ToolCallUpdate::new("toolu_test", fields);
-        let events = map_update_to_events(SessionUpdate::ToolCallUpdate(update));
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
         assert!(
             !events
                 .iter()
@@ -3193,7 +6304,7 @@ mod tests {
     fn map_usage_update_emits_typed_usage_event() {
         use agent_client_protocol::schema::{Cost, UsageUpdate};
         let u = UsageUpdate::new(12_345, 200_000).cost(Cost::new(0.42, "USD"));
-        let events = map_update_to_events(SessionUpdate::UsageUpdate(u));
+        let events = map_update_to_events(SessionUpdate::UsageUpdate(u), &agent_profiles::CLAUDE);
         assert_eq!(events.len(), 1);
         match &events[0] {
             Event::UsageUpdated { usage } => {
@@ -3220,7 +6331,10 @@ mod tests {
             AcpAvailableCommand::new("clear", "Reset context"),
         ];
         let update = AvailableCommandsUpdate::new(cmds);
-        let events = map_update_to_events(SessionUpdate::AvailableCommandsUpdate(update));
+        let events = map_update_to_events(
+            SessionUpdate::AvailableCommandsUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
         assert_eq!(events.len(), 1);
         match &events[0] {
             Event::AvailableCommandsUpdated { commands } => {
@@ -3232,6 +6346,90 @@ mod tests {
             }
             other => panic!("expected AvailableCommandsUpdated, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn map_config_option_update_emits_typed_event_with_categories() {
+        use agent_client_protocol::schema::{
+            ConfigOptionUpdate, SessionConfigKind, SessionConfigOption,
+            SessionConfigOptionCategory, SessionConfigSelect, SessionConfigSelectOption,
+            SessionConfigSelectOptions,
+        };
+        let model_option = SessionConfigOption::new(
+            "model",
+            "Model",
+            SessionConfigKind::Select(SessionConfigSelect::new(
+                "claude-opus-4-7",
+                SessionConfigSelectOptions::Ungrouped(vec![
+                    SessionConfigSelectOption::new("claude-opus-4-7", "Claude Opus 4.7"),
+                    SessionConfigSelectOption::new("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+                ]),
+            )),
+        )
+        .category(SessionConfigOptionCategory::Model);
+        let effort_option = SessionConfigOption::new(
+            "effort",
+            "Reasoning Effort",
+            SessionConfigKind::Select(SessionConfigSelect::new(
+                "default",
+                SessionConfigSelectOptions::Ungrouped(vec![
+                    SessionConfigSelectOption::new("default", "Default"),
+                    SessionConfigSelectOption::new("high", "High"),
+                ]),
+            )),
+        )
+        .category(SessionConfigOptionCategory::ThoughtLevel);
+        let mode_option = SessionConfigOption::new(
+            "mode",
+            "Mode",
+            SessionConfigKind::Select(SessionConfigSelect::new(
+                "default",
+                SessionConfigSelectOptions::Ungrouped(vec![
+                    SessionConfigSelectOption::new("default", "Default"),
+                    SessionConfigSelectOption::new("plan", "Plan"),
+                ]),
+            )),
+        )
+        .category(SessionConfigOptionCategory::Mode);
+        let update = ConfigOptionUpdate::new(vec![model_option, effort_option, mode_option]);
+
+        let events = map_update_to_events(
+            SessionUpdate::ConfigOptionUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::ConfigOptionsUpdated { options } => {
+                assert_eq!(options.len(), 3);
+                assert_eq!(options[0].id, "model");
+                assert_eq!(options[0].category, ConfigOptionCategory::Model);
+                assert_eq!(options[0].current_value, "claude-opus-4-7");
+                assert_eq!(options[0].options.len(), 2);
+                assert_eq!(options[1].category, ConfigOptionCategory::ThoughtLevel);
+                assert_eq!(options[1].current_value, "default");
+                assert_eq!(options[2].category, ConfigOptionCategory::Mode);
+            }
+            other => panic!("expected ConfigOptionsUpdated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_options_event_propagates_empty_snapshot() {
+        // A present-but-empty snapshot from the adapter is a real
+        // full replacement and must clear stale cached selectors, so
+        // `config_options_event(Some(vec![]))` returns
+        // `Some(ConfigOptionsUpdated { options: [] })` (not `None`).
+        let event =
+            config_options_event(Some(Vec::new())).expect("Some(vec![]) should produce an event");
+        match event {
+            Event::ConfigOptionsUpdated { options } => {
+                assert!(options.is_empty());
+            }
+            other => panic!("expected empty ConfigOptionsUpdated, got {other:?}"),
+        }
+        // Absent snapshot (the adapter omitted the field) still
+        // returns None so callers skip the emit.
+        assert!(config_options_event(None).is_none());
     }
 
     #[test]

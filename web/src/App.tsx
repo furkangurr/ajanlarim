@@ -3,11 +3,18 @@ import { useMatch, useNavigate } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
 import { useSessions } from "./hooks/useSessions";
 import { clearCockpitCache } from "./hooks/useCockpit";
+import { clearDraft, sweepOrphanDrafts } from "./lib/cockpitDrafts";
 import { CockpitPrefsProvider } from "./lib/cockpitPrefs";
+import { safeGetItem, safeSetItem } from "./lib/safeStorage";
 import { useWorkspaces } from "./hooks/useWorkspaces";
 import { useRepoGroups } from "./hooks/useRepoGroups";
+import { useSidebarSortMode } from "./hooks/useSidebarSortMode";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
+import { useResolvedTheme } from "./hooks/useResolvedTheme";
+import { useWebSettings } from "./hooks/useWebSettings";
 import { useDiffFiles } from "./hooks/useDiffFiles";
+import { useDiffComments } from "./hooks/useDiffComments";
+import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
 import { useCommandActions } from "./hooks/useCommandActions";
 import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
 import { useMobileKeyboard } from "./hooks/useMobileKeyboard";
@@ -17,6 +24,8 @@ import {
   deleteSession,
   fetchAbout,
   fetchSettings,
+  isDebugBuild,
+  updateWorkspaceOrdering,
 } from "./lib/api";
 import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
 import {
@@ -34,7 +43,7 @@ import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
 import { TopBar } from "./components/TopBar";
 import { ContentSplit } from "./components/ContentSplit";
-import { TerminalView } from "./components/TerminalView";
+import { TerminalSessionStack } from "./components/TerminalSessionStack";
 // Lazy-load the cockpit surface so non-cockpit users never download
 // the @assistant-ui/react, shiki, and in-house StringDiff/DiffLine
 // dependency tree. Cuts ~hundreds of KB off the cold-start bundle
@@ -64,11 +73,18 @@ import {
 import { AboutModal } from "./components/AboutModal";
 import { CommandPalette } from "./components/command-palette/CommandPalette";
 import { DisconnectBanner } from "./components/DisconnectBanner";
+import { ElevationPrompt } from "./components/ElevationPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
 
 const RIGHT_PANEL_COLLAPSED_KEY = "aoe-right-collapsed";
 
 export default function App() {
+  // Apply the user-selected theme as CSS custom properties on the root
+  // element. Runs once on mount + on settings-driven theme changes.
+  // The pre-React /theme-bootstrap.js (referenced from index.html)
+  // paints the cached theme before hydration; this hook keeps it in
+  // sync with the server's view.
+  useResolvedTheme();
   const [loginRequired, setLoginRequired] = useState<boolean | null>(null);
   const [loginAuthenticated, setLoginAuthenticated] = useState(true);
   const [tokenExpired, setTokenExpired] = useState(false);
@@ -143,13 +159,32 @@ export default function App() {
   return (
     <IdleDecayWindowContext.Provider value={idleDecayWindowMs}>
       <AppContent loginRequired={loginRequired} onLogout={handleLogout} />
+      <ElevationPrompt />
     </IdleDecayWindowContext.Provider>
   );
+}
+
+/** Walk from the event target up to the document root looking for any
+ *  text-input surface, so global hotkeys don't fire when the user is
+ *  typing in an `<input>`, `<textarea>`, or contenteditable element
+ *  (or any contenteditable ancestor of a deeper rich-text widget). */
+function isInsideEditable(target: EventTarget | null): boolean {
+  let el: HTMLElement | null =
+    target instanceof HTMLElement ? target : null;
+  while (el) {
+    const tag = el.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || el.isContentEditable) {
+      return true;
+    }
+    el = el.parentElement;
+  }
+  return false;
 }
 
 function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLogout: () => void }) {
   const navigate = useNavigate();
   const idleDecayWindowMs = useIdleDecayWindowMs();
+  const { settings: webSettings } = useWebSettings();
   const sessionMatch = useMatch("/session/:sessionId");
   const settingsRootMatch = useMatch("/settings");
   const settingsTabMatch = useMatch("/settings/:tab");
@@ -159,9 +194,56 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const showProjects = projectsMatch !== null;
   const settingsTab = settingsTabMatch?.params.tab ?? null;
 
-  const { sessions, error, injectSession, setSessionStatus } = useSessions();
+  const {
+    sessions,
+    workspaceOrdering,
+    setWorkspaceOrdering,
+    markLocalOrderingUpdate,
+    error,
+    loaded: sessionsLoaded,
+    injectSession,
+    setSessionStatus,
+  } = useSessions();
   const workspaces = useWorkspaces(sessions);
-  const { groups, toggleRepoCollapsed } = useRepoGroups(workspaces);
+
+  // One-shot orphan-draft sweep once useSessions has settled its first
+  // fetch (success or null). Catches cockpit:draft:<id> keys left behind
+  // by deletions that happened in another tab or on another device since
+  // the last load (#1358). The local-tab delete path calls clearDraft
+  // directly so it does not need to wait for this. Gating on
+  // `sessionsLoaded` rather than `sessions.length > 0` covers the
+  // legitimate empty-server case: a brand-new user with zero sessions
+  // must still get prior orphan drafts swept. Bounded by localStorage
+  // entry count; cheap.
+  const sweptDraftsRef = useRef(false);
+  useEffect(() => {
+    if (sweptDraftsRef.current) return;
+    if (!sessionsLoaded) return;
+    sweptDraftsRef.current = true;
+    sweepOrphanDrafts(new Set(sessions.map((s) => s.id)));
+  }, [sessionsLoaded, sessions]);
+
+  const [sidebarSortMode, setSidebarSortMode] = useSidebarSortMode();
+
+  const { groups, toggleRepoCollapsed, updateRepoAppearance } = useRepoGroups(
+    workspaces,
+    workspaceOrdering,
+    sidebarSortMode,
+  );
+
+  // Drag-end handler for the sidebar. Optimistically applies the new
+  // order locally so the row snaps into place, then persists to the
+  // server. `markLocalOrderingUpdate` opens a short window during
+  // which polled responses do not clobber our just-applied state, so a
+  // poll firing mid-PUT can't revert the drag.
+  const handleReorderWorkspaces = useCallback(
+    (newOrder: string[]) => {
+      setWorkspaceOrdering(newOrder);
+      markLocalOrderingUpdate();
+      void updateWorkspaceOrdering(newOrder);
+    },
+    [setWorkspaceOrdering, markLocalOrderingUpdate],
+  );
 
   // Selected diff-file identity. `repoName` is undefined for single-repo
   // sessions and the workspace member name for multi-repo workspaces.
@@ -176,13 +258,13 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const selectedFilePath = selectedFile?.path ?? null;
   const selectedRepoName = selectedFile?.repoName;
   const [diffCollapsed, setDiffCollapsed] = useState(() => {
-    const stored = localStorage.getItem(RIGHT_PANEL_COLLAPSED_KEY);
+    const stored = safeGetItem(RIGHT_PANEL_COLLAPSED_KEY);
     if (stored === "1") return true;
     if (stored === "0") return false;
     return window.innerWidth < 768;
   });
   useEffect(() => {
-    localStorage.setItem(RIGHT_PANEL_COLLAPSED_KEY, diffCollapsed ? "1" : "0");
+    safeSetItem(RIGHT_PANEL_COLLAPSED_KEY, diffCollapsed ? "1" : "0");
   }, [diffCollapsed]);
   const [showSessionWizard, setShowSessionWizard] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
@@ -209,7 +291,36 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     warning,
     loading: diffFilesLoading,
     revision,
+    refresh: refreshDiffFiles,
   } = useDiffFiles(activeSessionId, !diffCollapsed);
+
+  // Diff-viewer comments (#928). Cockpit-only and session-scoped. The
+  // banner lives in RightPanel while the inline UI lives inside
+  // DiffFileViewer, so the store is lifted here and threaded to both.
+  const diffComments = useDiffComments(activeSessionId);
+  const commentsEnabled = !!activeSession?.cockpit_mode;
+  const commentSendEnabled =
+    commentsEnabled && activeSession?.cockpit_worker_state === "running";
+  const commentSendDisabledReason = !commentsEnabled
+    ? "Diff comments require a cockpit session"
+    : "Cockpit worker is not running";
+  const commentsIsMultiRepo = (activeSession?.workspace_repos.length ?? 0) > 0;
+  const [sendDialogOpen, setSendDialogOpen] = useState(false);
+
+  useEffect(() => {
+    if (!commentSendEnabled) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (!((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "s")) {
+        return;
+      }
+      if (isInsideEditable(e.target)) return;
+      if (diffComments.count === 0) return;
+      e.preventDefault();
+      setSendDialogOpen(true);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [commentSendEnabled, diffComments.count]);
 
   useEffect(() => {
     if (!activeSessionId) {
@@ -325,8 +436,16 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     // the same id doesn't briefly show the prior transcript on
     // remount before fetchReplay clears it.
     clearCockpitCache(sessionId);
+    // Drop the persisted composer draft for the deleted session so its
+    // localStorage key doesn't linger (#1358). Cross-tab / cross-device
+    // deletes go through the startup sweep instead.
+    clearDraft(sessionId);
 
-    toastBus.handler?.info("Session deleted");
+    // Server returns `messages` from `perform_deletion` when there's something
+    // user-facing to report (e.g. "Scratch directory kept at: <path>" when
+    // `keep_scratch` is set). Surface the first one so the kept-path is visible.
+    const toast = result.messages?.[0] ?? "Session deleted";
+    toastBus.handler?.info(toast);
   }, [deletingSession, activeSessionId, setSessionStatus, navigate]);
 
   const handleCreateSession = useCallback((repoPath: string) => {
@@ -474,7 +593,23 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   useKeyboardShortcuts(
     useCallback(
       () => ({
-        onNew: () => setShowSessionWizard(true),
+        onNew: () => {
+          // Read-only mode hides mutation UI. The "n" shortcut must
+          // not open the wizard or the user gets a dead-end form that
+          // 403s on submit. Caught by the live read-only-mode spec.
+          if (serverAbout?.read_only) return;
+          setWizardPrefill(undefined);
+          setShowSessionWizard(true);
+        },
+        onNewScratch: () => {
+          // Same read-only guard as `onNew`: the wizard cannot land a
+          // POST /api/sessions when the server returns 403 on every
+          // mutation, and a scratch fast-create that 403s on submit is
+          // a worse footgun than a no-op.
+          if (serverAbout?.read_only) return;
+          setWizardPrefill({ scratch: true, skipToReview: true });
+          setShowSessionWizard(true);
+        },
         onDiff: () => toggleDiff(),
         // Escape closes local UI surfaces only (dialogs, palette,
         // wizard, settings, help, file viewer). Never wire this to
@@ -504,7 +639,16 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         onToggleRightPanel: () => setDiffCollapsed((c) => !c),
         onToggleTerminalFocus: handleToggleTerminalFocus,
       }),
-      [toggleDiff, showPalette, deletingWorkspaceId, showSettings, handleCloseSettings, navigate, handleToggleTerminalFocus],
+      [
+        toggleDiff,
+        showPalette,
+        deletingWorkspaceId,
+        showSettings,
+        handleCloseSettings,
+        navigate,
+        handleToggleTerminalFocus,
+        serverAbout,
+      ],
     ),
   );
 
@@ -546,6 +690,16 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       );
     }
 
+    // Refresh on `/session/<id>` paints once with `sessions === []` before
+    // the first poll resolves. Without this guard the lookup misses, the
+    // dashboard fallback renders, and the cockpit/terminal view only
+    // reappears once the fetch lands. Hold the minimal pre-auth shell
+    // until the first fetch settles, then let the real fallback decide.
+    // See #1351.
+    if (activeSessionId && !sessionsLoaded) {
+      return <div className="h-dvh bg-surface-900 safe-area-inset" />;
+    }
+
     if (!activeWorkspace || !activeSession) {
       return (
         <Dashboard
@@ -579,14 +733,21 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
                       key={activeSessionId}
                       sessionId={activeSessionId!}
                       cockpitWorkerState={activeSession.cockpit_worker_state ?? "absent"}
+                      tool={activeSession.tool}
+                      archivedAt={activeSession.archived_at ?? null}
+                      snoozedUntil={activeSession.snoozed_until ?? null}
                     />
                   </Suspense>
                 ) : (
-                  <TerminalView
-                    key={activeSessionId}
-                    session={activeSession}
+                  <TerminalSessionStack
+                    activeSessionId={activeSessionId!}
+                    sessions={sessions.filter((session) => !session.cockpit_mode)}
                     cockpitMasterEnabled={
                       !!serverAbout?.cockpit_master_enabled
+                    }
+                    persistent={webSettings.persistentTerminals}
+                    maxPersistentTerminals={
+                      webSettings.maxPersistentTerminals
                     }
                   />
                 )}
@@ -599,6 +760,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
                   repoName={selectedRepoName}
                   revision={revision}
                   onClose={handleCloseFile}
+                  commentsEnabled={commentsEnabled}
+                  commentsStore={diffComments}
                 />
               )}
             </div>
@@ -614,9 +777,46 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
               selectedFilePath={selectedFilePath}
               selectedRepoName={selectedRepoName}
               onSelectFile={handleSelectFile}
+              onDiffRefresh={refreshDiffFiles}
+              commentsEnabled={commentsEnabled}
+              commentsCount={diffComments.count}
+              commentsSendEnabled={commentSendEnabled}
+              commentsSendDisabledReason={commentSendDisabledReason}
+              onOpenSendDialog={() => setSendDialogOpen(true)}
+              onDiscardAllComments={diffComments.clearComments}
             />
           }
         />
+        {sendDialogOpen && commentsEnabled && activeSessionId && (
+          <SendCommentsDialog
+            sessionId={activeSessionId}
+            comments={diffComments.comments}
+            isMultiRepo={commentsIsMultiRepo}
+            sendEnabled={commentSendEnabled}
+            sendDisabledReason={commentSendDisabledReason}
+            introDraft={diffComments.introDraft}
+            outroDraft={diffComments.outroDraft}
+            clearAfterSend={diffComments.clearAfterSend}
+            onChangeIntro={diffComments.setIntroDraft}
+            onChangeOutro={diffComments.setOutroDraft}
+            onChangeClearAfterSend={diffComments.setClearAfterSend}
+            onClose={() => setSendDialogOpen(false)}
+            onSent={() => {
+              if (diffComments.clearAfterSend) {
+                diffComments.clearComments();
+                diffComments.setIntroDraft("");
+                diffComments.setOutroDraft("");
+              }
+              setSendDialogOpen(false);
+              // Close the diff viewer so the cockpit transcript is in
+              // view: the user just dispatched feedback and wants to
+              // see the agent's response. They can re-open any file
+              // from the right-panel list afterwards.
+              setSelectedFile(null);
+              toastBus.handler?.info("Comments sent to agent");
+            }}
+          />
+        )}
       </div>
     );
   };
@@ -628,11 +828,19 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   // Pinning to the no-keyboard height combined with the keyboard
   // reservation in TerminalView keeps the layout stable across the
   // keyboard cycle.
+  //
+  // Cockpit substrate doesn't host xterm.js, so the SIGWINCH concern
+  // doesn't apply; leaving the pin on for cockpit traps the composer
+  // below the keyboard on Android Chrome PWA (#1177). Drop the pin when
+  // the active session is cockpit so `h-dvh` plus the viewport meta's
+  // `interactive-widget=resizes-content` shrink the container with the
+  // keyboard and lift the composer back into view.
   const { isMobile, stableViewportHeight } = useMobileKeyboard();
-  const rootStyle =
-    isMobile && stableViewportHeight > 0
-      ? { height: `${stableViewportHeight}px` }
-      : undefined;
+  const pinRootHeight =
+    isMobile && stableViewportHeight > 0 && !activeSession?.cockpit_mode;
+  const rootStyle = pinRootHeight
+    ? { height: `${stableViewportHeight}px` }
+    : undefined;
 
   const cockpitPrefs = useMemo(
     () => ({
@@ -668,6 +876,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         onLogout={onLogout}
         loginRequired={loginRequired}
         isOffline={!!error}
+        isDevBuild={isDebugBuild(serverAbout)}
         onGoDashboard={handleGoDashboard}
       />
 
@@ -678,17 +887,21 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         {!showSettings && !showProjects && (
           <WorkspaceSidebar
             groups={groups}
+            onReorderWorkspaces={handleReorderWorkspaces}
             activeId={activeWorkspace?.id ?? null}
             open={sidebarOpen}
             onToggle={() => setSidebarOpen(false)}
             onSelect={handleSelectWorkspace}
             onToggleRepo={toggleRepoCollapsed}
+            onUpdateRepoAppearance={updateRepoAppearance}
             onNew={() => { setWizardPrefill(undefined); setShowSessionWizard(true); }}
             onCreateSession={handleCreateSession}
             onSettings={handleOpenSettings}
             onProjects={handleOpenProjects}
             onDeleteSession={handleDeleteSession}
             readOnly={serverAbout?.read_only}
+            sortMode={sidebarSortMode}
+            onSortModeChange={setSidebarSortMode}
           />
         )}
 
@@ -726,6 +939,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           branchName={deletingSession.branch}
           hasManagedWorktree={deletingSession.has_managed_worktree}
           isSandboxed={deletingSession.is_sandboxed}
+          isScratch={deletingSession.scratch}
           cleanupDefaults={deletingSession.cleanup_defaults}
           onConfirm={handleConfirmDelete}
           onCancel={() => setDeletingWorkspaceId(null)}

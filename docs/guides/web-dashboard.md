@@ -4,7 +4,7 @@ The web dashboard lets you monitor and interact with agent sessions from any bro
 
 ## Availability
 
-The web dashboard is included in all release binaries: [GitHub Releases](https://github.com/njbrake/agent-of-empires/releases), the [quick install script](../installation.md#quick-install-recommended), and Homebrew (`brew install aoe`). No extra build steps needed, just run `aoe serve`.
+The web dashboard is included in all release binaries: [GitHub Releases](https://github.com/agent-of-empires/agent-of-empires/releases), the [quick install script](../installation.md#quick-install-recommended), and Homebrew (`brew install aoe`). No extra build steps needed, just run `aoe serve`.
 
 ## Building from source
 
@@ -125,14 +125,46 @@ aoe prints a notice when it falls back to this path so you don't accidentally in
 |------|---------|-------------|
 | `--port` | 8080 | Port to listen on |
 | `--host` | 127.0.0.1 | Bind address. Use `0.0.0.0` for LAN/VPN access |
+| `--auth` | `token` | Auth mode: `token` (URL token, default), `passphrase` (passphrase login wall only), `none` (no auth, loopback only unless `--behind-proxy`) |
+| `--passphrase` | | Passphrase for the login wall. Valid with `--auth=token` (token + passphrase) and `--auth=passphrase`. Also reads `AOE_SERVE_PASSPHRASE` |
+| `--behind-proxy` | off | Server sits behind an external reverse proxy that terminates TLS. Sets cookies as `; Secure` and trusts `X-Forwarded-For` / `cf-connecting-ip` from loopback peers; does NOT spawn a tunnel |
+| `--no-auth` | off | Alias for `--auth=none` (kept for backwards compatibility) |
 | `--remote` | off | Expose over HTTPS tunnel (Tailscale Funnel if available, else Cloudflare quick tunnel) |
 | `--tunnel-name` | | Use a named Cloudflare tunnel (requires `--remote`; overrides Tailscale auto-detection) |
 | `--no-tailscale` | off | Skip Tailscale Funnel auto-detection and use Cloudflare (requires `--remote`) |
 | `--tunnel-url` | | Hostname for a named tunnel (requires `--tunnel-name`) |
-| `--no-auth` | off | Disable token auth (localhost only) |
 | `--read-only` | off | View terminals but cannot send keystrokes |
 | `--daemon` | off | Fork to background and detach from terminal |
 | `--stop` | | Stop a running daemon |
+
+### Auth mode matrix
+
+| Mode | Token URL | Passphrase wall | Use case |
+|------|-----------|-----------------|----------|
+| `--auth=token` (default) | required | optional (`--passphrase`) | Standard local / VPN / Tailscale deployments |
+| `--auth=passphrase --passphrase X` | none | required | Reverse-proxy deployments where pasting a token URL on mobile is too high friction |
+| `--auth=none` (alias `--no-auth`) | none | none | Localhost-only quick testing |
+
+Notes:
+
+- `--auth=passphrase` and `--auth=none` on a non-loopback bind require `--behind-proxy`. The flag asserts that an upstream reverse proxy terminates TLS and forwards the client IP. Without it, reduced-auth modes refuse to bind to a routable address.
+- `--auth=passphrase` requires `--passphrase <VALUE>` (or `AOE_SERVE_PASSPHRASE`) since the passphrase becomes the only human gate.
+- `--auth=none --passphrase X` is rejected explicitly; the previous silent acceptance of `--no-auth --passphrase` was a footgun. Use `--auth=passphrase` if the passphrase wall is what you want.
+- `--remote` is incompatible with `--auth=none` and `--auth=passphrase`; the public tunnel mandates both token auth and a passphrase.
+
+### Behind a reverse proxy
+
+When TLS is terminated by an external reverse proxy (Traefik, nginx, Caddy) that forwards traffic to `aoe serve` on loopback (often through an SSH reverse tunnel), use `--behind-proxy` so cookies carry `; Secure` and the rate limiter keys requests by the real client IP:
+
+```bash
+# Loopback bind, passphrase login wall, TLS terminated upstream.
+aoe serve \
+  --host 127.0.0.1 --port 42041 \
+  --auth=passphrase --passphrase "$AOE_PASSPHRASE" \
+  --behind-proxy
+```
+
+The upstream proxy must set `X-Forwarded-For` (or `cf-connecting-ip`); aoe reads the last value as the client IP. The trust check fires only when the socket peer is loopback, so a misconfigured upstream that lets requests reach aoe directly cannot spoof the IP.
 
 ## Security
 
@@ -140,10 +172,12 @@ aoe prints a notice when it falls back to this path so you don't accidentally in
 
 ### Authentication
 
-- **Token auth:** A random 256-bit token is generated on startup and stored at `~/.config/agent-of-empires/serve.token` (Linux) or `~/.agent-of-empires/serve.token` (macOS). The token is passed via URL on first visit, then stored as an `HttpOnly; SameSite=Strict` cookie.
-- **Rate limiting:** 5 failed auth attempts from an IP trigger a 15-minute lockout. Uses `Cf-Connecting-IP` when behind a Cloudflare tunnel to prevent IP spoofing.
+- **Token auth** (`--auth=token`, default): A random 256-bit token is generated on startup and stored at `~/.config/agent-of-empires/serve.token` (Linux) or `~/.agent-of-empires/serve.token` (macOS). The token is passed via URL on first visit, then stored as an `HttpOnly; SameSite=Strict` cookie.
+- **Passphrase wall** (`--auth=passphrase`, or combined with token via `--passphrase`): An argon2-hashed passphrase gates `/login`. Sessions are bound to a per-device secret stored in the client's `localStorage`; a leaked session cookie alone is insufficient.
+- **Rate limiting:** 5 failed login attempts from an IP trigger a 15-minute lockout. Uses `Cf-Connecting-IP` / `X-Forwarded-For` from loopback peers (covers `--remote` tunnel mode and `--behind-proxy` reverse-proxy mode) to prevent IP spoofing.
 - **Token rotation:** In `--remote` mode, the token rotates every 4 hours with a 5-minute grace period for active sessions.
 - **Device tracking:** Connected devices (IP, browser, last seen) are visible in Settings > Security.
+- **Step-up elevation:** A "Confirm passphrase" prompt appears on writes whose payload can plant code for the next session spawn: the `sandbox` and `worktree` sections, and dangerous `session` fields (`agent_command_override`, `agent_extra_args`, `extra_env`, `custom_agents`, `agent_detect_as`). Confirmation lasts 15 minutes. User-preference writes (theme, sound, updates, notification toggles, logging filter, profile description, and safe session fields like `yolo_mode_default`) save without the prompt; saving a theme should not feel like signing in again.
 
 ### Security headers
 
@@ -154,13 +188,14 @@ The server sets `X-Frame-Options: DENY` (prevents clickjacking), `X-Content-Type
 - **Localhost** (`aoe serve`): Same security as the TUI. Fine.
 - **Remote via tunnel** (`aoe serve --remote`): Encrypted via HTTPS. Recommended for phone access.
 - **Over Tailscale/WireGuard** (`aoe serve --host 0.0.0.0`): The VPN encrypts traffic.
+- **Behind a reverse proxy** (`aoe serve --auth=passphrase --passphrase ... --behind-proxy`): TLS terminated upstream by Traefik / nginx / Caddy. Passphrase is the only human gate.
 - **Read-only** (`aoe serve --remote --read-only`): Monitor sessions without input capability.
 
 ### Dangerous
 
 - `aoe serve --host 0.0.0.0` on public WiFi without a VPN: traffic is unencrypted HTTP
-- `aoe serve --no-auth --host 0.0.0.0`: blocked (refuses to start)
-- `aoe serve --no-auth --remote`: blocked (refuses to start)
+- `aoe serve --auth=none --host 0.0.0.0` (or alias `--no-auth --host 0.0.0.0`): blocked (refuses to start without `--behind-proxy`)
+- `aoe serve --auth=none --remote` or `--auth=passphrase --remote`: blocked (refuses to start)
 
 ## Installing as a PWA
 
@@ -182,6 +217,10 @@ aoe serve --daemon
 # Stop with: aoe serve --stop
 ```
 
+### Shutdown behavior
+
+`Ctrl-C` on a foreground `aoe serve`, and `aoe serve --stop` against a daemon, both exit within ~5 seconds even with open dashboard tabs. Live cockpit and terminal WebSocket clients receive a close frame with code `1001` ("going away") so the browser logs a clean reason and skips its transient-error reconnect backoff for one cycle. The reconnect resumes normally once a fresh `aoe serve` is running. A 5-second hard cap acts as a safety net: if any handler fails to honor the shutdown signal, the process still exits and emits `WARN shutdown: graceful shutdown exceeded grace window, forcing exit`.
+
 ## Features
 
 - **Session list** with live status updates (Running, Waiting, Idle, Error)
@@ -191,6 +230,28 @@ aoe serve --daemon
 - **Multi-profile** support (shows sessions from all profiles)
 - **Connected Devices** view in Settings > Security
 - **Push notifications** on Waiting / Idle / Error transitions, with per-session overrides ([guide](push-notifications.md))
+
+### Sidebar sort
+
+By default the sidebar shows your manually-ordered list. Drag a row with a press-and-hold gesture to move it; the new order persists across browsers and devices via `workspace-ordering.json`.
+
+A sort toggle next to the filter button in the sidebar header switches to **Recent activity** mode, which orders workspaces by the most recent of `last_accessed_at`, `idle_entered_at`, and `created_at` across each workspace's sessions, descending. Drag-to-reorder is disabled while Recent activity is selected, because the order is computed; the press-and-hold gesture does nothing in that mode.
+
+The toggle's state is per-browser (localStorage), not synced across devices and not tied to your profile. Toggling back to manual restores the stored manual order and re-enables drag. The multi-repo group stays pinned at the bottom in both modes.
+
+### Triage: pin, archive, snooze
+
+The sidebar exposes three triage primitives via the right-click (long-press on touch) context menu on any session row:
+
+- **Pin** floats the workspace to the top of the sidebar in every sort mode (manual and Recent activity). Pin is web-only and intentionally distinct from the TUI's favorite mark, which is a within-tier signal for the Attention sort. The web pin renders as a pushpin glyph next to the row title; the TUI favorite keeps its `*` star marker.
+- **Archive** kills the session's tmux pane (or shuts down the cockpit worker for ACP-cockpit sessions) and sinks the row into the collapsible "Snoozed & archived" footer of its repo group. Sending a message to the row from the dashboard wakes it back into the live list automatically. Daemon restarts and the cockpit worker reconciler both skip archived sessions, so a row stays parked until you explicitly unarchive it.
+- **Snooze** sinks the row into the same footer for a chosen duration. The menu offers the same eight presets as the TUI snooze dialog: 1h, 2h, 3h, 4h, 5h, 6h, 1d, 1w. The row wakes automatically when the timer expires; sending a message wakes it early.
+
+Snooze and archive are mutually exclusive with pin: pinning a sunk row surfaces it, and archiving or snoozing a pinned row removes the pin. The three primitives can be mixed freely across concurrent surfaces (TUI, CLI, web), and the data layer enforces the mutual-exclusion rules in one place so peer writes cannot leave a row in a contradictory state.
+
+The "Snoozed & archived" section sits at the very bottom of the sidebar and aggregates every sunk workspace across all repo groups. It is collapsed by default; clicking the header expands the list and remembers the choice in localStorage. Drag-to-reorder is disabled on pinned and sunk rows since their placement is computed.
+
+In read-only mode (`aoe serve --read-only`) the three menu entries are hidden, matching the existing read-only gate on Delete.
 
 ## Architecture
 
@@ -203,6 +264,22 @@ The server embeds an axum web server that serves a React frontend and provides:
 - Security headers (X-Frame-Options, Referrer-Policy)
 
 Each terminal connection spawns `tmux attach-session` inside a PTY and relays the raw byte stream bidirectionally over WebSocket. This gives the browser a real terminal experience identical to SSH.
+
+### Terminal WebSocket close codes
+
+When the browser fails to reach a working terminal, the disconnect banner shows the close code returned by the server. Decoder ring:
+
+| Code | Reason string             | Meaning                                                                                                                                              | Client behavior              |
+| ---- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------- |
+| 1001 | `server shutdown`         | Daemon is shutting down (SIGINT/SIGTERM).                                                                                                            | Retry with normal backoff.   |
+| 1011 | `openpty_failed`          | Server could not allocate a PTY.                                                                                                                     | Retry with normal backoff.   |
+| 1011 | `attach_spawn_failed`     | Server could not spawn the `tmux attach-session` child process.                                                                                      | Retry with normal backoff.   |
+| 1011 | `pty_reader_failed`       | Server could not clone the PTY reader handle.                                                                                                        | Retry with normal backoff.   |
+| 1011 | `pty_writer_failed`       | Server could not take the PTY writer handle.                                                                                                         | Retry with normal backoff.   |
+| 1013 | `tmux_not_ready`          | Server polled `tmux has-session` / `list-panes` for up to 2s and the pane did not become attachable. Usually a benign warm-up on first session open. | Retry with normal backoff.   |
+| 4001 | `pty_dead`                | PTY relay was running but the pane permanently exited. Continuing to retry would just hammer a dead session.                                         | Show "Click retry" banner.   |
+
+The browser uses a fast-start retry ladder (200ms, 400ms, 800ms, 1.5s, 3s, 6s, 10s) so transient warm-up failures recover in well under 5 seconds end-to-end. Permanently dead panes short-circuit on 4001 and surface a manual reconnect button.
 
 ## Frontend development
 

@@ -6,6 +6,9 @@ const IS_MAC =
 
 interface ShortcutActions {
   onNew: () => void;
+  /** Fast-path: opens the wizard pre-configured for a scratch session
+   *  and jumped to the Review step so Cmd+Enter immediately creates it. */
+  onNewScratch: () => void;
   onDiff: () => void;
   onEscape: () => void;
   onHelp: () => void;
@@ -72,6 +75,18 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
         return;
       }
 
+      // New scratch session: Cmd+Shift+N (Mac) / Ctrl+Shift+N (other).
+      // Use e.code so Shift+layout punctuation doesn't break match (Shift+N
+      // is still "N" by e.key but `code === "KeyN"` is layout-stable).
+      // Works regardless of focus so the user can fire it from anywhere
+      // including the terminal pane.
+      if (mod && e.shiftKey && !e.altKey && e.code === "KeyN") {
+        e.preventDefault();
+        e.stopPropagation();
+        actions.onNewScratch();
+        return;
+      }
+
       if (e.key === "Escape") {
         actions.onEscape();
         return;
@@ -100,7 +115,12 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
       }
     };
 
-    document.addEventListener("keydown", handler);
-    return () => document.removeEventListener("keydown", handler);
+    // Capture phase so we observe the keydown before xterm.js's helper
+    // textarea sees it. xterm.js calls stopPropagation on a handful of
+    // modifier combos (Cmd/Ctrl + letter), which otherwise blocks global
+    // shortcuts like Cmd+K, Cmd+`, and Ctrl+Alt+B whenever the terminal
+    // is focused.
+    document.addEventListener("keydown", handler, true);
+    return () => document.removeEventListener("keydown", handler, true);
   }, [getActions]);
 }

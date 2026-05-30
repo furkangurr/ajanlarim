@@ -46,6 +46,24 @@ export interface ToolCall {
    *  sub-tools under their parent Task. Undefined for top-level
    *  calls. See #1041. */
   parent_tool_call_id?: string;
+  /** Populated when claude-agent-acp v0.37.0+ routes a session-start
+   *  memory recall through the tool channel (upstream #703). The
+   *  cockpit renders a dedicated MemoryRecallCard instead of treating
+   *  it as a generic read. `recall` mode carries the list of file
+   *  paths the SDK loaded into the agent's context; `synthesize`
+   *  mode carries the synthesised memory text. */
+  memory_recall?: MemoryRecall | null;
+}
+
+export interface MemoryRecall {
+  /** "recall" (file list) or "synthesize" (text body). */
+  mode: string;
+  /** Absolute paths of the memory files loaded into the agent's
+   *  context. Empty in synthesize mode. */
+  paths?: string[];
+  /** Synthesised summary the SDK produced from the loaded memories.
+   *  Present in synthesize mode only. */
+  synthesized_text?: string | null;
 }
 
 export interface DiffPreview {
@@ -84,6 +102,50 @@ export interface AvailableCommand {
   accepts_input: boolean;
 }
 
+/** Semantic category for a session configuration option, mirroring
+ *  ACP's `SessionConfigOptionCategory`. The cockpit UI uses this to
+ *  pick the right widget per category (model dropdown, effort
+ *  segmented control). Unknown categories preserve their string
+ *  payload so the broadcast frame stays forward-compatible. See
+ *  #1403. */
+export type ConfigOptionCategory =
+  | "mode"
+  | "model"
+  | "thought_level"
+  | { Other: string };
+
+/** One choice in a `Select`-kind ConfigOptionDescriptor. */
+export interface ConfigOptionChoice {
+  value: string;
+  name: string;
+  description?: string | null;
+}
+
+/** Cockpit's view of a single ACP `SessionConfigOption`. Each
+ *  `ConfigOptionsUpdated` event replaces the prior list in full;
+ *  the adapter resends the full snapshot whenever any selector
+ *  changes. */
+export interface ConfigOptionDescriptor {
+  id: string;
+  name: string;
+  description?: string | null;
+  category: ConfigOptionCategory;
+  current_value: string;
+  options: ConfigOptionChoice[];
+}
+
+/** Carried by `ConfigOptionSwitchFailed`. Lives on
+ *  `CockpitState.configOptionSwitchFailed` so the UI can render a
+ *  non-blocking notice when the adapter rejects a `set_config_option`
+ *  call. Auto-clears when the next `ConfigOptionsUpdated` snapshot
+ *  confirms the originally-requested value. */
+export interface ConfigOptionSwitchFailure {
+  configId: string;
+  value: string;
+  reason: string;
+  at: string;
+}
+
 export interface Approval {
   nonce: string;
   tool_call: ToolCall;
@@ -95,6 +157,42 @@ export interface Approval {
     resolved_at: string;
   } | null;
 }
+
+/** Mirror of `StartupErrorDetail` in src/cockpit/state.rs. Serde's
+ *  default for `#[serde(tag = "kind", ...)]` is internal tagging keyed
+ *  on `kind`. Carries the structured remediation data the
+ *  `StartupErrorScreen` renders. */
+export type IncompatibleAgentDetail =
+  | {
+      kind: "incompatible_agent_version";
+      package_name: string;
+      installed: string;
+      required: string;
+      install_command: string;
+    }
+  | {
+      kind: "missing_agent_info";
+      expected_package: string;
+      install_command: string;
+    }
+  | {
+      kind: "mismatched_agent_name";
+      expected: string;
+      received: string;
+      install_command: string;
+    }
+  | {
+      kind: "unparseable_agent_version";
+      package_name: string;
+      raw_version: string;
+      required: string;
+      install_command: string;
+    }
+  | {
+      kind: "unsupported_protocol_version";
+      expected: string;
+      received: string;
+    };
 
 // One variant per Event::* in src/cockpit/state.rs. All variants carry
 // a discriminant key matching the serde representation: serde defaults
@@ -165,15 +263,27 @@ export type CockpitEvent =
       };
     }
   | { CurrentModeChanged: { current_mode_id: string } }
+  | { ModeSwitchFailed: { mode_id: string; reason: string } }
   | { AvailableCommandsUpdated: { commands: AvailableCommand[] } }
+  | { ConfigOptionsUpdated: { options: ConfigOptionDescriptor[] } }
+  | {
+      ConfigOptionSwitchFailed: {
+        config_id: string;
+        value: string;
+        reason: string;
+      };
+    }
   | { RawAgentUpdate: { payload: unknown } }
   | { AgentMessageChunk: { text: string } }
   | { Stopped: { reason: string } }
   | { AgentStartupError: { message: string } }
+  | { IncompatibleAgent: { detail: IncompatibleAgentDetail } }
   | { UserPromptSent: { text: string } }
   | { AcpSessionAssigned: { acp_session_id: string } }
   | { SessionContextReset: { reason: string } }
-  | { WakeupScheduled: { at: string; reason: string | null } };
+  | { WakeupScheduled: { at: string; reason: string | null } }
+  | { PromptRejected: { reason: string; text: string } }
+  | { AgentSwitched: { from: string; to: string; reason: string } };
 
 export interface CockpitFrame {
   session_id: string;
@@ -194,6 +304,18 @@ export interface CockpitState {
   /** Latest agent-reported context-window usage. Null until the agent
    *  emits its first ACP `UsageUpdate`. */
   sessionUsage: SessionUsage | null;
+  /** Cumulative cost snapshot captured at the most recent context
+   *  boundary (`/clear`, `/compact`). The ACP agent keeps reporting
+   *  session-lifetime cumulative cost via `UsageUpdate`, but the user
+   *  expects the composer footer to read "since the most recent
+   *  clear/compact." The `UsageUpdated` reducer arm subtracts this
+   *  baseline from the incoming cumulative before storing it on
+   *  `sessionUsage.cost`. Reset to null on `AgentSwitched` and
+   *  `SessionContextReset` (new backend or new ACP session restarts
+   *  the agent-side cumulative at zero). Re-derived on hard reload via
+   *  the full event-store replay, since boundary events are applied in
+   *  seq order. See #1354. */
+  usageBaseline: { cost: number } | null;
   /** Most recent assistant message chunks accumulated as a single
    *  text body. Cleared each time a new prompt is sent. */
   assistantMessage: string;
@@ -212,6 +334,16 @@ export interface CockpitState {
   /** Latest agent startup failure message, if any. Cleared when a new
    *  prompt is sent or the worker successfully connects. */
   startupError: string | null;
+  /** Structured detail from the per-adapter compatibility check (see
+   *  `src/cockpit/agent_compat.rs`). When set, the cockpit UI replaces
+   *  its normal session view with a full-region `StartupErrorScreen`
+   *  that renders the exact remediation command. Distinct from
+   *  `startupError` (string) which legacy callers still populate for
+   *  free-form handshake failures; `incompatibleAgent` carries
+   *  installed/required versions + install command in structured form.
+   *  Cleared on a fresh `AcpSessionAssigned` so a respawned worker
+   *  that satisfies the policy unblocks the UI. */
+  incompatibleAgent: IncompatibleAgentDetail | null;
   /** Latest interaction error (failed sendPrompt / resolveApproval /
    *  cancel POST). Surfaces as a dismissible banner so users don't
    *  silently lose actions to a network blip. Cleared on the next
@@ -220,8 +352,26 @@ export interface CockpitState {
   /** True between sending a user prompt and receiving the
    *  `Stopped { reason: "prompt_complete" }` event. Drives the global
    *  "working" spinner so the UI feels alive even when the agent
-   *  isn't streaming text or running a tool yet. */
+   *  isn't streaming text or running a tool yet.
+   *
+   *  Derived from `pendingUserPromptSeq > lastStoppedSeq`; never
+   *  written directly. Keeping it on the state shape (instead of
+   *  exporting a selector) lets all the existing `state.turnActive`
+   *  reads stay unchanged. The counter pair is the source of truth so
+   *  a late `Stopped` from a prior turn can't clobber a fresh
+   *  follow-up that's already incremented `pendingUserPromptSeq`.
+   *  See #1170. */
   turnActive: boolean;
+  /** Monotonic count of user prompts the client has dispatched (either
+   *  via the optimistic `user_prompt` action or via a server-confirmed
+   *  `UserPromptSent` echo that didn't match an outstanding optimistic
+   *  row). Source of truth for `turnActive`; never decremented. */
+  pendingUserPromptSeq: number;
+  /** Snapshot of `pendingUserPromptSeq` at the moment the most recent
+   *  `Stopped` (or `AgentStartupError`) arrived. `turnActive` derives
+   *  to false only when no further prompt has bumped
+   *  `pendingUserPromptSeq` past this snapshot. */
+  lastStoppedSeq: number;
   /** Real ACP-advertised modes from the agent's NewSessionResponse,
    *  plus the agent's currently-active mode id. Empty until the
    *  agent reports them; the picker falls back to the hard-coded
@@ -243,6 +393,14 @@ export interface CockpitState {
    *  handler to detect "no-op turn" without walking the full
    *  activity array. */
   turnHasOutput: boolean;
+  /** Latest cockpit-side `session/set_mode` rejection from the adapter.
+   *  Populated by the `ModeSwitchFailed` event so the UI can render a
+   *  non-blocking notice ("Yolo / bypassPermissions requested but the
+   *  adapter declined; session is in default mode"). Most common cause:
+   *  claude-agent-acp gates bypassPermissions on the `ALLOW_BYPASS` env
+   *  var. Cleared by the user dismissing the notice or by a successful
+   *  `CurrentModeChanged`. See #1233. */
+  modeSwitchFailed: { modeId: string; reason: string; at: string } | null;
   /** Set true when the daemon publishes `Stopped { reason: "user_stopped" }`,
    *  meaning `aoe cockpit stop|kill` (or an equivalent external
    *  teardown) terminated the runner. The composer disables itself and
@@ -278,6 +436,74 @@ export interface CockpitState {
    *  primer (last N turns) and pre-filling the composer with it.
    *  Cleared by `UserPromptSent`. See #1004. */
   contextPrimerAvailable: { resetSeq: number; reason: string } | null;
+  /** Capped FIFO of prompts the daemon rejected because another
+   *  `session/prompt` was already in flight. The composer renders a
+   *  Retry pill per entry; clicking Retry re-dispatches via the
+   *  normal sendPrompt path. Cleared on `UserPromptSent` (the user
+   *  has either retried or moved on). See #1196. */
+  rejectedPrompts: RejectedPrompt[];
+  /** Set when the daemon emitted `Stopped { reason: "agent_unresponsive" }`,
+   *  meaning the cancel-escalation watchdog fired and the supervisor
+   *  is restarting the wedged worker. The composer renders a specific
+   *  banner ("Agent stopped responding to cancel, restarting worker")
+   *  instead of the generic "Restarting..." overlay. Also pairs with
+   *  `workerRestarting = true` so the existing composer-lockdown
+   *  styling kicks in; cleared on `AcpSessionAssigned` (the respawned
+   *  worker came online) or `UserPromptSent`. See #1196. */
+  agentUnresponsive: boolean;
+  /** Most recent `AgentSwitched` snapshot. Populated when the user
+   *  hands off a rate-limited session to a different ACP backend via
+   *  `/cockpit/switch-agent`. Drives a transcript divider ("Switched
+   *  claude -> codex due to rate_limit") and lets the recovery flow
+   *  identify the cursor where the handoff happened. Cleared by
+   *  `SessionCleared`. See #1282. */
+  lastAgentSwitch: {
+    from: string;
+    to: string;
+    reason: string;
+    at: string;
+  } | null;
+  /** Full snapshot of the per-session selectors (model, reasoning
+   *  effort, mode, future categories) the adapter advertises through
+   *  ACP `SessionUpdate::ConfigOptionUpdate`. Empty when the adapter
+   *  emits no config options. Replaced wholesale on each
+   *  `ConfigOptionsUpdated` frame; cleared on `AgentSwitched`. See
+   *  #1403. */
+  configOptions: ConfigOptionDescriptor[];
+  /** Non-blocking notice for the most recent
+   *  `session/set_config_option` rejection. Auto-clears when the
+   *  next snapshot confirms the originally-requested value, or on
+   *  `AgentSwitched`. */
+  configOptionSwitchFailed: ConfigOptionSwitchFailure | null;
+  /** Set when the user clicks a model/effort option and the POST is
+   *  in flight; cleared by the next `ConfigOptionsUpdated` snapshot
+   *  (which reconciles authoritative state) or by
+   *  `ConfigOptionSwitchFailed`. Drives the pending affordance
+   *  (opacity dim + disabled re-click) on the just-clicked option;
+   *  the picker keeps showing the previously-current value until the
+   *  adapter confirms, so the UI never lies about active state. */
+  pendingConfigOption: { configId: string; value: string } | null;
+  /** Set when the daemon emitted `Stopped { reason: "prompt_orphaned" }`,
+   *  meaning the silent-orphan watchdog detected that the adapter
+   *  finished streaming the turn but never sent the JSON-RPC
+   *  `PromptResponse`. The supervisor is SIGTERMing the runner and
+   *  respawning via `session/load` (transcript preserved). Pairs with
+   *  `workerRestarting = true` for composer lockdown; banner copy
+   *  distinguishes this from `agentUnresponsive` so users can tell
+   *  whether the adapter ignored their cancel (`agentUnresponsive`)
+   *  or finished without notifying the daemon (`agentOrphaned`).
+   *  Cleared on `AcpSessionAssigned` or `UserPromptSent`. See #1240. */
+  agentOrphaned: boolean;
+}
+
+export interface RejectedPrompt {
+  /** Client-stable id derived from the frame seq. Used to key the
+   *  pill list and to target a specific entry for retry/dismiss. */
+  id: string;
+  text: string;
+  reason: string;
+  /** Server-side wall-clock at rejection time (frame arrival). */
+  rejectedAt: string;
 }
 
 export interface QueuedPrompt {
@@ -341,13 +567,17 @@ export function emptyCockpitState(): CockpitState {
     thinking: false,
     rateLimit: null,
     sessionUsage: null,
+    usageBaseline: null,
     assistantMessage: "",
     activity: [],
     lastSeq: 0,
     lagged: false,
     startupError: null,
+    incompatibleAgent: null,
     lastError: null,
     turnActive: false,
+    pendingUserPromptSeq: 0,
+    lastStoppedSeq: 0,
     availableModes: [],
     currentModeId: null,
     availableCommands: [],
@@ -359,6 +589,14 @@ export function emptyCockpitState(): CockpitState {
     nextWakeupAt: null,
     nextWakeupReason: null,
     contextPrimerAvailable: null,
+    rejectedPrompts: [],
+    agentUnresponsive: false,
+    agentOrphaned: false,
+    modeSwitchFailed: null,
+    lastAgentSwitch: null,
+    configOptions: [],
+    configOptionSwitchFailed: null,
+    pendingConfigOption: null,
   };
 }
 
@@ -390,6 +628,13 @@ export function applyEvent(
       // `compacted` kind to a "Conversation compacted" divider that
       // makes the boundary visible without nudging the user toward
       // pre-filling duplicate context. See #1109.
+      // Capture the agent's cumulative cost snapshot as the new
+      // baseline so the next UsageUpdate reports cost-since-compact
+      // instead of session-lifetime cumulative. See #1354.
+      const compactPriorUsage = state.sessionUsage?.cost?.amount ?? 0;
+      const compactPriorBaseline = state.usageBaseline?.cost ?? 0;
+      const compactCumulative = compactPriorUsage + compactPriorBaseline;
+      next.usageBaseline = { cost: compactCumulative };
       next.sessionUsage = null;
       next.activity = [
         ...next.activity,
@@ -401,11 +646,23 @@ export function applyEvent(
         },
       ];
     } else if (event === "SessionCleared") {
-      // /clear wiped the model's memory. Append a divider row and
-      // drop session-scoped capability caches; the UI groups all
-      // rows above the divider behind a collapsible disclosure so
-      // the user can still scroll back but won't reply on top of a
-      // conversation the model no longer has. See #1101.
+      // /clear wiped the model's memory. Append a divider row so the
+      // UI can fold pre-clear turns behind a disclosure (#1101), then
+      // drop only the per-turn / in-flight state that the cleared
+      // context invalidates: the active plan, the legacy mode enum,
+      // pending approvals, and the session usage snapshot.
+      //
+      // We deliberately preserve availableCommands, availableModes,
+      // and currentModeId. claude-agent-sdk caches the supported
+      // command surface at Query init and does not recreate the
+      // Query on /clear, so the cached list stays authoritative for
+      // the lifetime of the cockpit's underlying agent process. The
+      // prior over-clear (#1101 A.1) was based on an assumption that
+      // doesn't hold for this SDK; emptying availableCommands made
+      // the slash palette stay empty forever after the first /clear
+      // because no AvailableCommandsUpdated event arrives to refill
+      // it (tracked upstream at
+      // agentclientprotocol/claude-agent-acp#657). See #1128.
       next.activity = [
         ...next.activity,
         {
@@ -415,12 +672,19 @@ export function applyEvent(
           at: new Date().toISOString(),
         },
       ];
-      next.availableCommands = [];
-      next.availableModes = [];
-      next.currentModeId = null;
       next.plan = null;
       next.mode = "Default";
       next.pendingApprovals = [];
+      // Capture the agent's cumulative cost snapshot as the new
+      // baseline so the next UsageUpdate reports cost-since-clear
+      // instead of session-lifetime cumulative. `sessionUsage.cost`
+      // already stores the delta since the previous baseline, so the
+      // new baseline is the sum of both to track the true cumulative.
+      // See #1354.
+      const clearPriorUsage = state.sessionUsage?.cost?.amount ?? 0;
+      const clearPriorBaseline = state.usageBaseline?.cost ?? 0;
+      const clearCumulative = clearPriorUsage + clearPriorBaseline;
+      next.usageBaseline = { cost: clearCumulative };
       next.sessionUsage = null;
     }
     return next;
@@ -562,7 +826,23 @@ export function applyEvent(
     return next;
   }
   if ("UsageUpdated" in event) {
-    next.sessionUsage = event.UsageUpdated.usage;
+    // claude-agent-acp keeps reporting session-lifetime cumulative
+    // cost via UsageUpdate; `/clear` and `/compact` don't rotate the
+    // ACP session id so the agent's cumulative carries pre-boundary
+    // spend. Subtract the baseline captured at the most recent
+    // SessionCleared / ConversationCompacted so the composer footer
+    // reads "since the most recent boundary." `used` already reflects
+    // the post-boundary context size from the agent's side and stays
+    // raw; only `cost` is rebased. clamp to zero defensively in case
+    // an upstream restart ever reports a smaller cumulative. See #1354.
+    const incoming = event.UsageUpdated.usage;
+    if (next.usageBaseline && incoming.cost) {
+      const rebasedAmount = Math.max(0, incoming.cost.amount - next.usageBaseline.cost);
+      const rebasedCost = { amount: rebasedAmount, currency: incoming.cost.currency };
+      next.sessionUsage = { used: incoming.used, size: incoming.size, cost: rebasedCost };
+    } else {
+      next.sessionUsage = incoming;
+    }
     return next;
   }
   if ("ModeChanged" in event) {
@@ -580,10 +860,54 @@ export function applyEvent(
   }
   if ("CurrentModeChanged" in event) {
     next.currentModeId = event.CurrentModeChanged.current_mode_id;
+    // Mode actually switched, so any prior failure notice is stale.
+    next.modeSwitchFailed = null;
+    return next;
+  }
+  if ("ModeSwitchFailed" in event) {
+    next.modeSwitchFailed = {
+      modeId: event.ModeSwitchFailed.mode_id,
+      reason: event.ModeSwitchFailed.reason,
+      at: new Date().toISOString(),
+    };
     return next;
   }
   if ("AvailableCommandsUpdated" in event) {
     next.availableCommands = event.AvailableCommandsUpdated.commands;
+    return next;
+  }
+  if ("ConfigOptionsUpdated" in event) {
+    const options = event.ConfigOptionsUpdated.options;
+    next.configOptions = options;
+    // The snapshot is authoritative, so any in-flight pending click
+    // resolves here regardless of whether the adapter applied the
+    // exact requested value. A rejected change comes through
+    // `ConfigOptionSwitchFailed` and clears pending on that path
+    // instead.
+    next.pendingConfigOption = null;
+    // Auto-dismiss a stale switch-failed notice when this snapshot
+    // confirms the originally-requested value: user retried and won,
+    // or the adapter applied asynchronously after the rejection.
+    if (next.configOptionSwitchFailed) {
+      const failure = next.configOptionSwitchFailed;
+      const confirmed = options.some(
+        (opt) =>
+          opt.id === failure.configId && opt.current_value === failure.value,
+      );
+      if (confirmed) {
+        next.configOptionSwitchFailed = null;
+      }
+    }
+    return next;
+  }
+  if ("ConfigOptionSwitchFailed" in event) {
+    next.configOptionSwitchFailed = {
+      configId: event.ConfigOptionSwitchFailed.config_id,
+      value: event.ConfigOptionSwitchFailed.value,
+      reason: event.ConfigOptionSwitchFailed.reason,
+      at: new Date().toISOString(),
+    };
+    next.pendingConfigOption = null;
     return next;
   }
   if ("AgentMessageChunk" in event) {
@@ -599,10 +923,23 @@ export function applyEvent(
   }
   if ("Stopped" in event) {
     // Final marker; nothing to mutate, but reset the inflight tool just
-    // in case the agent forgot to emit a completion. Also clears the
-    // turn-active flag so the global "working" spinner stops.
+    // in case the agent forgot to emit a completion.
+    //
+    // `turnActive` is derived from `pendingUserPromptSeq > lastStoppedSeq`;
+    // we advance `lastStoppedSeq` by one (capped at `pendingUserPromptSeq`)
+    // so this Stopped only retires ONE turn's worth of activity. If a
+    // fresh user prompt landed client-side between the turn this Stopped
+    // is closing and now, `pendingUserPromptSeq` was already bumped past
+    // the cap and `turnActive` stays true. Without this, a late Stopped
+    // would clobber the spinner mid follow-up and reorder the user's
+    // optimistic message above any still-arriving prior-turn agent
+    // chunks. See #1170.
     next.inFlightTool = null;
-    next.turnActive = false;
+    next.lastStoppedSeq = Math.min(
+      next.lastStoppedSeq + 1,
+      next.pendingUserPromptSeq,
+    );
+    next.turnActive = isTurnActive(next);
     // The "user_stopped" / "restart_pending" reasons are published by
     // the supervisor's reap_user_stopped pass when it detects an
     // out-of-band CLI teardown. Surface a distinct UI state for each:
@@ -614,9 +951,47 @@ export function applyEvent(
     if (event.Stopped.reason === "user_stopped") {
       next.workerStopped = true;
       next.workerRestarting = false;
+      // Any prior unresponsive escalation has been superseded by the
+      // user explicitly stopping the worker; drop the stale banner
+      // flag so a future `restart_pending` doesn't accidentally
+      // render unresponsive copy. See #1196.
+      next.agentUnresponsive = false;
+      next.agentOrphaned = false;
     } else if (event.Stopped.reason === "restart_pending") {
       next.workerRestarting = true;
       next.workerStopped = false;
+      next.agentUnresponsive = false;
+      next.agentOrphaned = false;
+    } else if (event.Stopped.reason === "agent_unresponsive") {
+      // Cancel-escalation watchdog in the daemon fired: claude-agent-acp
+      // ignored `session/cancel` for the grace window, the supervisor
+      // is SIGTERMing the runner and respawning via `session/load` to
+      // preserve transcript continuity. claude-agent-acp >=0.37.0
+      // (upstream #694) returns StopReason::Cancelled natively when it
+      // resolves the cancel; in that path the daemon surfaces
+      // `cancelled` instead and this branch only fires when the adapter
+      // does not respond at all (transport wedge, child hang). Reuse
+      // `workerRestarting`'s composer-lockdown semantics; the
+      // `agentUnresponsive` flag lets the banner render the specific
+      // cause. Cleared on `AcpSessionAssigned` (respawn finished) or
+      // `UserPromptSent`. See #1196.
+      next.workerRestarting = true;
+      next.workerStopped = false;
+      next.agentUnresponsive = true;
+      next.agentOrphaned = false;
+    } else if (event.Stopped.reason === "prompt_orphaned") {
+      // Silent-orphan watchdog in the daemon fired: the adapter
+      // finished streaming the turn but never sent the JSON-RPC
+      // `PromptResponse`, the supervisor is SIGTERMing the runner
+      // and respawning via `session/load` (transcript preserved).
+      // Distinct from `agent_unresponsive`: this is "adapter stopped
+      // talking" vs. "adapter ignored cancel"; both reuse the
+      // `workerRestarting` lockdown, but the banner copy differs so
+      // users can tell which failure happened. See #1240.
+      next.workerRestarting = true;
+      next.workerStopped = false;
+      next.agentUnresponsive = false;
+      next.agentOrphaned = true;
     }
     // Some upstream slash commands (e.g. /usage, /status, /memory in
     // claude-agent-acp) advertise via available_commands_update but
@@ -626,6 +1001,15 @@ export function applyEvent(
     // flag is flipped by every output-producing handler and reset by
     // UserPromptSent, so this check is O(1) instead of walking the
     // full activity array on every Stopped.
+    //
+    // `state.turnActive` is read on the PRE-event state. Under the
+    // counter derivation it means "at least one outstanding prompt
+    // hasn't been retired yet," which is exactly what we want: it
+    // skips spurious Stopped frames (no open turn to attribute the
+    // notice to) and fires for the turn this Stopped is actually
+    // retiring. In the race case, `turnHasOutput` still reflects the
+    // turn being retired because UserPromptSent (which resets it) for
+    // the follow-up hasn't been applied yet.
     if (state.turnActive && !state.turnHasOutput) {
       next.activity = pushActivity(next.activity, {
         id: `empty-${frame.seq}`,
@@ -636,10 +1020,38 @@ export function applyEvent(
     }
     return next;
   }
+  if ("IncompatibleAgent" in event) {
+    // The cockpit refused to enter the session because the adapter
+    // failed the per-adapter compatibility check (see
+    // src/cockpit/agent_compat.rs). The structured payload powers the
+    // dedicated StartupErrorScreen which short-circuits normal session
+    // rendering. The parallel AgentStartupError event populates
+    // `startupError` so legacy status logic still flips into Error.
+    next.incompatibleAgent = event.IncompatibleAgent.detail;
+    next.inFlightTool = null;
+    next.agentUnresponsive = false;
+    next.lastStoppedSeq = Math.min(
+      next.lastStoppedSeq + 1,
+      next.pendingUserPromptSeq,
+    );
+    next.turnActive = isTurnActive(next);
+    return next;
+  }
   if ("AgentStartupError" in event) {
     next.startupError = event.AgentStartupError.message;
     next.inFlightTool = null;
-    next.turnActive = false;
+    // A failed respawn supersedes any in-progress unresponsive
+    // escalation; the user sees the startup error banner instead.
+    next.agentUnresponsive = false;
+    // Same race-safe semantics as `Stopped`: advance `lastStoppedSeq`
+    // by one so a startup failure for the prior turn doesn't kill the
+    // spinner for a freshly-typed follow-up the user has already
+    // submitted. See #1170.
+    next.lastStoppedSeq = Math.min(
+      next.lastStoppedSeq + 1,
+      next.pendingUserPromptSeq,
+    );
+    next.turnActive = isTurnActive(next);
     return next;
   }
   if ("UserPromptSent" in event) {
@@ -658,24 +1070,39 @@ export function applyEvent(
         !r.id.startsWith("user-seq-"),
     );
     if (matchIdx >= 0) {
+      // Optimistic-match path: promote the placeholder's id. The
+      // client's `user_prompt` action already bumped
+      // `pendingUserPromptSeq`, so we don't bump again here. The
+      // per-turn resets below STILL apply: `turnHasOutput`, the
+      // worker banners, and the wakeup countdown all reset on every
+      // server-confirmed UserPromptSent regardless of which branch
+      // promoted the row. See #1170.
       const match = next.activity[matchIdx];
       if (match) {
         const updated = next.activity.slice();
         updated[matchIdx] = { ...match, id: `user-seq-${frame.seq}` };
         next.activity = updated;
-        return next;
       }
+    } else {
+      // No optimistic row matched: this is a server-confirmed prompt
+      // the client didn't dispatch (replay path, server-initiated, or
+      // user action without optimistic local dispatch). Append a fresh
+      // row and bump the prompt counter so `turnActive` derives true.
+      // The optimistic-match branch above is reached when the client's
+      // `user_prompt` action already bumped the counter; bumping again
+      // here would double-count. See #1170.
+      next.activity = pushActivity(next.activity, {
+        id: `user-seq-${frame.seq}`,
+        kind: "user_prompt",
+        text,
+        at: new Date().toISOString(),
+      });
+      next.pendingUserPromptSeq = next.pendingUserPromptSeq + 1;
     }
-    next.activity = pushActivity(next.activity, {
-      id: `user-seq-${frame.seq}`,
-      kind: "user_prompt",
-      text,
-      at: new Date().toISOString(),
-    });
     next.assistantMessage = "";
     next.startupError = null;
     next.lastError = null;
-    next.turnActive = true;
+    next.turnActive = isTurnActive(next);
     // New turn; reset the no-output detector so Stopped fires the
     // empty-output notice if the agent produces nothing.
     next.turnHasOutput = false;
@@ -683,6 +1110,13 @@ export function applyEvent(
     // user_stopped banner without waiting for AcpSessionAssigned.
     next.workerStopped = false;
     next.workerRestarting = false;
+    // The user is moving on. Clear any pending Retry pills and the
+    // agent-unresponsive banner; if the rejection was legitimate the
+    // new prompt will end up rejected too and a fresh pill will land.
+    // See #1196.
+    next.rejectedPrompts = [];
+    next.agentUnresponsive = false;
+    next.agentOrphaned = false;
     // /loop dynamic mode self-fires a UserPromptSent on wake, but a
     // user-typed follow-up during the wait is NOT the wake firing;
     // only clear when the scheduled time has already elapsed. The
@@ -715,11 +1149,22 @@ export function applyEvent(
     // its own once the respawn completes the handshake.
     next.startupError = null;
     next.lastError = null;
+    // A fresh agent that passed the compatibility check has come
+    // online; the structured incompatibility banner heals so the
+    // session can resume.
+    next.incompatibleAgent = null;
     // A fresh agent (via POST /cockpit/spawn after `aoe cockpit stop`
     // or via the reconciler's auto-respawn after `aoe cockpit restart`)
     // is online; clear both transient worker banners.
     next.workerStopped = false;
     next.workerRestarting = false;
+    // The respawn after an `agent_unresponsive` escalation completed;
+    // clear the banner so the user can interact again. See #1196.
+    next.agentUnresponsive = false;
+    // Same shape for `prompt_orphaned`: the silent-orphan watchdog
+    // fired, the runner was SIGTERMed, and the respawn handshake has
+    // now landed. See #1240.
+    next.agentOrphaned = false;
     return next;
   }
   if ("SessionContextReset" in event) {
@@ -728,6 +1173,10 @@ export function applyEvent(
     // the composer footer doesn't keep showing the previous run's
     // "75k / 200k" until the next UsageUpdate arrives.
     next.sessionUsage = null;
+    // The new ACP session restarts the agent-side cumulative cost at
+    // zero, so any prior per-clear baseline no longer maps onto
+    // incoming UsageUpdate values. See #1354.
+    next.usageBaseline = null;
     // Suppress the visible notice on a session that never saw a user
     // prompt: claude-agent-acp doesn't persist a 0-prompt session, so
     // session/load failing on the next spawn is expected, not an
@@ -764,6 +1213,89 @@ export function applyEvent(
     next.nextWakeupReason = event.WakeupScheduled.reason ?? null;
     return next;
   }
+  if ("AgentSwitched" in event) {
+    // ACP backend handoff completed (e.g. claude -> codex after a
+    // rate-limit). Drop everything tied to the prior backend so the
+    // composer/footer don't keep showing Claude's usage bar, mode
+    // pills, or in-flight tool card while talking to Codex. The
+    // transcript stays intact on the event log; only the visible
+    // overlay state is dropped. Append a session-divider row so the
+    // UI shows where the handoff happened. See #1282.
+    const { from, to, reason } = event.AgentSwitched;
+    const now = new Date().toISOString();
+    next.agent = to;
+    next.rateLimit = null;
+    next.inFlightTool = null;
+    next.thinking = false;
+    next.pendingApprovals = [];
+    next.sessionUsage = null;
+    // The new backend reports its own cumulative cost starting from
+    // zero, so the prior agent's per-clear baseline does not apply.
+    // See #1354.
+    next.usageBaseline = null;
+    next.availableCommands = [];
+    next.availableModes = [];
+    next.currentModeId = null;
+    next.plan = null;
+    next.mode = "Default";
+    next.startupError = null;
+    next.lastAgentSwitch = { from, to, reason, at: now };
+    // The switch path emits Stopped { user_stopped } from the
+    // shutdown of the prior backend just before AgentSwitched, which
+    // flips workerStopped/agentUnresponsive on. Without an explicit
+    // clear here the user sees a "worker stopped / reconnecting"
+    // banner on top of a freshly switched session during the new
+    // agent's session/new handshake (until AcpSessionAssigned clears
+    // it). Clear them eagerly so the banner stays hidden.
+    next.workerStopped = false;
+    next.workerRestarting = false;
+    next.agentUnresponsive = false;
+    // Per-adapter selectors belong to the previous backend; the new
+    // backend will publish its own snapshot. See #1403.
+    next.configOptions = [];
+    next.configOptionSwitchFailed = null;
+    next.pendingConfigOption = null;
+    next.activity = [
+      ...next.activity,
+      {
+        id: `agent-switched-${frame.seq}`,
+        kind: "session_cleared",
+        text: `Switched cockpit agent from ${from} to ${to} (${reason}).`,
+        at: now,
+      },
+    ];
+    return next;
+  }
+  if ("PromptRejected" in event) {
+    // Daemon refused the follow-up prompt because another `session/prompt`
+    // was still in flight. The rejected text has already been persisted
+    // upstream as `UserPromptSent` by the REST handler; this event tells
+    // the UI the daemon never forwarded it to the agent. Show a Retry
+    // pill so the user can re-dispatch via the normal sendPrompt path
+    // instead of having their message vanish silently. See #1196.
+    const entry: RejectedPrompt = {
+      id: `rejected-${frame.seq}`,
+      text: event.PromptRejected.text,
+      reason: event.PromptRejected.reason,
+      rejectedAt: new Date().toISOString(),
+    };
+    const REJECTED_PROMPTS_CAP = 5;
+    next.rejectedPrompts = [...next.rejectedPrompts, entry].slice(
+      -REJECTED_PROMPTS_CAP,
+    );
+    // Retire the spinner for this rejected submission so the composer
+    // unlocks. `pendingUserPromptSeq` was bumped by the optimistic
+    // dispatch; advancing `lastStoppedSeq` by one (capped) gives this
+    // rejection the same turn-retirement semantics as a Stopped without
+    // letting it spill into a different turn's bookkeeping. See #1170
+    // for the cap rationale.
+    next.lastStoppedSeq = Math.min(
+      next.lastStoppedSeq + 1,
+      next.pendingUserPromptSeq,
+    );
+    next.turnActive = isTurnActive(next);
+    return next;
+  }
   // RawAgentUpdate, TodoListUpdated, anything else: pass through with
   // no state mutation. The activity feed shows the raw text where
   // useful via the catch-all branch in the UI.
@@ -776,4 +1308,99 @@ function pushActivity(rows: ActivityRow[], row: ActivityRow): ActivityRow[] {
     return next.slice(next.length - activityLimit);
   }
   return next;
+}
+
+/** Derived `turnActive` from the prompt / stop seq counters. Exported
+ *  so any new consumer can compute it from the counters directly; the
+ *  reducer also calls this to keep `state.turnActive` in lockstep so
+ *  existing `state.turnActive` reads stay correct. See #1170.
+ *
+ *  Invariant: `lastStoppedSeq <= pendingUserPromptSeq` always holds.
+ *  Both counters start at 0; `pendingUserPromptSeq` increments by one
+ *  on every dispatched user prompt, and `lastStoppedSeq` advances by
+ *  one per `Stopped` / `AgentStartupError` but is capped at
+ *  `pendingUserPromptSeq` so spurious extra Stopped frames cannot
+ *  poison a future turn. */
+export function isTurnActive(
+  state: Pick<CockpitState, "pendingUserPromptSeq" | "lastStoppedSeq">,
+): boolean {
+  return state.pendingUserPromptSeq > state.lastStoppedSeq;
+}
+
+/** Normalise a partial CockpitState so the turn counters are populated.
+ *  Used by the localStorage loader after the #1170 schema change: pre-
+ *  schema persisted entries have no counters, so we backfill from the
+ *  cached `turnActive` boolean (true → one outstanding prompt, false →
+ *  fully retired) and re-derive `turnActive` from the counters. */
+export function normaliseTurnCounters(
+  state: CockpitState & {
+    pendingUserPromptSeq?: number;
+    lastStoppedSeq?: number;
+    rejectedPrompts?: RejectedPrompt[];
+    agentUnresponsive?: boolean;
+    agentOrphaned?: boolean;
+    usageBaseline?: { cost: number } | null;
+    configOptions?: ConfigOptionDescriptor[];
+    configOptionSwitchFailed?: ConfigOptionSwitchFailure | null;
+    pendingConfigOption?: { configId: string; value: string } | null;
+  },
+): CockpitState {
+  const pendingUserPromptSeq =
+    typeof state.pendingUserPromptSeq === "number"
+      ? state.pendingUserPromptSeq
+      : state.turnActive
+        ? 1
+        : 0;
+  const lastStoppedSeq =
+    typeof state.lastStoppedSeq === "number"
+      ? state.lastStoppedSeq
+      : state.turnActive
+        ? 0
+        : pendingUserPromptSeq;
+  // Pre-#1196 persisted entries lack rejectedPrompts / agentUnresponsive;
+  // backfill so the reducer and renderers see well-typed values instead
+  // of `undefined` (which crashes RejectedPromptsStrip's `.length` read).
+  const rejectedPrompts = Array.isArray(state.rejectedPrompts)
+    ? state.rejectedPrompts
+    : [];
+  const agentUnresponsive =
+    typeof state.agentUnresponsive === "boolean"
+      ? state.agentUnresponsive
+      : false;
+  // Pre-#1240 persisted entries lack agentOrphaned; backfill to false
+  // so the reducer and renderers see a well-typed value instead of
+  // `undefined`.
+  const agentOrphaned =
+    typeof state.agentOrphaned === "boolean" ? state.agentOrphaned : false;
+  // Pre-#1354 persisted entries lack usageBaseline; backfill to null
+  // so the UsageUpdated reducer's `next.usageBaseline && ...` check
+  // sees a well-typed value. The baseline stays null until the next
+  // SessionCleared / ConversationCompacted, which matches the
+  // pre-fix behaviour for that one session; subsequent /clear events
+  // start subtracting normally.
+  const usageBaseline =
+    state.usageBaseline === undefined ? null : state.usageBaseline;
+  // Pre-#1403 persisted entries lack the config-option trio.
+  const configOptions = Array.isArray(state.configOptions)
+    ? state.configOptions
+    : [];
+  const configOptionSwitchFailed =
+    state.configOptionSwitchFailed === undefined
+      ? null
+      : state.configOptionSwitchFailed;
+  const pendingConfigOption =
+    state.pendingConfigOption === undefined ? null : state.pendingConfigOption;
+  return {
+    ...state,
+    rejectedPrompts,
+    agentUnresponsive,
+    agentOrphaned,
+    usageBaseline,
+    configOptions,
+    configOptionSwitchFailed,
+    pendingConfigOption,
+    pendingUserPromptSeq,
+    lastStoppedSeq,
+    turnActive: isTurnActive({ pendingUserPromptSeq, lastStoppedSeq }),
+  };
 }

@@ -1,4 +1,5 @@
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect } from "./helpers/mockedTest";
+import type { Page } from "@playwright/test";
 import { clickSidebarSession } from "./helpers/sidebar";
 import {
   mockTerminalApis,
@@ -34,7 +35,7 @@ test.describe("Terminal mouse-wheel scroll (desktop)", () => {
   async function openSession(page: Page, handle: MockHandle) {
     await clickSidebarSession(page, "pinch-test");
     await page
-      .locator(".wterm")
+      .locator(".xterm")
       .first()
       .waitFor({ state: "visible", timeout: 10_000 });
     // Wait for the WebSocket to deliver at least one message (the app sends
@@ -51,8 +52,8 @@ test.describe("Terminal mouse-wheel scroll (desktop)", () => {
   ) {
     await page.evaluate(
       ({ deltaY, ctrlKey, times }) => {
-        const target = document.querySelector<HTMLElement>(".wterm");
-        if (!target) throw new Error(".wterm not mounted");
+        const target = document.querySelector<HTMLElement>(".xterm");
+        if (!target) throw new Error(".xterm not mounted");
         for (let i = 0; i < (times ?? 1); i++) {
           target.dispatchEvent(
             new WheelEvent("wheel", {
@@ -85,9 +86,11 @@ test.describe("Terminal mouse-wheel scroll (desktop)", () => {
     await fireWheel(page, { deltaY: 120, times: 3 });
 
     // WebSocket message delivery from page to Playwright handler is async;
-    // poll briefly so the assertion doesn't race the message capture.
+    // poll so the assertion doesn't race the message capture. 5s gives
+    // enough headroom for CI runners under load (2s was tight enough
+    // to flake on heavy parallel runs).
     await expect
-      .poll(() => countSeq(handle, WHEEL_DOWN_SEQ), { timeout: 2_000 })
+      .poll(() => countSeq(handle, WHEEL_DOWN_SEQ), { timeout: 5_000 })
       .toBeGreaterThan(0);
     expect(countSeq(handle, WHEEL_UP_SEQ)).toBe(0);
   });
@@ -105,7 +108,7 @@ test.describe("Terminal mouse-wheel scroll (desktop)", () => {
     await fireWheel(page, { deltaY: -120, times: 3 });
 
     await expect
-      .poll(() => countSeq(handle, WHEEL_UP_SEQ), { timeout: 2_000 })
+      .poll(() => countSeq(handle, WHEEL_UP_SEQ), { timeout: 5_000 })
       .toBeGreaterThan(0);
     expect(countSeq(handle, WHEEL_DOWN_SEQ)).toBe(0);
   });

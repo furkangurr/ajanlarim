@@ -13,12 +13,22 @@
 // CockpitRuntime.tsx. We never let assistant-ui own the chat state; it
 // only renders what we feed it and surfaces user actions back.
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   MessagePrimitive,
   ThreadPrimitive,
+  useMessage,
 } from "@assistant-ui/react";
-import { Check, ChevronDown, Clock, ListChecks, X } from "lucide-react";
+import {
+  AlertTriangle,
+  Check,
+  ChevronDown,
+  Clock,
+  Info,
+  ListChecks,
+  RotateCcw,
+  X,
+} from "lucide-react";
 
 import { ApprovalCard } from "./ApprovalCard";
 import {
@@ -28,9 +38,19 @@ import {
   type CockpitContext,
 } from "./CockpitRuntime";
 import { Composer } from "./Composer";
+import { ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
 import { ContextPrimerBanner } from "./ContextPrimerBanner";
+import { RateLimitRecoveryModal } from "./RateLimitRecoveryModal";
 import { Markdown } from "./Markdown";
+import {
+  isQueuedPromptLong,
+  queuedStripLayout,
+} from "./queuedPromptsLayout";
+import { StartupErrorScreen } from "./StartupErrorScreen";
+import { pickWorkerStoppedVariant } from "./workerStoppedBanner";
 import { SubagentCard, ToolCard, ToolGroupCard } from "./ToolCards";
+import { DiffCommentsUserCard } from "../diff/comments/DiffCommentsUserCard";
+import { parseDiffCommentsSentinel } from "../diff/comments/buildPrompt";
 import {
   SPINNER_FRAMES,
   SPINNER_INTERVAL_MS,
@@ -38,12 +58,20 @@ import {
   chooseVerb,
 } from "../../lib/cockpitRattle";
 import { useCockpitPrefs } from "../../lib/cockpitPrefs";
+import {
+  AgentProfileProvider,
+  useAgentProfile,
+} from "../../lib/agentProfileContext";
+import { isClearAlias } from "../../lib/agentProfiles";
+import { useApprovalSound } from "../../hooks/useApprovalSound";
+import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import type {
   Approval,
   ApprovalDecision,
   CockpitState,
   Plan,
   QueuedPrompt,
+  RejectedPrompt,
   ToolCall,
 } from "../../lib/cockpitTypes";
 
@@ -53,6 +81,22 @@ interface Props {
    *  (REST-poll-driven, ~3s cadence). Drives the `WorkerResumingBanner`
    *  while the reconciler is mid-spawn/attach. See #1088. */
   cockpitWorkerState: "absent" | "resuming" | "running";
+  /** Session's `tool` registry key (claude / codex / opencode / gemini
+   *  / etc.). Resolves the active AgentProfile that drives card
+   *  dispatch and claude-specific capability gates. */
+  tool: string | null | undefined;
+  /** RFC3339 archived-at timestamp, or null. Drives the
+   *  archived-specific "worker stopped" banner that replaces the
+   *  generic `aoe cockpit stop`-style message when the user has
+   *  explicitly parked the session via the sidebar archive action.
+   *  See #1581. */
+  archivedAt: string | null;
+  /** RFC3339 snoozed-until timestamp, or null. Drives the
+   *  snoozed-specific "worker stopped" banner with a wake-time
+   *  readout. Server gates this on `is_snoozed()` so expired
+   *  timestamps come back as null and we fall through to the live
+   *  variant. See #1581. */
+  snoozedUntil: string | null;
 }
 
 const STARTER_PROMPTS = [
@@ -61,28 +105,40 @@ const STARTER_PROMPTS = [
   "What does the build pipeline do?",
 ];
 
-export function CockpitView({ sessionId, cockpitWorkerState }: Props) {
+export function CockpitView({
+  sessionId,
+  cockpitWorkerState,
+  tool,
+  archivedAt,
+  snoozedUntil,
+}: Props) {
   // Folds rows above the most recent `/clear` divider out of the
   // thread by default; the disclosure banner toggles this. Lives on
   // the view (not the reducer) because it's a UI preference, not
   // event-log state. See #1101.
   const [showClearedTurns, setShowClearedTurns] = useState(false);
   return (
-    <CockpitRuntime
-      sessionId={sessionId}
-      cockpitWorkerState={cockpitWorkerState}
-      showClearedTurns={showClearedTurns}
-    >
-      {(ctx) => (
-        <CockpitChrome
-          sessionId={sessionId}
-          cockpitWorkerState={cockpitWorkerState}
-          showClearedTurns={showClearedTurns}
-          onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
-          {...ctx}
-        />
-      )}
-    </CockpitRuntime>
+    <AgentProfileProvider toolKey={tool}>
+      <CockpitRuntime
+        sessionId={sessionId}
+        cockpitWorkerState={cockpitWorkerState}
+        archivedAt={archivedAt}
+        snoozedUntil={snoozedUntil}
+        showClearedTurns={showClearedTurns}
+      >
+        {(ctx) => (
+          <CockpitChrome
+            sessionId={sessionId}
+            cockpitWorkerState={cockpitWorkerState}
+            showClearedTurns={showClearedTurns}
+            onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
+            archivedAt={archivedAt}
+            snoozedUntil={snoozedUntil}
+            {...ctx}
+          />
+        )}
+      </CockpitRuntime>
+    </AgentProfileProvider>
   );
 }
 
@@ -91,9 +147,16 @@ function CockpitChrome({
   cockpitWorkerState,
   showClearedTurns,
   onToggleClearedTurns,
+  archivedAt,
+  snoozedUntil,
   state,
   status,
   hasEverOpened,
+  reconnecting,
+  retryCount,
+  retryCountdown,
+  maxRetries,
+  manualReconnect,
   resolveApproval,
   sendPrompt,
   forceEndTurn,
@@ -103,11 +166,17 @@ function CockpitChrome({
   removeQueuedPrompt,
   editQueuedPrompt,
   clearQueue,
+  dismissRejectedPrompt,
+  dismissModeSwitchFailed,
+  setConfigOption,
+  dismissConfigOptionSwitchFailed,
 }: CockpitContext & {
   sessionId: string;
   cockpitWorkerState: "absent" | "resuming" | "running";
   showClearedTurns: boolean;
   onToggleClearedTurns: () => void;
+  archivedAt: string | null;
+  snoozedUntil: string | null;
 }) {
   // Count how many activity rows precede the latest `session_cleared`
   // divider so the banner can say "12 earlier turns hidden". The
@@ -131,6 +200,23 @@ function CockpitChrome({
   const [primerPrefill, setPrimerPrefill] = useState<
     { id: string; text: string } | null
   >(null);
+  // Rate-limit recovery modal toggle. Opened from the rate-limit row
+  // in `SystemNotices`; the modal owns the agent picker and the
+  // switch / primer-fetch round-trip. Wrapped in a tiny exported
+  // component so the wiring (banner trigger -> modal open -> prefill
+  // dispatch) is testable in isolation without mounting the full
+  // CockpitView (which depends on many hooks). See #1282.
+  const recoveryHandoffPrefill = (text: string) =>
+    setPrimerPrefill({
+      id: `rate-limit-recovery-${Date.now()}`,
+      text,
+    });
+
+  // Browser-side approval chime. Fires once on the 0 -> >=1 edge of
+  // pendingApprovals; complements the OS push (delivered via the SW
+  // when the dashboard is backgrounded) and the in-app toast (when
+  // foregrounded). See #1038.
+  useApprovalSound(state.pendingApprovals.length);
 
   // Re-pin the chat viewport to the bottom when the composer (or any
   // sibling below it: queued strip, primer banner) grows. assistant-ui's
@@ -178,27 +264,77 @@ function CockpitChrome({
       vp.removeEventListener("scroll", sampleAtBottom);
     };
   }, []);
+  // Short-circuit: when the per-adapter compatibility check rejected
+  // the adapter, replace the chat layout with a dedicated screen that
+  // renders the exact remediation command. We never reach Running, so
+  // dropping the chat/composer prevents the user from typing into a
+  // session that has no live agent. Cleared on AcpSessionAssigned once
+  // the user reinstalls and a fresh worker spawns. See agent_compat.rs.
+  if (state.incompatibleAgent) {
+    return (
+      <div className="flex h-full flex-col bg-surface-900 text-text-primary">
+        <StartupErrorScreen detail={state.incompatibleAgent} />
+      </div>
+    );
+  }
   return (
     <div className="flex h-full flex-col bg-surface-900 text-text-primary">
       <PlanStrip plan={state.plan} />
 
-      {(status !== "open" || state.lagged || state.rateLimit) && (
-        <SystemNotices
-          status={status}
-          lagged={state.lagged}
-          rateLimit={state.rateLimit}
-          hasEverOpened={hasEverOpened}
-        />
-      )}
+      <RateLimitRecoverySection
+        sessionId={sessionId}
+        currentAgent={state.agent}
+        onPrefill={recoveryHandoffPrefill}
+      >
+        {({ onSwitchAgent }) =>
+          (status !== "open" || state.lagged || state.rateLimit || reconnecting) ? (
+            <SystemNotices
+              status={status}
+              lagged={state.lagged}
+              rateLimit={state.rateLimit}
+              hasEverOpened={hasEverOpened}
+              reconnecting={reconnecting}
+              retryCount={retryCount}
+              retryCountdown={retryCountdown}
+              maxRetries={maxRetries}
+              manualReconnect={manualReconnect}
+              onSwitchAgent={onSwitchAgent}
+            />
+          ) : null
+        }
+      </RateLimitRecoverySection>
 
       {state.startupError && (
         <StartupErrorBanner sessionId={sessionId} message={state.startupError} />
       )}
-      {state.workerStopped && !state.startupError && (
-        <WorkerStoppedBanner sessionId={sessionId} />
-      )}
+      {(() => {
+        const variant = pickWorkerStoppedVariant({
+          workerStopped: state.workerStopped,
+          startupError: state.startupError,
+          archivedAt,
+          snoozedUntil,
+        });
+        if (variant === "archived") {
+          return <ArchivedWorkerStoppedBanner sessionId={sessionId} />;
+        }
+        if (variant === "snoozed" && snoozedUntil) {
+          return (
+            <SnoozedWorkerStoppedBanner
+              sessionId={sessionId}
+              snoozedUntil={snoozedUntil}
+            />
+          );
+        }
+        if (variant === "generic") {
+          return <WorkerStoppedBanner sessionId={sessionId} />;
+        }
+        return null;
+      })()}
       {state.workerRestarting && !state.startupError && !state.workerStopped && (
-        <WorkerRestartingBanner />
+        <WorkerRestartingBanner
+          agentUnresponsive={state.agentUnresponsive}
+          agentOrphaned={state.agentOrphaned}
+        />
       )}
       {cockpitWorkerState === "resuming" &&
         !state.startupError &&
@@ -275,6 +411,29 @@ function CockpitChrome({
             onRemove={removeQueuedPrompt}
             onEdit={editQueuedPrompt}
             onClear={clearQueue}
+            pendingResume={status !== "open" || cockpitWorkerState !== "running" || state.workerStopped || state.workerRestarting}
+          />
+
+          <RejectedPromptsStrip
+            rejected={state.rejectedPrompts}
+            onRetry={sendPrompt}
+            onDismiss={dismissRejectedPrompt}
+            disabled={
+              state.workerRestarting ||
+              state.workerStopped ||
+              Boolean(state.startupError)
+            }
+          />
+
+          <ModeSwitchFailedNotice
+            failure={state.modeSwitchFailed}
+            onDismiss={dismissModeSwitchFailed}
+          />
+
+          <ConfigOptionSwitchFailedNotice
+            failure={state.configOptionSwitchFailed}
+            configOptions={state.configOptions}
+            onDismiss={dismissConfigOptionSwitchFailed}
           />
 
           <ContextPrimerBanner
@@ -294,6 +453,9 @@ function CockpitChrome({
             availableModes={state.availableModes}
             currentModeId={state.currentModeId}
             legacyMode={state.mode}
+            configOptions={state.configOptions}
+            pendingConfigOption={state.pendingConfigOption}
+            setConfigOption={setConfigOption}
             sessionUsage={state.sessionUsage}
             availableCommands={state.availableCommands}
             connected={status === "open" && !state.workerStopped && !state.workerRestarting}
@@ -313,19 +475,32 @@ function CockpitChrome({
 function UserMessage() {
   return (
     <MessagePrimitive.Root className="group mt-4 flex flex-col items-end gap-1">
-      <div className="max-w-[80%] min-w-0 rounded-2xl rounded-br-sm border border-surface-700 bg-surface-800/70 px-3 py-1.5 text-sm">
-        <MessagePrimitive.Parts
-          components={{
-            // User prompts get the same markdown pipeline as agent
-            // messages so fenced code blocks render with syntax
-            // highlighting instead of literal backticks. Smooth-reveal
-            // is off because user prompts arrive complete; the pacing
-            // only matters for streamed agent tokens. See #1108.
-            Text: ({ text }) => <Markdown text={text} smooth={false} />,
-          }}
-        />
-      </div>
+      <MessagePrimitive.Parts
+        components={{
+          Text: UserText,
+        }}
+      />
     </MessagePrimitive.Root>
+  );
+}
+
+/** Text-part renderer for user messages. Detects the diff-comments
+ *  sentinel header (prepended by `buildFullPrompt`) and swaps in the
+ *  structured `DiffCommentsUserCard`; falls back to the classic chat
+ *  bubble otherwise. */
+function UserText({ text }: { text: string }) {
+  const payload = parseDiffCommentsSentinel(text);
+  if (payload) {
+    return <DiffCommentsUserCard payload={payload} />;
+  }
+  // User prompts get the same markdown pipeline as agent messages so
+  // fenced code blocks render with syntax highlighting instead of
+  // literal backticks. Smooth-reveal is off because user prompts arrive
+  // complete; the pacing only matters for streamed agent tokens. See #1108.
+  return (
+    <div className="max-w-[80%] min-w-0 rounded-2xl rounded-br-sm border border-surface-700 bg-surface-800/70 px-3 py-1.5 text-sm">
+      <Markdown text={text} smooth={false} />
+    </div>
   );
 }
 
@@ -347,11 +522,16 @@ function AssistantMessage() {
 }
 
 function AssistantText({ text }: { text: string }) {
+  // Smooth-reveal only the live streaming tail: an assistant message
+  // whose runtime status is `running` is the one the agent is
+  // actively chunking text into. Historical messages (loaded from
+  // the localStorage cache on reload, or replayed from the server on
+  // session switch) render with the Markdown default `smooth={false}`
+  // so the user doesn't watch the entire transcript type itself out
+  // again. See #1132.
+  const isRunning = useMessage((m) => m.status?.type === "running");
   if (!text) return null;
-  // MarkdownTextPrimitive (in Markdown.tsx) handles smooth
-  // streaming via its built-in `smooth` prop, so we don't need the
-  // hand-rolled char-budget reveal anymore.
-  return <Markdown text={text} />;
+  return <Markdown text={text} smooth={isRunning} />;
 }
 
 // assistant-ui's tool-call props are typed as JSON-only; in our app the
@@ -717,7 +897,7 @@ function formatElapsed(seconds: number): string {
 
 /* ── Working spinner (rattle) ────────────────────────────────────── */
 
-function WorkingSpinner({
+export function WorkingSpinner({
   thinking,
   tool,
   lastActivityRef,
@@ -781,10 +961,13 @@ function WorkingSpinner({
   // want a more sensitive signal lower one knob and get both. See
   // #1112.
   const showStalled = stalledSecs >= forceEndTurnThresholdSecs;
+  const toolInFlight = tool != null;
   const label = showStalled
-    ? `Waiting on model… ${formatElapsed(stalledSecs)}`
+    ? toolInFlight
+      ? `Waiting on tool… ${formatElapsed(stalledSecs)}`
+      : `Waiting on model… ${formatElapsed(stalledSecs)}`
     : chooseVerb(state, seed, tool);
-  const showForceEnd = showStalled;
+  const showForceEnd = showStalled && !toolInFlight;
 
   return (
     <div className="flex flex-col gap-2 text-sm italic text-text-muted">
@@ -932,33 +1115,92 @@ function PendingApproval({
 
 /* ── System notices ──────────────────────────────────────────────── */
 
-function SystemNotices({
+/** Wires the rate-limit handoff banner to the recovery modal. Owns the
+ *  open/close toggle so CockpitView (which is wide and pulls in many
+ *  hooks) does not have to. Exported so the wiring can be unit-tested
+ *  without mounting all of CockpitView. See #1282. */
+export function RateLimitRecoverySection({
+  sessionId,
+  currentAgent,
+  onPrefill,
+  children,
+}: {
+  sessionId: string;
+  currentAgent: string | null;
+  onPrefill: (text: string) => void;
+  children: (renderProps: { onSwitchAgent: () => void }) => React.ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      {children({ onSwitchAgent: () => setOpen(true) })}
+      <RateLimitRecoveryModal
+        open={open}
+        sessionId={sessionId}
+        currentAgent={currentAgent}
+        onClose={() => setOpen(false)}
+        onPrefill={onPrefill}
+      />
+    </>
+  );
+}
+
+export function SystemNotices({
   status,
   lagged,
   rateLimit,
   hasEverOpened,
+  reconnecting,
+  retryCount,
+  retryCountdown,
+  maxRetries,
+  manualReconnect,
+  onSwitchAgent,
 }: {
   status: CockpitContext["status"];
   lagged: boolean;
   rateLimit: CockpitState["rateLimit"];
   hasEverOpened: boolean;
+  reconnecting: boolean;
+  retryCount: number;
+  retryCountdown: number;
+  maxRetries: number;
+  manualReconnect: () => void;
+  onSwitchAgent?: () => void;
 }) {
   const messages: { kind: string; text: string }[] = [];
-  if (status === "connecting") {
+  // Retry envelope exhausted: the auto-reconnect chain stopped after
+  // `maxRetries` and we're sitting on a dead WS. Surface the manual
+  // affordance instead of a status line so the user has a clear path
+  // back to live. See #1130.
+  const retriesExhausted =
+    status !== "open" &&
+    hasEverOpened &&
+    !reconnecting &&
+    retryCount >= maxRetries;
+  if (reconnecting && status !== "open") {
+    // Auto-retry banner: "Reconnecting (3/7) in 4s". Replaces the bare
+    // "Reconnecting…" copy with concrete progress so the user knows
+    // the tab isn't frozen and roughly how long until the next dial.
+    const countdownPart =
+      retryCountdown > 0 ? ` in ${retryCountdown}s` : "";
+    messages.push({
+      kind: "warn",
+      text: `Cockpit disconnected. Reconnecting (${retryCount}/${maxRetries})${countdownPart}…`,
+    });
+  } else if (status === "connecting") {
     messages.push({
       kind: "info",
       text: hasEverOpened ? "Reconnecting to cockpit…" : "Starting cockpit…",
     });
-  }
-  if (status === "error") {
+  } else if (status === "error") {
     messages.push({
       kind: "warn",
       text: hasEverOpened
         ? "Cockpit reconnecting… showing cached transcript; new messages disabled."
         : "Starting cockpit worker… this can take a few seconds for new sessions.",
     });
-  }
-  if (status === "closed") {
+  } else if (status === "closed" && !retriesExhausted) {
     messages.push({
       kind: "warn",
       text: hasEverOpened
@@ -976,7 +1218,7 @@ function SystemNotices({
       text: `Rate-limited (${rateLimit.kind}); resets at ${reset}.`,
     });
   }
-  if (messages.length === 0) return null;
+  if (messages.length === 0 && !retriesExhausted) return null;
   return (
     <div className="border-b border-surface-800 px-4 py-2 space-y-1">
       {messages.map((m, i) => (
@@ -987,6 +1229,29 @@ function SystemNotices({
           {m.text}
         </div>
       ))}
+      {rateLimit && onSwitchAgent && (
+        <div className="flex items-center justify-end pt-1">
+          <button
+            type="button"
+            onClick={onSwitchAgent}
+            className="shrink-0 rounded-md border border-brand-700 bg-brand-900/40 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-brand-100 hover:bg-brand-900/60"
+          >
+            Continue in another agent
+          </button>
+        </div>
+      )}
+      {retriesExhausted && (
+        <div className="flex items-center justify-between gap-3 text-xs text-brand-400">
+          <span>Connection lost. Auto-retry stopped.</span>
+          <button
+            type="button"
+            onClick={manualReconnect}
+            className="shrink-0 rounded-md border border-brand-700 bg-brand-900/40 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-brand-100 hover:bg-brand-900/60"
+          >
+            Reconnect
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -1015,24 +1280,37 @@ function InteractionErrorBanner({
   );
 }
 
-function WorkerRestartingBanner() {
-  // `aoe cockpit restart` deletes the registry + writes a sentinel; the
-  // daemon's reaper publishes Stopped{reason:"restart_pending"} and the
-  // reconciler clears its `attempted` set so the next 2s tick spawns a
-  // fresh worker (with the cached acp_session_id for transcript
-  // continuity). AcpSessionAssigned then clears `workerRestarting` and
-  // this banner unmounts. No reconnect button because the daemon is
-  // already handling it.
+export function WorkerRestartingBanner({
+  agentUnresponsive,
+  agentOrphaned,
+}: {
+  agentUnresponsive: boolean;
+  agentOrphaned: boolean;
+}) {
+  // Three reasons land here:
+  //   - `aoe cockpit restart` (deletes registry, daemon's reaper
+  //     publishes Stopped{reason:"restart_pending"}, reconciler spawns
+  //     a fresh worker with the cached acp_session_id).
+  //   - Cancel-escalation watchdog fired: claude-agent-acp ignored
+  //     `session/cancel` for the grace window, the supervisor SIGTERMed
+  //     the wedged runner and is respawning via `session/load`.
+  //   - Silent-orphan watchdog fired: the adapter finished streaming
+  //     the turn but never sent the JSON-RPC `PromptResponse`; the
+  //     supervisor restarts the runner the same way. See #1240.
+  // All paths end with `AcpSessionAssigned` clearing the banner.
+  // See #1196 for the agent_unresponsive variant.
+  const message = agentOrphaned
+    ? "Agent finished but didn't notify the daemon. Restarting worker; your transcript will be preserved."
+    : agentUnresponsive
+      ? "Agent stopped responding to cancel. Restarting worker; your transcript will be preserved."
+      : "Restarting cockpit worker… the daemon will respawn the agent with your existing transcript shortly.";
   return (
     <div className="flex items-center gap-2 border-b border-sky-900/60 bg-sky-950/40 px-4 py-2 text-xs text-sky-200">
       <span
         className="inline-block h-2 w-2 animate-pulse rounded-full bg-sky-400"
         aria-hidden
       />
-      <span>
-        Restarting cockpit worker… the daemon will respawn the agent with
-        your existing transcript shortly.
-      </span>
+      <span>{message}</span>
     </div>
   );
 }
@@ -1202,6 +1480,64 @@ function WorkerStoppedBanner({ sessionId }: { sessionId: string }) {
   );
 }
 
+/** Replacement for `WorkerStoppedBanner` when the worker was torn
+ *  down because the user archived the session from the sidebar. The
+ *  reconnect button would be misleading here: the reconciler and the
+ *  startup recovery path both skip archived sessions, so a fresh
+ *  spawn would not survive the next reconciliation tick. The user
+ *  unblocks by unarchiving from the sidebar context menu. See #1581. */
+export function ArchivedWorkerStoppedBanner({
+  sessionId,
+}: {
+  sessionId: string;
+}) {
+  return (
+    <div
+      className="border-b border-amber-900/60 bg-amber-950/40 px-4 py-3 text-amber-200"
+      data-testid={`cockpit-archived-banner-${sessionId}`}
+    >
+      <div className="text-sm font-medium">Session archived</div>
+      <div className="mt-1 text-xs text-amber-100/90">
+        This session is parked. The cockpit worker was shut down and the
+        reconciler will not respawn it. Unarchive from the sidebar
+        (right-click the row, then Unarchive) to bring it back.
+      </div>
+    </div>
+  );
+}
+
+/** Replacement for `WorkerStoppedBanner` when the worker was torn
+ *  down because the user snoozed the session. Surfaces the wake time
+ *  so the user knows when the worker will come back on its own;
+ *  Unsnooze from the sidebar context menu wakes it sooner. See
+ *  #1581. */
+export function SnoozedWorkerStoppedBanner({
+  sessionId,
+  snoozedUntil,
+}: {
+  sessionId: string;
+  snoozedUntil: string;
+}) {
+  const target = new Date(snoozedUntil);
+  const wallClock = Number.isFinite(target.getTime())
+    ? target.toLocaleString()
+    : snoozedUntil;
+  return (
+    <div
+      className="border-b border-amber-900/60 bg-amber-950/40 px-4 py-3 text-amber-200"
+      data-testid={`cockpit-snoozed-banner-${sessionId}`}
+    >
+      <div className="text-sm font-medium">Session snoozed</div>
+      <div className="mt-1 text-xs text-amber-100/90">
+        The cockpit worker was shut down until{" "}
+        <span className="font-mono">{wallClock}</span>. The reconciler will
+        respawn it automatically once the snooze expires, or you can
+        Unsnooze from the sidebar (right-click the row) to wake it sooner.
+      </div>
+    </div>
+  );
+}
+
 function StartupErrorBanner({
   sessionId,
   message,
@@ -1337,10 +1673,58 @@ function StartupErrorBanner({
             Run <code className="rounded bg-rose-900/60 px-1">aoe cockpit doctor --fix</code>{" "}
             from a terminal, or install the adapter manually:
             <pre className="mt-1 whitespace-pre-wrap rounded bg-rose-900/40 p-2 text-xs">
-              npm install -g @agentclientprotocol/claude-agent-acp
+              npm install -g @agentclientprotocol/claude-agent-acp@latest
             </pre>
           </>
         )}
+      </div>
+    </div>
+  );
+}
+
+/* ── Mode-switch-failed notice ────────────────────────────────────── */
+
+interface ModeSwitchFailedNoticeProps {
+  failure: { modeId: string; reason: string; at: string } | null;
+  onDismiss: () => void;
+}
+
+/** Non-blocking notice rendered when the ACP adapter rejected a
+ *  `session/set_mode` request. The most common path: a user enabled
+ *  yolo_mode_default but the claude-agent-acp build does not expose
+ *  `bypassPermissions` (gated on the `ALLOW_BYPASS` env var), so the
+ *  session keeps running in `default` and silently prompts on every
+ *  Write/Edit/Bash. The notice gives them an explicit signal plus a
+ *  pointer to the mode picker. See #1233. */
+function ModeSwitchFailedNotice({
+  failure,
+  onDismiss,
+}: ModeSwitchFailedNoticeProps) {
+  if (!failure) return null;
+  const friendly =
+    failure.modeId === "bypassPermissions"
+      ? "YOLO mode (bypassPermissions) is not available on this adapter; the session is running in default permission mode. claude-agent-acp gates bypass on the ALLOW_BYPASS env var. Pick a different mode from the composer or restart the daemon with ALLOW_BYPASS=1."
+      : `Could not switch to mode "${failure.modeId}"; the session is staying on its previous mode. Pick a different mode from the composer.`;
+  return (
+    <div className="border-t border-amber-900/40 bg-amber-950/20 px-4 py-2">
+      <div className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl">
+        <div className="flex items-start gap-2 rounded-lg border border-amber-700/30 bg-amber-950/15 px-2.5 py-1.5">
+          <Info className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
+          <div className="min-w-0 flex-1">
+            <p className="text-xs leading-5 text-amber-100">{friendly}</p>
+            <p className="mt-0.5 font-mono text-[10px] text-amber-400/70">
+              {failure.reason}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onDismiss}
+            className="inline-flex shrink-0 items-center justify-center rounded-md border border-amber-700/40 bg-amber-900/20 p-1 text-amber-200 hover:bg-amber-900/60"
+            aria-label="Dismiss mode-switch notice"
+          >
+            <X className="h-3 w-3" />
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -1353,47 +1737,182 @@ interface QueuedPromptsStripProps {
   onRemove: (id: string) => void;
   onEdit: (id: string, text: string) => void;
   onClear: () => void;
+  /** True when the session is not in a state where the drain effect
+   *  can fire (WS closed, worker stopped, worker restarting, or the
+   *  worker is still cold-starting). Drives the heading copy so the
+   *  user can tell whether queued prompts fire on the next turn-end
+   *  or wait for the session to resume. See #1359. */
+  pendingResume: boolean;
 }
 
 /** Strip rendered above the composer listing prompts the user has
  *  queued mid-turn. Each row is editable in place (click to edit, save
  *  on Enter or blur, cancel on Escape) and removable via the X button.
  *  Hidden when the queue is empty. See #1031. */
-function QueuedPromptsStrip({
+function RejectedPromptsStrip({
+  rejected,
+  onRetry,
+  onDismiss,
+  disabled,
+}: {
+  rejected: RejectedPrompt[];
+  onRetry: (text: string) => void;
+  /** Drop a single pill without resending. Local-only; the daemon has
+   *  no record of pending rejections so this never goes over the wire. */
+  onDismiss: (id: string) => void;
+  /** True while the worker is restarting/stopped/in startup error.
+   *  Retry must be gated then: `sendPrompt` would clear
+   *  `workerRestarting` / `agentUnresponsive` and the rejected pills
+   *  before the respawn has produced a new `AcpSessionAssigned`,
+   *  leaving the UI claiming the agent is ready while the daemon
+   *  hasn't reconnected yet. Dismiss stays available so the user can
+   *  clear stale pills during the respawn. See #1196. */
+  disabled: boolean;
+}) {
+  // Pills for prompts the daemon refused while another `session/prompt`
+  // was already in flight. The user sees the rejection and can re-fire
+  // via the Retry button instead of having their message vanish. The
+  // reducer caps the list at 5 entries (oldest dropped) and clears on
+  // the next UserPromptSent. See #1196.
+  if (rejected.length === 0) return null;
+  return (
+    <div className="border-t border-amber-900/40 bg-amber-950/20 px-4 py-2">
+      <div className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl">
+        <div className="pb-1.5 text-[11px] uppercase tracking-wider text-amber-300">
+          <span className="inline-flex items-center gap-1">
+            <AlertTriangle className="h-3 w-3" />
+            Rejected ({rejected.length})
+          </span>
+        </div>
+        <ul className="flex flex-col gap-1.5">
+          {rejected.map((r) => (
+            <li
+              key={r.id}
+              className="group flex items-start gap-2 rounded-lg border border-amber-700/30 bg-amber-950/15 px-2.5 py-1.5"
+            >
+              <span className="mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-amber-500/20 text-[10px] font-semibold text-amber-300">
+                !
+              </span>
+              <div className="min-w-0 flex-1">
+                <p className="truncate whitespace-pre-wrap break-words text-xs text-amber-100">
+                  {r.text}
+                </p>
+                <p className="mt-0.5 text-[10px] text-amber-400/80">
+                  Agent was busy; prompt was not sent.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => onRetry(r.text)}
+                disabled={disabled}
+                className="inline-flex shrink-0 items-center gap-1 rounded-md border border-amber-700/60 bg-amber-900/30 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-amber-100 hover:bg-amber-900/60 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-amber-900/30"
+                aria-label="Retry rejected prompt"
+              >
+                <RotateCcw className="h-3 w-3" />
+                Retry
+              </button>
+              <button
+                type="button"
+                onClick={() => onDismiss(r.id)}
+                className="inline-flex shrink-0 items-center justify-center rounded-md border border-amber-700/40 bg-amber-900/20 p-1 text-amber-200 hover:bg-amber-900/60"
+                aria-label="Dismiss rejected prompt"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+export function QueuedPromptsStrip({
   queued,
   onRemove,
   onEdit,
   onClear,
+  pendingResume,
 }: QueuedPromptsStripProps) {
+  // Strip-level collapse: when the queue exceeds `visibleDefault` rows,
+  // only the first N render until the user expands. State resets when
+  // the queue length drops back below the threshold (toggle disappears;
+  // `expanded` stays harmlessly true and re-arms on the next overflow).
+  // Mobile gets N=1 because a single multi-line prompt already eats
+  // half the small-viewport composer area; desktop tolerates N=2.
+  // See #1232.
+  const isMobile = useIsCoarsePointer();
+  const [expanded, setExpanded] = useState(false);
+  const profile = useAgentProfile();
   if (queued.length === 0) return null;
+  const layout = queuedStripLayout({
+    queuedCount: queued.length,
+    isMobile,
+    expanded,
+  });
+  const visible = queued.slice(0, layout.visibleCount);
+  const aliases = profile.clearAliases;
   return (
     <div className="border-t border-surface-800 bg-surface-900/60 px-4 py-2">
       <div className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl">
         <div className="flex items-center justify-between pb-1.5 text-[11px] uppercase tracking-wider text-text-dim">
           <span className="inline-flex items-center gap-1">
             <Clock className="h-3 w-3" />
-            Queued ({queued.length})
+            {pendingResume ? `Pending until session resumes (${queued.length})` : `Queued (${queued.length})`}
           </span>
           {queued.length > 1 && (
             <button
               type="button"
               onClick={onClear}
-              className="text-text-dim hover:text-rose-300 transition-colors"
+              className="text-text-dim hover:text-text-secondary transition-colors"
             >
               Clear all
             </button>
           )}
         </div>
         <ul className="flex flex-col gap-1.5">
-          {queued.map((q) => (
-            <QueuedPromptRow
-              key={q.id}
-              prompt={q}
-              onRemove={() => onRemove(q.id)}
-              onEdit={(text) => onEdit(q.id, text)}
-            />
-          ))}
+          {visible.map((q, i) => {
+            // Insert a clear-boundary divider between this row and the
+            // previous when either side is a clear-command alias. Signals
+            // that the drain effect will fire these as separate POSTs
+            // rather than gluing them into one combined prompt (#1356).
+            const prev = i > 0 ? visible[i - 1] : undefined;
+            const showDivider =
+              aliases.length > 0 &&
+              prev !== undefined &&
+              (isClearAlias(prev.text, aliases) ||
+                isClearAlias(q.text, aliases));
+            return (
+              <Fragment key={q.id}>
+                {showDivider && (
+                  <li
+                    aria-hidden="true"
+                    data-testid="queued-clear-boundary"
+                    className="flex items-center gap-2 px-1 text-[10px] uppercase tracking-wider text-amber-300/60"
+                  >
+                    <span className="h-px flex-1 bg-amber-500/20" />
+                    fires separately
+                    <span className="h-px flex-1 bg-amber-500/20" />
+                  </li>
+                )}
+                <QueuedPromptRow
+                  prompt={q}
+                  onRemove={() => onRemove(q.id)}
+                  onEdit={(text) => onEdit(q.id, text)}
+                />
+              </Fragment>
+            );
+          })}
         </ul>
+        {layout.toggleLabel && (
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            className="mt-1.5 w-full rounded-md border border-sky-700/20 bg-sky-950/10 px-2 py-1 text-[11px] font-medium uppercase tracking-wider text-sky-300 hover:bg-sky-950/30"
+          >
+            {layout.toggleLabel}
+          </button>
+        )}
       </div>
     </div>
   );
@@ -1413,10 +1932,17 @@ function QueuedPromptRow({
   // current prompt.text. This avoids a setState-in-effect to keep the
   // draft synced with external edits (lint: react-hooks/set-state-in-effect).
   const [editing, setEditing] = useState(false);
+  // Per-row clamp: long / multi-line prompts only render their first
+  // few lines in display mode. The `…` affordance lifts the clamp
+  // without entering edit mode. The clamp is undone automatically when
+  // the editor mounts, since the textarea has its own sizing logic.
+  // See #1232.
+  const [rowExpanded, setRowExpanded] = useState(false);
+  const isLong = isQueuedPromptLong(prompt.text);
 
   return (
-    <li className="group flex items-start gap-2 rounded-lg border border-amber-700/30 bg-amber-950/15 px-2.5 py-1.5">
-      <span className="mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-amber-500/20 text-[10px] font-semibold text-amber-300">
+    <li className="group flex items-start gap-2 rounded-lg border border-sky-700/30 bg-sky-950/15 px-2.5 py-1.5">
+      <span className="mt-0.5 inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-sky-500/20 text-[10px] font-semibold text-sky-300">
         ⏱
       </span>
       {editing ? (
@@ -1431,20 +1957,42 @@ function QueuedPromptRow({
           }}
         />
       ) : (
-        <button
-          type="button"
-          onClick={() => setEditing(true)}
-          title="Click to edit"
-          className="min-w-0 flex-1 text-left text-xs leading-5 text-text-secondary whitespace-pre-wrap break-words hover:text-text-primary"
-        >
-          {prompt.text}
-        </button>
+        <div className="min-w-0 flex-1">
+          <button
+            type="button"
+            onClick={() => setEditing(true)}
+            title="Click to edit"
+            className={[
+              "block w-full text-left text-xs leading-5 text-text-secondary whitespace-pre-wrap break-words hover:text-text-primary",
+              isLong && !rowExpanded ? "line-clamp-3" : "",
+            ]
+              .filter(Boolean)
+              .join(" ")}
+          >
+            {prompt.text}
+          </button>
+          {isLong && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setRowExpanded((v) => !v);
+              }}
+              className="mt-0.5 text-[11px] font-medium text-sky-300 hover:text-sky-200"
+              aria-label={
+                rowExpanded ? "Collapse queued prompt" : "Show full queued prompt"
+              }
+            >
+              {rowExpanded ? "Show less" : "…"}
+            </button>
+          )}
+        </div>
       )}
       <button
         type="button"
         onClick={onRemove}
         title="Drop this queued message"
-        className="shrink-0 rounded p-1 text-text-dim hover:bg-surface-800 hover:text-rose-300"
+        className="shrink-0 rounded p-1 text-text-dim hover:bg-surface-800 hover:text-text-secondary"
       >
         <X className="h-3.5 w-3.5" />
       </button>

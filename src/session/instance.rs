@@ -1,9 +1,10 @@
 //! Session instance definition and operations
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -16,16 +17,16 @@ use super::environment::{build_docker_env_args, shell_escape};
 use super::poller::SessionPoller;
 
 use crate::session::capture::{
-    build_exclusion_set, capture_codex_session_id, capture_gemini_session_id,
-    capture_hermes_session_id, capture_pi_session_id, capture_vibe_session_id, claude_poll_fn,
-    claude_poll_fn_sandboxed, codex_poll_fn, codex_poll_fn_sandboxed, gemini_poll_fn,
-    gemini_poll_fn_sandboxed, generate_claude_session_id, hermes_poll_fn, hermes_poll_fn_sandboxed,
-    is_valid_session_id, opencode_poll_fn, opencode_poll_fn_sandboxed, pi_poll_fn,
-    pi_poll_fn_sandboxed, try_capture_codex_session_id_in_container,
-    try_capture_gemini_session_id_in_container, try_capture_hermes_session_id_in_container,
-    try_capture_opencode_session_id, try_capture_opencode_session_id_in_container,
-    try_capture_pi_session_id_in_container, try_capture_vibe_session_id_in_container,
-    validated_session_id, vibe_poll_fn, vibe_poll_fn_sandboxed,
+    capture_codex_session_id, capture_gemini_session_id, capture_hermes_session_id,
+    capture_pi_session_id, capture_vibe_session_id, claude_poll_fn, claude_poll_fn_sandboxed,
+    codex_poll_fn, codex_poll_fn_sandboxed, gemini_poll_fn, gemini_poll_fn_sandboxed,
+    generate_claude_session_id, hermes_poll_fn, hermes_poll_fn_sandboxed, is_valid_session_id,
+    opencode_poll_fn, opencode_poll_fn_sandboxed, pi_poll_fn, pi_poll_fn_sandboxed,
+    try_capture_codex_session_id_in_container, try_capture_gemini_session_id_in_container,
+    try_capture_hermes_session_id_in_container, try_capture_opencode_session_id,
+    try_capture_opencode_session_id_in_container, try_capture_pi_session_id_in_container,
+    try_capture_vibe_session_id_in_container, validated_session_id, vibe_poll_fn,
+    vibe_poll_fn_sandboxed,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,16 +50,96 @@ pub enum Status {
     Creating,
 }
 
+impl Status {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Status::Running => "running",
+            Status::Waiting => "waiting",
+            Status::Idle => "idle",
+            Status::Unknown => "unknown",
+            Status::Stopped => "stopped",
+            Status::Error => "error",
+            Status::Starting => "starting",
+            Status::Deleting => "deleting",
+            Status::Creating => "creating",
+        }
+    }
+}
+
+/// Outcome of a `start_with_resume_fallback` cascade.
+///
+/// Failures (both tiers) propagate as `Err` so callers keep the existing
+/// `Status::Error` + `last_error` path. Only successful outcomes are
+/// enumerated; mirrors the `EnsureReadyOutcome` shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartOutcome {
+    /// Session ID was set and resume succeeded; pane is alive.
+    Resumed,
+    /// Resume attempt crashed the pane fast; the bad sid was cleared and a
+    /// fresh start succeeded. Caller should surface this: the user's prior
+    /// conversation is gone. `stale_sid` is the sid that was cleared.
+    Restarted { stale_sid: String },
+    /// No resume cascade ran. Either no prior sid, the agent doesn't support
+    /// resume, the sid was invalid, the session is cockpit-mode (no tmux
+    /// pane), or the tmux session was already alive when entered (so
+    /// `start_with_size_opts` was a no-op and the probe had nothing to
+    /// detect). The pane is alive on return; whether a fresh launch
+    /// actually occurred this call depends on the caller having killed
+    /// any pre-existing pane first.
+    Fresh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeResult {
+    Alive,
+    Dead,
+}
+
+const RESUME_PROBE_MAX: std::time::Duration = std::time::Duration::from_millis(3000);
+const RESUME_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+/// Grace window we keep observing after the pane stops running its boot
+/// shell, before declaring `Alive`. Sized to cover the longest in-pane
+/// boot a real agent takes before it would have crashed on a bad sid:
+/// opencode (bun-compiled native binary that loads JS, parses argv, and
+/// hits the session-not-found path) reaches `pane_dead = true` between
+/// ~900ms and ~1100ms after spawn on a warm cache, longer on cold or
+/// heavy projects. Healthy resumes pay this entire window once on Tier-1
+/// (and again on Tier-2 if it fires); the pane is fully attachable for
+/// the duration so the cost is purely in the synchronous restart path's
+/// latency, not in agent responsiveness afterward.
+const RESUME_PROBE_POST_SHELL_GRACE: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// Pure decision: should the resume-fallback cascade probe and potentially
+/// retry without resume after the initial start? Extracted for unit-testability:
+/// the cascade itself needs a real tmux session to test end-to-end.
+pub(crate) fn should_attempt_resume(agent_session_id: Option<&str>, tool: &str) -> bool {
+    let valid = agent_session_id.map(is_valid_session_id).unwrap_or(false);
+    if !valid {
+        return false;
+    }
+    !matches!(
+        crate::agents::get_agent(tool).map(|a| &a.resume_strategy),
+        Some(crate::agents::ResumeStrategy::Unsupported) | None,
+    )
+}
+
 /// Outcome of `Instance::ensure_pane_ready`. Callers surface this so the user
 /// knows what (if anything) happened on their behalf before a send.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnsureReadyOutcome {
     /// Pane was already alive; no action taken.
     AlreadyAlive,
     /// Pane was dead (`#{pane_dead}=1`) and was respawned via the restart path.
-    Respawned,
-    /// Tmux session did not exist and was started from scratch.
-    Started,
+    /// `stale_sid` is `Some` when the resume-fallback cascade fired during the
+    /// respawn, meaning the agent's prior conversation is gone; callers should
+    /// surface this so the user understands why history disappeared.
+    Respawned { stale_sid: Option<String> },
+    /// Tmux session did not exist and was started via the resume-fallback
+    /// cascade. `stale_sid` is `Some` when the cascade fired (sid was on
+    /// disk from a prior run, the agent crashed on it, and we cleared it
+    /// before retrying), `None` for a healthy resume or fresh launch
+    /// without resume. Same surface-to-user contract as `Respawned`.
+    Started { stale_sid: Option<String> },
 }
 
 /// Errors `ensure_pane_ready` can return. Separating transient lifecycle
@@ -214,10 +295,56 @@ pub struct Instance {
     ///
     /// Named `idle_entered_at` rather than `idle_since` to avoid collision
     /// with `DwellState::idle_since` in `src/server/push.rs`, which is an
-    /// in-process `Instant` for push-notification dwell timing — a
+    /// in-process `Instant` for push-notification dwell timing, a
     /// different concept with a different type and lifetime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_entered_at: Option<DateTime<Utc>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<DateTime<Utc>>,
+
+    /// Favorite marker; sibling of archive. When set AND the session is in
+    /// a "needs help" status (Waiting, Error, Idle, Unknown), the session
+    /// pre-empts all non-favorited peers in the same status tier, pinning it
+    /// to the top of the Attention sort. In Running / Stopped / transient
+    /// statuses the flag is visible (⭐ glyph + bold) but does NOT re-rank
+    /// since live work isn't interrupted by a decoration. Opposite of archive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub favorited_at: Option<DateTime<Utc>>,
+
+    /// Snooze marker, a "temporary archive." When `snoozed_until` is in the
+    /// future, the session sorts to tier 99 alongside archived rows and
+    /// renders italic+dim with a `z ` prefix plus a remaining-time readout
+    /// in the age column. When the timestamp falls into the past, the
+    /// `is_snoozed()` predicate returns false and the row naturally rejoins
+    /// the active attention sort (the stale timestamp stays on disk until
+    /// the next mutation rewrites it, which is harmless). Mutually compatible with
+    /// `favorited_at`: a snoozed favorite keeps its star when it wakes up.
+    /// Archive wins over snooze (archiving a snoozed session clears nothing
+    /// but renders as archive since is_archived() is checked first).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snoozed_until: Option<DateTime<Utc>>,
+
+    /// Web-only pin marker. Distinct from `favorited_at`: favorite is the
+    /// TUI attention-sort within-tier pin, while pin is a hard top-of-sort
+    /// surfacing primitive surfaced through the web sidebar (where the TUI's
+    /// Attention sort does not exist). Mutually exclusive with the sink
+    /// states (`archived_at`, `snoozed_until`) via the `pin()` mutator and
+    /// the inverse clear in `archive()` / `snooze()`. Orthogonal to
+    /// `favorited_at` (both can be set; they drive different surfaces).
+    /// Unlike archive/snooze, `pin` is NOT cleared by `touch_last_accessed`
+    /// because it is an explicit persistent surfacing signal, not a sink
+    /// state that "user is engaging" implicitly contradicts. See #1581.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_at: Option<DateTime<Utc>>,
+
+    /// Scratch-session marker. When true, `project_path` points at an
+    /// auto-provisioned directory under `<app_dir>/scratch/<id>/` that the
+    /// deletion path removes on `aoe rm` (unless the user opts in to keeping
+    /// the directory). Mutually exclusive with worktree/workspace.
+    /// See `src/session/scratch.rs`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scratch: bool,
 
     // Git worktree integration
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -260,6 +387,18 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify_on_error: Option<bool>,
 
+    /// Per-session override for the diff base ref. Takes precedence
+    /// over `DiffConfig.default_branch` and the auto-detected default
+    /// branch. Set when the eventual PR target differs from the project
+    /// default (e.g. stacked PRs, hotfix off `release/*`). See #970.
+    ///
+    /// Accepts either a short branch name (`"main"`, `"release-1.2"`)
+    /// or a remote-qualified ref (`"upstream/main"`); the diff resolver
+    /// hands it straight to `compute_changed_files`, whose
+    /// `get_commit_from_ref` resolves both forms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch_override: Option<String>,
+
     /// Whether this session uses the ACP cockpit instead of a tmux pane.
     /// When true, aoe spawns an ACP agent subprocess and renders structured
     /// events natively; tmux integration is bypassed for this session.
@@ -296,6 +435,33 @@ pub struct Instance {
     pub last_error: Option<String>,
     #[serde(skip)]
     pub session_id_poller: Option<Arc<Mutex<SessionPoller>>>,
+
+    /// Runtime-only set of session IDs that retroactive capture must NOT
+    /// re-discover from on-disk artifacts. Populated by the resume-fallback
+    /// cascade with the just-crashed session ID so the Tier-2 fresh start
+    /// doesn't re-import the same bad sid via filesystem scan (opencode db,
+    /// vibe meta.json, codex state, etc., all keep the bad session's row
+    /// after the crash for several minutes).
+    ///
+    /// `#[serde(skip)]` is intentional. If the daemon dies between the
+    /// cascade clearing the on-disk sid and the on-disk artifact decaying
+    /// (~5-10 min), the next launch starts with this set empty and the
+    /// freshly-spawned poller can re-import the bad sid once. The next
+    /// `start_with_resume_fallback` then re-runs the cascade and clears it
+    /// again. Self-healing within one cycle; persisting a TTL set isn't
+    /// worth the schema cost.
+    #[serde(skip)]
+    pub(crate) retroactive_capture_excludes: HashSet<String>,
+
+    /// Cached `is_pane_dead()` reading from the most recent status_poller
+    /// tick. Lets the Attention comparator treat dead-pane rows as sunk
+    /// (tier 99) without re-querying tmux on every sort. Field name avoids
+    /// `pane_dead` to prevent shadowing `tmux::Session::is_pane_dead()` at
+    /// call sites that take both. Refreshed by status_poller; not persisted
+    /// (clears to false on TUI restart, which is correct; a fresh poll
+    /// will re-set it within one tick if the pane is genuinely dead).
+    #[serde(skip)]
+    pub pane_dead_observed: bool,
 }
 
 /// Append yolo-mode flags or environment variables to a launch command.
@@ -315,7 +481,7 @@ fn build_resume_flags(tool: &str, session_id: &str, is_existing_session: bool) -
     use crate::agents::{get_agent, ResumeStrategy};
 
     if !is_valid_session_id(session_id) {
-        tracing::warn!(
+        tracing::warn!(target: "session.store",
             "Refusing to build resume flags: invalid session ID {:?}",
             session_id
         );
@@ -371,27 +537,27 @@ fn append_resume_flags(
         } else {
             *cmd = format!("{} {}", cmd, resume_part);
         }
-        tracing::debug!("Added resume flags to {} command: {}", context, resume_part);
+        tracing::debug!(target: "session.store", "Added resume flags to {} command: {}", context, resume_part);
     }
 }
 
 /// Persist an agent session ID to storage and tmux env for a given instance.
 ///
-/// Used only during synchronous pre-launch (e.g. `persist_session_id` for
-/// Claude) when no poller is active yet. Post-launch persistence goes
-/// exclusively through the poller channel -> `apply_session_id_updates()`
-/// in the TUI thread to avoid concurrent writes to `sessions.json`.
-fn persist_session_to_storage(profile: &str, instance_id: &str, session_id: &str) {
-    debug_assert!(
-        std::thread::current()
-            .name()
-            .is_none_or(|n| n == "main" || !n.starts_with("aoe-")),
-        "persist_session_to_storage must not be called from background threads (was: {:?})",
-        std::thread::current().name()
-    );
-
+/// Used during synchronous pre-launch (e.g. `persist_session_id` for Claude)
+/// when no poller is active yet. Post-launch persistence goes exclusively
+/// through the poller channel -> `apply_session_id_updates()` in the TUI
+/// thread. Concurrent calls within and across processes are serialised via
+/// `Storage::update`'s two-layer lock (in-process mutex + cross-process
+/// flock; see `storage.rs` module rustdoc).
+///
+/// Fire-and-forget: errors are logged at warn level. The poller dedupes
+/// on its `last_known` and `apply_session_id_updates` dedupes on in-memory
+/// state, so a transient persist failure stays disk-out-of-sync until the
+/// process restarts (which reloads from disk and re-emits via the agent's
+/// own session log on next start).
+pub(crate) fn persist_session_to_storage(profile: &str, instance_id: &str, session_id: &str) {
     if !is_valid_session_id(session_id) {
-        tracing::warn!(
+        tracing::warn!(target: "session.store",
             "Refusing to persist invalid session ID {:?} for {}",
             session_id,
             instance_id
@@ -402,28 +568,72 @@ fn persist_session_to_storage(profile: &str, instance_id: &str, session_id: &str
     let storage = match super::storage::Storage::new(profile) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!("Failed to create storage for session ID persistence: {}", e);
+            tracing::warn!(target: "session.store", "Failed to create storage for session ID persistence: {}", e);
             return;
         }
     };
-    let mut instances = match storage.load() {
-        Ok(i) => i,
+
+    let outcome = storage.update(|instances, _groups| {
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == instance_id) {
+            inst.agent_session_id = Some(session_id.to_string());
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    });
+
+    match outcome {
+        Ok(true) => {
+            tracing::debug!(target: "session.store", "Session ID persisted for {}", instance_id);
+        }
+        Ok(false) => {}
         Err(e) => {
-            tracing::warn!("Failed to load instances for session ID persistence: {}", e);
+            tracing::warn!(target: "session.store", "Failed to persist session ID for {}: {}", instance_id, e);
+        }
+    }
+}
+
+/// Clear the persisted `agent_session_id` for an instance.
+///
+/// Inverse of `persist_session_to_storage`. Used by the resume-fallback
+/// cascade after Tier 1 detects a crashed pane: the bad sid was already
+/// flushed to `sessions.json` by the Tier-1 `finalize_launch`, so an
+/// in-memory clear is not enough. If the daemon dies between Tier 1 and
+/// Tier 2's `finalize_launch`, the next launch would otherwise re-load the
+/// bad sid from disk and pass `--resume <bad>` again, looping.
+///
+/// Concurrent callers within and across processes (TUI tick, server
+/// `spawn_blocking` workers, CLI `restart --all` JoinSet workers, peer
+/// `aoe` invocations) are serialised via `Storage::update`'s two-layer
+/// lock (in-process mutex + cross-process flock; see `storage.rs` module
+/// rustdoc).
+fn clear_session_id_on_disk(profile: &str, instance_id: &str) {
+    let storage = match super::storage::Storage::new(profile) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(target: "session.store", "Failed to create storage to clear session ID: {}", e);
             return;
         }
     };
 
-    let Some(inst) = instances.iter_mut().find(|i| i.id == instance_id) else {
-        return;
-    };
+    let outcome = storage.update(|instances, _groups| {
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == instance_id) {
+            if inst.agent_session_id.is_some() {
+                inst.agent_session_id = None;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    });
 
-    inst.agent_session_id = Some(session_id.to_string());
-
-    if let Err(e) = storage.save(&instances) {
-        tracing::warn!("Failed to save instances for session ID persistence: {}", e);
-    } else {
-        tracing::debug!("Session ID persisted for {}", instance_id);
+    match outcome {
+        Ok(true) => {
+            tracing::debug!(target: "session.store", "Session ID cleared on disk for {}", instance_id);
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(target: "session.store", "Failed to clear session ID for {}: {}", instance_id, e);
+        }
     }
 }
 
@@ -438,7 +648,7 @@ fn publish_session_to_tmux_env(tmux_session_name: &str, session_id: &str) {
         crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
         session_id,
     ) {
-        tracing::warn!("Failed to write captured session ID to tmux env: {}", e);
+        tracing::warn!(target: "session.store", "Failed to write captured session ID to tmux env: {}", e);
     }
 }
 
@@ -459,6 +669,11 @@ impl Instance {
             created_at: Utc::now(),
             last_accessed_at: None,
             idle_entered_at: None,
+            archived_at: None,
+            favorited_at: None,
+            snoozed_until: None,
+            pinned_at: None,
+            scratch: false,
             worktree_info: None,
             workspace_info: None,
             sandbox_info: None,
@@ -468,6 +683,7 @@ impl Instance {
             notify_on_waiting: None,
             notify_on_idle: None,
             notify_on_error: None,
+            base_branch_override: None,
             #[cfg(feature = "serve")]
             cockpit_mode: false,
             #[cfg(feature = "serve")]
@@ -480,14 +696,284 @@ impl Instance {
             last_start_time: None,
             last_error: None,
             session_id_poller: None,
+            retroactive_capture_excludes: HashSet::new(),
+            pane_dead_observed: false,
         }
     }
 
-    /// Stamp `last_accessed_at` to the current time. Call this on
-    /// user-initiated interactions (attach, send keys, etc.) so the
-    /// timestamp reflects actual activity, not just status transitions.
+    /// Stamp `last_accessed_at` to the current time AND wake the session
+    /// from any sink state. Call this on user-initiated interactions
+    /// (attach, send keys, etc.); every existing call site already does.
+    ///
+    /// Auto-unarchive/unsnooze: sending a message or attaching is the user
+    /// explicitly saying "I care about this now." Leaving `archived_at` or
+    /// `snoozed_until` set after such interaction is incoherent; the row
+    /// would render italic+dim at tier 99 even while live traffic flows.
+    /// User rule (2026-04-23): "messaging should unarchive."
+    ///
+    /// `favorited_at` is preserved: fav is a positive "care more" signal,
+    /// orthogonal to the sink states. A favorited session that was snoozed
+    /// stays favorited when the user wakes it.
     pub fn touch_last_accessed(&mut self) {
         self.last_accessed_at = Some(Utc::now());
+        self.archived_at = None;
+        self.snoozed_until = None;
+    }
+
+    /// Mutates: `status`, `sandbox_info`. Field set must match what
+    /// `start_with_size_opts` writes; missing fields re-introduce the
+    /// wholesale-replace clobber.
+    pub fn merge_post_start(&mut self, src: &Self) {
+        self.status = src.status;
+        self.sandbox_info = src.sandbox_info.clone();
+    }
+
+    /// Same fields as `merge_post_start`. When `stale_sid` is `Some`, the
+    /// resume-fallback cascade just invalidated that exact sid; clear
+    /// `self.agent_session_id` only if it still matches the stale value, so
+    /// a peer poller's freshly-discovered sid (landed between phase 2 and
+    /// phase 3 of the restart) survives intact.
+    pub fn merge_post_restart(&mut self, src: &Self, stale_sid: Option<&str>) {
+        self.merge_post_start(src);
+        if let Some(stale) = stale_sid {
+            if self.agent_session_id.as_deref() == Some(stale) {
+                self.agent_session_id = src.agent_session_id.clone();
+            }
+        }
+    }
+
+    /// Splice TUI-mirrored, persisted fields from `src` onto `self`. Used by
+    /// `HomeView::save` for fields the TUI is the canonical disk writer of
+    /// (the daemon's `status_poll_loop` keeps these in memory only). The
+    /// server's `send_message` respawn briefly writes `status` via
+    /// `apply_post_restart_sync`; the resulting transient mis-paint
+    /// converges on the next `status_poll` tick.
+    /// User-action fields (archived/favorited/snoozed/title/group_path/...)
+    /// are NOT here; they go through `apply_user_action` per-action so peer
+    /// writers (CLI) cannot be clobbered by a stale TUI snapshot.
+    pub fn merge_from_tui(&mut self, src: &Self) {
+        self.status = src.status;
+        self.last_accessed_at = self.last_accessed_at.max(src.last_accessed_at);
+        self.idle_entered_at = src.idle_entered_at;
+    }
+
+    /// Per-field-conditional splice: copy `post.X` onto `self.X` only when
+    /// `pre.X != post.X`. Peer writes to fields the mutation did not touch
+    /// survive even when the field is in the user-action set.
+    /// `last_accessed_at` is monotone-max (no diff guard).
+    /// `source_profile` is excluded; cross-profile moves bypass this path.
+    /// Post-splice rules enforce the same cross-field invariants the
+    /// per-mutation methods enforce (archive XOR favorite, touch unarchives)
+    /// so concurrent peer writes cannot violate them.
+    pub fn merge_user_action_diff(&mut self, pre: &Self, post: &Self) {
+        debug_assert_eq!(
+            pre.source_profile, post.source_profile,
+            "apply_user_action must not change source_profile; cross-profile moves go through mutate_instance"
+        );
+        if pre.title != post.title {
+            self.title = post.title.clone();
+        }
+        if pre.group_path != post.group_path {
+            self.group_path = post.group_path.clone();
+        }
+        if pre.archived_at != post.archived_at {
+            self.archived_at = post.archived_at;
+        }
+        if pre.favorited_at != post.favorited_at {
+            self.favorited_at = post.favorited_at;
+        }
+        if pre.snoozed_until != post.snoozed_until {
+            self.snoozed_until = post.snoozed_until;
+        }
+        if pre.pinned_at != post.pinned_at {
+            self.pinned_at = post.pinned_at;
+        }
+        if pre.base_branch_override != post.base_branch_override {
+            self.base_branch_override = post.base_branch_override.clone();
+        }
+        if pre.status != post.status {
+            self.status = post.status;
+        }
+        self.last_accessed_at = self.last_accessed_at.max(post.last_accessed_at);
+
+        let archived_changed = pre.archived_at != post.archived_at;
+        let favorited_changed = pre.favorited_at != post.favorited_at;
+        let snoozed_changed = pre.snoozed_until != post.snoozed_until;
+        let pinned_changed = pre.pinned_at != post.pinned_at;
+        // Touch is an event invariant: any advance of last_accessed_at
+        // (TUI-side or peer-side) dethrones a concurrent archive.
+        let touched = self.last_accessed_at > pre.last_accessed_at;
+
+        // archive(): archived=Some => favorited=None, snoozed=None, pinned=None
+        if archived_changed && post.archived_at.is_some() {
+            self.favorited_at = None;
+            self.snoozed_until = None;
+            self.pinned_at = None;
+        }
+        // favorite(): favorited=Some => archived=None, snoozed=None
+        if favorited_changed && post.favorited_at.is_some() {
+            self.archived_at = None;
+            self.snoozed_until = None;
+        }
+        // snooze(): snoozed=Some => pinned=None (sink clears surface).
+        if snoozed_changed && post.snoozed_until.is_some() {
+            self.pinned_at = None;
+        }
+        // pin(): pinned=Some => archived=None, snoozed=None (surface clears sinks).
+        if pinned_changed && post.pinned_at.is_some() {
+            self.archived_at = None;
+            self.snoozed_until = None;
+        }
+        // touch_last_accessed(): clears archived + snoozed. Does NOT clear
+        // favorite or pin (both are explicit user-surfacing signals, not
+        // sink states).
+        if touched {
+            self.archived_at = None;
+            self.snoozed_until = None;
+        }
+        // Final-state invariant: archive is the strongest dismiss and
+        // wins over snooze. The per-mutation rules above clear other
+        // flags on the change side, but the diff can also leave disk
+        // archived (pre-existing) AND snoozed (added by post); without
+        // this check the row would persist both and the web sidebar's
+        // tier comparator (which assumes exactly one active triage
+        // state) would render contradictory chips. See #1581.
+        if self.archived_at.is_some() {
+            self.snoozed_until = None;
+        }
+    }
+
+    /// Mark the session archived. Archived sessions sink to the bottom of
+    /// the Attention sort and render in italic+dim style, but remain
+    /// visible. Auto-cleared by the attention-signal hook on Waiting/Error.
+    ///
+    /// Mutual exclusion with `favorite`, `snooze`, and `pin`: archiving
+    /// clears `favorited_at`, `snoozed_until`, and `pinned_at`. Archive
+    /// is the strongest dismiss; keeping any other triage flag on a row
+    /// the user just sunk produces contradictory state, and the web
+    /// sidebar's tier comparator already assumes the server enforces a
+    /// single active triage state (see `sidebarSort.ts` in #1581).
+    pub fn archive(&mut self) {
+        self.archived_at = Some(Utc::now());
+        self.favorited_at = None;
+        self.snoozed_until = None;
+        self.pinned_at = None;
+    }
+
+    pub fn unarchive(&mut self) {
+        self.archived_at = None;
+    }
+
+    pub fn is_archived(&self) -> bool {
+        self.archived_at.is_some()
+    }
+
+    /// Mark the session favorite. Sibling of `archive`, with opposite semantics.
+    /// Pinning logic lives in `attention_session_key`: favorite is a
+    /// within-tier pin (top of its respective category), not a cross-tier
+    /// promoter. A favorited Running stays in the Running bucket but sorts
+    /// above non-favorited Running peers.
+    ///
+    /// Mutual exclusion with the sink states: favoriting clears `archived_at`
+    /// AND `snoozed_until`. Favorite's whole purpose is "surface this row";
+    /// leaving either sink-state flag set would force the row to tier 99 and
+    /// the favorite bias would be suppressed; user presses `f` and sees
+    /// nothing change. The user's explicit rule: "marking as favorite
+    /// unarchives," extended to snooze because snooze shares tier 99 and
+    /// shares the burial outcome.
+    pub fn favorite(&mut self) {
+        self.favorited_at = Some(Utc::now());
+        self.archived_at = None;
+        self.snoozed_until = None;
+    }
+
+    pub fn unfavorite(&mut self) {
+        self.favorited_at = None;
+    }
+
+    pub fn is_favorited(&self) -> bool {
+        self.favorited_at.is_some()
+    }
+
+    /// Read the agent-raised urgent flag from `attention.json`. Sourced
+    /// on-demand from `/tmp/aoe-hooks/{id}/attention.json` so it picks up
+    /// changes the running agent makes (via the `attention-urgent` script)
+    /// without an Instance state mutation. Suppressed for archived/snoozed
+    /// rows so a sunk session can't claw its way back to the top.
+    pub fn is_urgent(&self) -> bool {
+        if self.is_archived() || self.is_snoozed() {
+            return false;
+        }
+        crate::hooks::read_hook_urgent(&self.id)
+    }
+
+    /// Temporarily defer this session for `minutes`; sets `snoozed_until`
+    /// to `Utc::now() + minutes`. Behaves like a timed archive: the row
+    /// sinks to tier 99, renders italic+dim with a `z ` prefix, and shows
+    /// remaining time in the age column. When the timestamp expires the
+    /// row rejoins the active attention sort automatically (next render
+    /// tick); no timer task needed. Resolution of `minutes` happens at
+    /// snooze time, not render time, so changing the config default mid-
+    /// snooze does NOT extend currently-sleeping rows.
+    ///
+    /// Clears `pinned_at` for the same reason archive does: snooze is a
+    /// sink state, and a pinned-yet-snoozed row is contradictory. The
+    /// existing favorite mutator is intentionally NOT touched here
+    /// (favorite is the TUI within-tier signal, snoozed favorites keep
+    /// their star when they wake; see field doc for `favorited_at`).
+    pub fn snooze(&mut self, minutes: u32) {
+        self.snoozed_until = Some(Utc::now() + chrono::Duration::minutes(minutes as i64));
+        self.pinned_at = None;
+    }
+
+    pub fn unsnooze(&mut self) {
+        self.snoozed_until = None;
+    }
+
+    /// True if `snoozed_until` is set AND in the future. Expired snoozes
+    /// return false so the row naturally rejoins the main sort on the next
+    /// render; the stale timestamp stays on disk until the next mutation
+    /// rewrites the session (harmless; `snoozed_until` is always compared
+    /// against `Utc::now()`).
+    pub fn is_snoozed(&self) -> bool {
+        self.snoozed_until.map(|t| t > Utc::now()).unwrap_or(false)
+    }
+
+    /// Remaining snooze duration as a `chrono::Duration`, or `None` if the
+    /// session isn't snoozed (or the timestamp has already expired).
+    pub fn snooze_remaining(&self) -> Option<chrono::Duration> {
+        self.snoozed_until.and_then(|t| {
+            let delta = t - Utc::now();
+            if delta > chrono::Duration::zero() {
+                Some(delta)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Mark this session pinned. Pin is a web-only surfacing primitive:
+    /// pinned workspaces sort to the top of the web sidebar (across all
+    /// sort modes), regardless of last-activity. Distinct from
+    /// `favorited_at`, which drives the TUI Attention sort's within-tier
+    /// pin and stays unchanged here (see #1581).
+    ///
+    /// Mutual exclusion with the sink states: pinning clears
+    /// `archived_at` and `snoozed_until`. A pinned-yet-sunk row would
+    /// contradict the entire point of pinning (surface this), so the
+    /// sinks come off, identical to how `favorite()` handles it.
+    pub fn pin(&mut self) {
+        self.pinned_at = Some(Utc::now());
+        self.archived_at = None;
+        self.snoozed_until = None;
+    }
+
+    pub fn unpin(&mut self) {
+        self.pinned_at = None;
+    }
+
+    pub fn is_pinned(&self) -> bool {
+        self.pinned_at.is_some()
     }
 
     /// Time elapsed since this session most recently transitioned into
@@ -573,7 +1059,7 @@ impl Instance {
         let tmux_exists = self.tmux_session().is_ok_and(|s| s.exists());
         if tmux_exists {
             if let Some(id) = self.try_retroactive_capture() {
-                tracing::info!(
+                tracing::info!(target: "session.store",
                     "Retroactive capture found session ID for {}: {}",
                     self.tool,
                     id
@@ -590,15 +1076,25 @@ impl Instance {
         };
 
         if let Some(ref id) = session_id {
-            tracing::debug!("Session ID for {}: {}", self.tool, id);
+            tracing::debug!(target: "session.store", "Session ID for {}: {}", self.tool, id);
             self.agent_session_id = session_id.clone();
         }
 
         (session_id, false)
     }
 
+    /// Full set of session IDs that retroactive capture must skip for THIS
+    /// instance: the live tmux-discovered set plus any sids the
+    /// resume-fallback cascade has explicitly cleared. Composed of
+    /// `build_exclusion_set` (live tmux scan) and
+    /// `self.retroactive_capture_excludes` (cascade memory) so the caller
+    /// gets the complete picture in one call.
+    fn retroactive_capture_exclusion_set(&self) -> HashSet<String> {
+        super::capture::compose_exclusion(&self.id, &self.retroactive_capture_excludes)
+    }
+
     pub(crate) fn try_retroactive_capture(&self) -> Option<String> {
-        let exclusion = build_exclusion_set(&self.id);
+        let exclusion = self.retroactive_capture_exclusion_set();
         let result: Option<String> = match self.tool.as_str() {
             "opencode" => {
                 if self.is_sandboxed() {
@@ -790,6 +1286,14 @@ impl Instance {
             .unwrap_or(false)
     }
 
+    /// `exists()` alone is insufficient: a pane can exist while its agent
+    /// has died. Used by recovery, status polling, and TUI reload.
+    pub fn has_live_tmux_pane(&self) -> bool {
+        self.tmux_session()
+            .map(|s| s.exists() && !s.is_pane_dead())
+            .unwrap_or(false)
+    }
+
     pub fn start_container_terminal_with_size(&mut self, size: Option<(u16, u16)>) -> Result<()> {
         if !self.is_sandboxed() {
             anyhow::bail!("Cannot create container terminal for non-sandboxed session");
@@ -922,7 +1426,38 @@ impl Instance {
         }
 
         let profile = self.effective_profile();
-        let on_launch_hooks = self.resolve_on_launch_hooks(skip_on_launch, &profile);
+        let cmd = self.build_launch_command(skip_on_launch, &profile)?;
+
+        tracing::debug!(target: "session.store",
+            "container cmd: {}",
+            cmd.as_ref().map_or("none".to_string(), |v| {
+                super::environment::redact_env_values(v)
+            })
+        );
+        session.create_with_size(&self.project_path, cmd.as_deref(), size)?;
+
+        self.finalize_launch(session.name(), &profile);
+
+        Ok(())
+    }
+
+    /// Build the launch command string the way `start_with_size_opts` would,
+    /// but without creating a tmux session. Returns `None` for cockpit or
+    /// other modes where there is no command to launch.
+    ///
+    /// Currently only called from `start_with_size_opts`; a future dead-pane
+    /// respawn path could route through here so `tmux respawn-pane` receives
+    /// the same command `tmux new-session` would have. For now the helper is
+    /// preparatory and has one caller.
+    ///
+    /// Side effects mirror the start path: agent status hooks are installed,
+    /// and (for sandboxed sessions) on_launch hooks run inside the container.
+    fn build_launch_command(
+        &mut self,
+        skip_on_launch: bool,
+        profile: &str,
+    ) -> Result<Option<String>> {
+        let on_launch_hooks = self.resolve_on_launch_hooks(skip_on_launch, profile);
 
         let agent = crate::agents::get_agent(&self.tool)
             .or_else(|| crate::agents::get_agent(&self.detect_as));
@@ -931,14 +1466,16 @@ impl Instance {
         let cmd = if self.is_sandboxed() {
             let container = self.get_container_for_instance()?;
             if let Some(ref hook_cmds) = on_launch_hooks {
+                let hook_env = super::repo_config::lifecycle_env_vars(self);
                 if let Some(ref sandbox) = self.sandbox_info {
                     let workdir = self.container_workdir();
                     if let Err(e) = super::repo_config::execute_hooks_in_container(
                         hook_cmds,
                         &sandbox.container_name,
                         &workdir,
+                        &hook_env,
                     ) {
-                        tracing::warn!("on_launch hook failed in container: {}", e);
+                        tracing::warn!(target: "session.store", "on_launch hook failed in container: {}", e);
                     }
                 }
             }
@@ -977,6 +1514,7 @@ impl Instance {
             }
 
             self.apply_session_flags(&mut tool_cmd, "sandboxed");
+            apply_agent_launch_env(&mut tool_cmd, agent);
 
             let sandbox = self
                 .sandbox_info
@@ -997,24 +1535,18 @@ impl Instance {
             self.build_host_command(agent, &on_launch_hooks)
         };
 
-        tracing::debug!(
-            "container cmd: {}",
-            cmd.as_ref().map_or("none".to_string(), |v| {
-                super::environment::redact_env_values(v)
-            })
-        );
-        session.create_with_size(&self.project_path, cmd.as_deref(), size)?;
-
-        self.finalize_launch(session.name(), &profile);
-
-        Ok(())
+        Ok(cmd)
     }
 
     /// Resolve on_launch hooks from the full config chain (global > profile > repo).
     ///
     /// Repo hooks go through trust verification; global/profile hooks are
     /// implicitly trusted. Returns `None` when skipped or no hooks are configured.
-    fn resolve_on_launch_hooks(&self, skip_on_launch: bool, profile: &str) -> Option<Vec<String>> {
+    pub(crate) fn resolve_on_launch_hooks(
+        &self,
+        skip_on_launch: bool,
+        profile: &str,
+    ) -> Option<Vec<String>> {
         if skip_on_launch {
             return None;
         }
@@ -1047,23 +1579,24 @@ impl Instance {
     /// so this only acts on host sessions by writing to the user's home directory.
     /// Respects the `agent_status_hooks` config setting.
     fn install_agent_status_hooks(&self, agent: Option<&'static crate::agents::AgentDef>) {
-        let hooks_enabled = crate::session::config::Config::load()
-            .map(|c| c.session.agent_status_hooks)
-            .unwrap_or(true);
+        let profile = self.effective_profile();
+        let hooks_enabled = super::profile_config::resolve_config_or_warn(&profile)
+            .session
+            .agent_status_hooks;
         if !hooks_enabled {
             return;
         }
         if self.tool == "settl" {
             // settl uses TOML config, not JSON settings
             if let Err(e) = crate::hooks::install_settl_hooks() {
-                tracing::warn!("Failed to install settl hooks: {}", e);
+                tracing::warn!(target: "session.store", "Failed to install settl hooks: {}", e);
             }
         } else if self.tool == "hermes" && !self.is_sandboxed() {
             // Hermes uses YAML config; sandbox path is handled by build_container_config
             if let Some(home) = dirs::home_dir() {
                 let config_path = home.join(".hermes").join("config.yaml");
                 if let Err(e) = crate::hooks::install_hermes_hooks(&config_path) {
-                    tracing::warn!("Failed to install hermes hooks: {}", e);
+                    tracing::warn!(target: "session.store", "Failed to install hermes hooks: {}", e);
                 }
             }
         } else if self.tool == "kiro" && !self.is_sandboxed() {
@@ -1073,7 +1606,22 @@ impl Instance {
                 let config_path = home.join(crate::hooks::KIRO_HOOKS_AGENT_FILE);
                 match crate::hooks::install_kiro_hooks(&config_path) {
                     Ok(()) => crate::hooks::set_kiro_default_agent_if_builtin(),
-                    Err(e) => tracing::warn!("Failed to install kiro hooks: {}", e),
+                    Err(e) => {
+                        tracing::warn!(target: "session.store", "Failed to install kiro hooks: {}", e)
+                    }
+                }
+            }
+        } else if agent.is_some_and(|a| a.name == "codex") && !self.is_sandboxed() {
+            if let Some(hook_cfg) = agent.and_then(|a| a.hook_config.as_ref()) {
+                match self.codex_config_path_for_launch_env() {
+                    Ok(config_path) => {
+                        if let Err(e) =
+                            crate::hooks::install_codex_hooks(&config_path, hook_cfg.events)
+                        {
+                            tracing::warn!("Failed to install codex hooks: {}", e);
+                        }
+                    }
+                    Err(e) => tracing::warn!("Failed to resolve codex config path: {}", e),
                 }
             }
         } else if let Some(hook_cfg) = agent.and_then(|a| a.hook_config.as_ref()) {
@@ -1084,11 +1632,15 @@ impl Instance {
                 if let Some(home) = dirs::home_dir() {
                     let settings_path = home.join(hook_cfg.settings_rel_path);
                     if let Err(e) = crate::hooks::install_hooks(&settings_path, hook_cfg.events) {
-                        tracing::warn!("Failed to install agent hooks: {}", e);
+                        tracing::warn!(target: "session.store", "Failed to install agent hooks: {}", e);
                     }
                 }
             }
         }
+    }
+
+    fn codex_config_path_for_launch_env(&self) -> Result<PathBuf> {
+        crate::hooks::codex_config_path_for_host_environment(&self.profile_host_environment())
     }
 
     /// Build the tmux command for a sandboxed (Docker) session.
@@ -1108,10 +1660,13 @@ impl Instance {
     ) -> Option<String> {
         // Run on_launch hooks on host for non-sandboxed sessions
         if let Some(ref hook_cmds) = on_launch_hooks {
-            if let Err(e) =
-                super::repo_config::execute_hooks(hook_cmds, Path::new(&self.project_path))
-            {
-                tracing::warn!("on_launch hook failed: {}", e);
+            let hook_env = super::repo_config::lifecycle_env_vars(self);
+            if let Err(e) = super::repo_config::execute_hooks(
+                hook_cmds,
+                Path::new(&self.project_path),
+                &hook_env,
+            ) {
+                tracing::warn!(target: "session.store", "on_launch hook failed: {}", e);
             }
         }
 
@@ -1144,6 +1699,7 @@ impl Instance {
                     }
                 }
                 self.apply_session_flags(&mut cmd, "host agent");
+                apply_agent_launch_env(&mut cmd, agent);
                 wrap_command_ignore_suspend(&format!("{}{}", env_prefix, cmd))
             })
         } else {
@@ -1157,6 +1713,7 @@ impl Instance {
                 }
             }
             self.apply_session_flags(&mut cmd, "host custom");
+            apply_agent_launch_env(&mut cmd, agent);
             Some(wrap_command_ignore_suspend(&format!(
                 "{}{}",
                 env_prefix, cmd
@@ -1171,7 +1728,7 @@ impl Instance {
             crate::tmux::env::AOE_INSTANCE_ID_KEY,
             &self.id,
         ) {
-            tracing::warn!("Failed to set AOE_INSTANCE_ID in tmux env: {}", e);
+            tracing::warn!(target: "session.store", "Failed to set AOE_INSTANCE_ID in tmux env: {}", e);
         }
 
         self.persist_session_id(profile);
@@ -1198,12 +1755,12 @@ impl Instance {
                         sandbox.as_ref(),
                     );
                 })) {
-                    tracing::error!("finalize-tmux thread panicked: {:?}", panic);
+                    tracing::error!(target: "session.store", "finalize-tmux thread panicked: {:?}", panic);
                 }
             }) {
             Ok(_handle) => {}
             Err(e) => {
-                tracing::error!(
+                tracing::error!(target: "session.store", 
                     session = %instance_id_for_log,
                     error = %e,
                     "Failed to spawn finalize-tmux thread"
@@ -1274,7 +1831,7 @@ impl Instance {
         container_config::build_container_config(
             &self.project_path,
             sandbox,
-            &self.tool,
+            container_config::ContainerAgentSelection::new(&self.tool, Some(&self.detect_as)),
             self.is_yolo_mode(),
             &self.id,
             self.workspace_info.as_ref(),
@@ -1295,6 +1852,13 @@ impl Instance {
         let mut poller = SessionPoller::new(tmux_session_name.clone());
         let instance_id = self.id.clone();
         let initial_known = self.agent_session_id.clone();
+        // Snapshot per-instance excludes (sids cleared by the resume-fallback
+        // cascade) at poller-spawn time. The cascade always tears down the
+        // existing poller and re-enters this function AFTER inserting into
+        // `retroactive_capture_excludes` (see start_with_resume_fallback),
+        // so the freshly-spawned poller's first immediate poll sees the
+        // populated set and won't re-import the bad sid.
+        let extra_excludes = self.retroactive_capture_excludes.clone();
 
         let poll_fn: Box<dyn Fn() -> Option<String> + Send + 'static> = match tool {
             "claude" => {
@@ -1308,7 +1872,10 @@ impl Instance {
                         self.container_workdir(),
                     ))
                 } else {
-                    Box::new(claude_poll_fn(self.project_path.clone()))
+                    Box::new(claude_poll_fn(
+                        self.project_path.clone(),
+                        initial_known.clone(),
+                    ))
                 }
             }
             "opencode" => {
@@ -1326,12 +1893,14 @@ impl Instance {
                         self.container_workdir(),
                         self.id.clone(),
                         launch_time_ms,
+                        extra_excludes.clone(),
                     ))
                 } else {
                     Box::new(opencode_poll_fn(
                         self.project_path.clone(),
                         self.id.clone(),
                         launch_time_ms,
+                        extra_excludes.clone(),
                     ))
                 }
             }
@@ -1345,9 +1914,14 @@ impl Instance {
                         container_name,
                         self.container_workdir(),
                         self.id.clone(),
+                        extra_excludes.clone(),
                     ))
                 } else {
-                    Box::new(vibe_poll_fn(self.project_path.clone(), self.id.clone()))
+                    Box::new(vibe_poll_fn(
+                        self.project_path.clone(),
+                        self.id.clone(),
+                        extra_excludes.clone(),
+                    ))
                 }
             }
             "pi" => {
@@ -1360,9 +1934,14 @@ impl Instance {
                         container_name,
                         self.container_workdir(),
                         self.id.clone(),
+                        extra_excludes.clone(),
                     ))
                 } else {
-                    Box::new(pi_poll_fn(self.project_path.clone(), self.id.clone()))
+                    Box::new(pi_poll_fn(
+                        self.project_path.clone(),
+                        self.id.clone(),
+                        extra_excludes.clone(),
+                    ))
                 }
             }
             "codex" => {
@@ -1375,9 +1954,14 @@ impl Instance {
                         container_name,
                         self.container_workdir(),
                         self.id.clone(),
+                        extra_excludes.clone(),
                     ))
                 } else {
-                    Box::new(codex_poll_fn(self.project_path.clone(), self.id.clone()))
+                    Box::new(codex_poll_fn(
+                        self.project_path.clone(),
+                        self.id.clone(),
+                        extra_excludes.clone(),
+                    ))
                 }
             }
             "gemini" => {
@@ -1390,9 +1974,14 @@ impl Instance {
                         container_name,
                         self.container_workdir(),
                         self.id.clone(),
+                        extra_excludes.clone(),
                     ))
                 } else {
-                    Box::new(gemini_poll_fn(self.project_path.clone(), self.id.clone()))
+                    Box::new(gemini_poll_fn(
+                        self.project_path.clone(),
+                        self.id.clone(),
+                        extra_excludes.clone(),
+                    ))
                 }
             }
             "hermes" => {
@@ -1405,9 +1994,14 @@ impl Instance {
                         container_name,
                         self.container_workdir(),
                         self.id.clone(),
+                        extra_excludes,
                     ))
                 } else {
-                    Box::new(hermes_poll_fn(self.project_path.clone(), self.id.clone()))
+                    Box::new(hermes_poll_fn(
+                        self.project_path.clone(),
+                        self.id.clone(),
+                        extra_excludes,
+                    ))
                 }
             }
             _ => return,
@@ -1420,7 +2014,7 @@ impl Instance {
             .unwrap_or_default();
 
         let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |new_id: &str| {
-            tracing::info!("Session ID changed for {}: {}", cb_instance_id, new_id);
+            tracing::info!(target: "session.store", "Session ID changed for {}: {}", cb_instance_id, new_id);
             if !cb_tmux_name.is_empty() {
                 publish_session_to_tmux_env(&cb_tmux_name, new_id);
             }
@@ -1429,7 +2023,7 @@ impl Instance {
         if poller.start(instance_id.clone(), poll_fn, on_change, initial_known) {
             self.session_id_poller = Some(Arc::new(Mutex::new(poller)));
         } else {
-            tracing::warn!(
+            tracing::warn!(target: "session.store",
                 "Failed to start session poller for instance {}, poller will not be stored",
                 instance_id
             );
@@ -1445,12 +2039,47 @@ impl Instance {
         }
     }
 
-    pub fn restart(&mut self) -> Result<()> {
-        self.restart_with_size(None)
+    pub fn restart_with_size(&mut self, size: Option<(u16, u16)>) -> Result<StartOutcome> {
+        self.restart_with_size_opts(size, false)
     }
 
-    pub fn restart_with_size(&mut self, size: Option<(u16, u16)>) -> Result<()> {
-        self.restart_with_size_opts(size, false)
+    /// Tear down the current tmux session cleanly so a fresh
+    /// `start_with_size_opts` can recreate it.
+    ///
+    /// `remain-on-exit on` keeps the tmux session alive after the agent
+    /// process exits, leaving a frozen pane. The plain kill-session +
+    /// new-session flow can race against the session cache
+    /// (kill_process_tree on a defunct pid stalls on macOS, and the
+    /// subsequent kill can run while start's exists() check still sees the
+    /// cached entry), leaving the dead pane in place. Respawning the pane
+    /// into a shell first puts it back in a live state so the kill path
+    /// proceeds cleanly. The kill below then sees a live pane and tears it
+    /// down. Caller is responsible for the subsequent
+    /// `start_with_size_opts` to recreate the session with the agent
+    /// command.
+    pub(crate) fn kill_clean(&self) -> Result<()> {
+        let session = self.tmux_session()?;
+        if !session.exists() {
+            return Ok(());
+        }
+        if session.is_pane_dead() {
+            tracing::info!(target: "session.store",
+                "restart: pane dead for session {} (remain-on-exit), \
+                 respawning shell before recreate",
+                session.name()
+            );
+            let shell = super::environment::user_shell();
+            if let Err(e) = session.respawn_dead_pane(&self.project_path, Some(&shell)) {
+                tracing::warn!(target: "session.store",
+                    "respawn_dead_pane failed for {}: {}; falling back to kill+start",
+                    session.name(),
+                    e
+                );
+            }
+        }
+        session.kill()?;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        Ok(())
     }
 
     /// Restart the session, optionally skipping on_launch hooks (e.g. when
@@ -1459,44 +2088,263 @@ impl Instance {
         &mut self,
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
-    ) -> Result<()> {
+    ) -> Result<StartOutcome> {
         self.stop_poller();
         self.session_id_poller = None;
+        self.kill_clean()?;
+        self.start_with_resume_fallback(size, skip_on_launch)
+    }
 
+    /// Settle-based pane probe used by the resume-fallback cascade.
+    ///
+    /// Returns `Dead` immediately if the pane dies or the session evaporates
+    /// during the probe window. Returns `Alive` only after the pane has been
+    /// off the boot shell for `RESUME_PROBE_POST_SHELL_GRACE` consecutive
+    /// time (handles agents whose boot wrapper sits before the agent
+    /// crashes on a bad sid), or charitably on full timeout for slow-start
+    /// agents. `pane_dead` is the unambiguous signal we trust to fire the
+    /// cascade.
+    ///
+    /// For instances using a shell-wrapper command (`/bin/sh -c '...'`,
+    /// agent-override scripts), `is_pane_running_shell` stays true for the
+    /// entire probe and the post-shell grace shortcut never fires. Such
+    /// instances rely exclusively on `pane_dead`: if the wrapper exits
+    /// when the agent crashes, the cascade fires correctly; if the wrapper
+    /// holds the pane open past the agent crash (e.g., trailing `sleep`),
+    /// the cascade misses it. Pathological shape; not worth special-casing.
+    ///
+    /// Latency consequence: shell-wrapper instances therefore burn the full
+    /// `RESUME_PROBE_MAX` on every healthy resume. Real agents settle in
+    /// ~`RESUME_PROBE_POST_SHELL_GRACE`.
+    fn probe_settle(
+        &self,
+        max: std::time::Duration,
+        poll: std::time::Duration,
+    ) -> Result<ProbeResult> {
         let session = self.tmux_session()?;
-
-        if session.exists() {
-            // Dead-pane case: `remain-on-exit on` keeps the tmux session
-            // alive after the agent process exits, leaving a frozen pane.
-            // The plain kill-session + new-session flow can race against
-            // the session cache (kill_process_tree on a defunct pid
-            // stalls on macOS, and the subsequent kill can run while
-            // start's exists() check still sees the cached entry),
-            // leaving the dead pane in place. Respawning the pane into a
-            // shell first puts it back in a live state so the kill path
-            // proceeds cleanly. The kill below then sees a live pane and
-            // tears it down; start_with_size_opts recreates the session
-            // with the agent command.
-            if session.is_pane_dead() {
-                tracing::info!(
-                    "restart: pane dead for session {} (remain-on-exit), \
-                     respawning shell before recreate",
-                    session.name()
-                );
-                let shell = super::environment::user_shell();
-                if let Err(e) = session.respawn_dead_pane(&self.project_path, Some(&shell)) {
-                    tracing::warn!(
-                        "respawn_dead_pane failed for {}: {} -- falling back to kill+start",
-                        session.name(),
-                        e
-                    );
-                }
+        let deadline = std::time::Instant::now() + max;
+        let mut first_post_shell: Option<std::time::Instant> = None;
+        loop {
+            if !session.exists() {
+                return Ok(ProbeResult::Dead);
             }
-            session.kill()?;
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            if session.is_pane_dead() {
+                return Ok(ProbeResult::Dead);
+            }
+            let now = std::time::Instant::now();
+            if !session.is_pane_running_shell() {
+                let started = *first_post_shell.get_or_insert(now);
+                if now.duration_since(started) >= RESUME_PROBE_POST_SHELL_GRACE {
+                    return Ok(ProbeResult::Alive);
+                }
+            } else {
+                first_post_shell = None;
+            }
+            if now >= deadline {
+                return Ok(ProbeResult::Alive);
+            }
+            std::thread::sleep(poll);
+        }
+    }
+
+    /// Start the session with a one-shot resume fallback.
+    ///
+    /// Cascade:
+    ///   1. If a valid `agent_session_id` is set and the agent supports
+    ///      resume, attempt the start (which appends `--resume <sid>` or
+    ///      equivalent). Probe the pane via `probe_settle`.
+    ///   2. If the pane went dead within the probe window, stop the Tier-1
+    ///      poller, tear down the dead tmux session, clear the bad sid
+    ///      (in memory, on disk, and from retroactive-capture re-discovery),
+    ///      and retry the start with `skip_on_launch=true` so on_launch
+    ///      hooks do not run twice. Probe the second pane the same way:
+    ///      `start_with_size_opts` only fails on tmux-subprocess errors, so
+    ///      an in-pane crash (missing binary, broken `docker exec`, agent
+    ///      panic on first run) would otherwise masquerade as
+    ///      `StartOutcome::Restarted` over a corpse pane.
+    ///   3. If the Tier-2 start fails at the tmux level *or* its pane crashes
+    ///      within the probe window, propagate `Err` so the caller's existing
+    ///      `Status::Error` + `last_error` path takes over.
+    ///
+    /// Latency: only fires the probe when `--resume <sid>` is being passed
+    /// to a freshly-created tmux session. Healthy resumes on real agents
+    /// pay `RESUME_PROBE_POST_SHELL_GRACE` (~2s) once on cold start;
+    /// warm sessions and non-resume launches pay nothing. Shell-wrapper
+    /// command overrides pay the full `RESUME_PROBE_MAX` (~3s) on every
+    /// healthy resume because `is_pane_running_shell` never clears for
+    /// them; see `probe_settle`. When the cascade fires, add `kill_clean`
+    /// (~100ms macOS grace) + Tier-2 spawn + a second `RESUME_PROBE_MAX`
+    /// window: ~6-7s total worst-case.
+    ///
+    /// Cockpit-mode sessions short-circuit (no tmux pane to probe).
+    /// `StartOutcome::Fresh` is honest there: cockpit's resume concept lives
+    /// in `cockpit_acp_session_id` and is handled by the ACP supervisor, not
+    /// by this cascade.
+    pub(crate) fn start_with_resume_fallback(
+        &mut self,
+        size: Option<(u16, u16)>,
+        skip_on_launch: bool,
+    ) -> Result<StartOutcome> {
+        // Clear `Status::Error` on entry so a successful relaunch from any
+        // restart surface (REST `ensure_session`, TUI Enter/restart, CLI
+        // `aoe session restart [id|--all]`, cockpit-mode short-circuit)
+        // does not leave a stale error chip up. REST `ensure_session`
+        // re-asserts `status=Starting`, `last_error=None` pre-call as
+        // defense in depth.
+        //
+        // `last_error_check` is cleared alongside `last_error` to mirror
+        // how the field is otherwise managed: `update_status` writes both
+        // together when transitioning into Error (see the write sites
+        // gated on the 30s rate-limit). The clear is functionally inert
+        // today because the only reader is gated on `status == Error` and
+        // we just left Error, but the symmetry is intentional defense
+        // against a future read site that drops that gate.
+        if self.status == Status::Error {
+            self.status = Status::Idle;
+            self.last_error = None;
+            self.last_error_check = None;
         }
 
-        self.start_with_size_opts(size, skip_on_launch)
+        #[cfg(feature = "serve")]
+        if self.cockpit_mode {
+            self.start_with_size_opts(size, skip_on_launch)?;
+            return Ok(StartOutcome::Fresh);
+        }
+
+        let attempting_resume = should_attempt_resume(self.agent_session_id.as_deref(), &self.tool);
+        // Defense in depth: every current caller runs `kill_clean()` (or
+        // its equivalent) first, so this is normally false. It can still
+        // be true if `kill_clean` raced the macOS tmux session cache
+        // (see `Instance::kill_clean` doc): in that case
+        // `start_with_size_opts` no-ops, the probe would have nothing to
+        // detect, and reporting `Fresh` is the least-wrong outcome
+        // (returning `Resumed` would mean lying about a `--resume <sid>`
+        // that was never passed). The debug_assert surfaces the protocol
+        // violation in dev/test if a future caller forgets to tear down;
+        // the tracing::warn! mirrors it in release so the race is visible
+        // in `aoe logs` for diagnosis. The branch on `attempting_resume`
+        // separates the dangerous case (sid was passed but no probe ran,
+        // pane could be left frozen) from the benign one (no resume was
+        // attempted, the race is just kill_clean cache staleness).
+        let pane_was_preexisting = self.tmux_session().is_ok_and(|s| s.exists());
+        if pane_was_preexisting {
+            if attempting_resume {
+                tracing::warn!(
+                    target: "session.store",
+                    instance_id = %self.id,
+                    "start_with_resume_fallback: tmux session still exists on \
+                     entry with attempting_resume=true; cascade skipped, \
+                     returning Fresh. --resume <sid> was passed to \
+                     start_with_size_opts but no probe ran; if the agent \
+                     crashes inside the pane, it will be left frozen.",
+                );
+            } else {
+                tracing::warn!(
+                    target: "session.store",
+                    instance_id = %self.id,
+                    "start_with_resume_fallback: tmux session still exists on \
+                     entry (no resume attempted); cascade skipped, returning \
+                     Fresh. Likely a kill_clean race or caller protocol violation.",
+                );
+            }
+        }
+        debug_assert!(
+            !pane_was_preexisting,
+            "start_with_resume_fallback callers must kill_clean() first; \
+             tmux session for {} still exists on entry",
+            self.id
+        );
+
+        self.start_with_size_opts(size, skip_on_launch)?;
+
+        if !attempting_resume || pane_was_preexisting {
+            return Ok(StartOutcome::Fresh);
+        }
+
+        // Tier-1 settle probe. On Err (rare: only when `tmux_session()`
+        // fails), tear down the Tier-1 poller spawned by the
+        // start_with_size_opts above before propagating, so a transient
+        // tmux failure cannot leak a poller thread onto a presumed-broken
+        // pane.
+        let probe = match self.probe_settle(RESUME_PROBE_MAX, RESUME_PROBE_POLL) {
+            Ok(p) => p,
+            Err(e) => {
+                self.stop_poller();
+                self.session_id_poller = None;
+                return Err(e);
+            }
+        };
+        match probe {
+            ProbeResult::Alive => return Ok(StartOutcome::Resumed),
+            ProbeResult::Dead => {}
+        }
+
+        let stale_sid = self
+            .agent_session_id
+            .clone()
+            .expect("attempting_resume guarantees agent_session_id is Some");
+        let profile = self.effective_profile();
+        tracing::warn!(
+            target: "session.store",
+            "start: resume with sid {} for session {} crashed pane within probe; \
+             clearing sid and retrying without resume",
+            stale_sid,
+            self.id,
+        );
+
+        self.stop_poller();
+        self.session_id_poller = None;
+        self.kill_clean()
+            .with_context(|| format!("kill_clean before resume fallback for {}", self.id))?;
+
+        self.agent_session_id = None;
+        clear_session_id_on_disk(&profile, &self.id);
+        self.retroactive_capture_excludes.insert(stale_sid.clone());
+
+        self.start_with_size_opts(size, true).with_context(|| {
+            format!(
+                "fresh restart after resume fallback failed for {} (stale sid {} was cleared)",
+                self.id, stale_sid,
+            )
+        })?;
+
+        // Tier-2 needs the same settle-probe as Tier-1: tmux can spawn the
+        // pane successfully while the agent inside crashes immediately
+        // (missing binary, gone docker image, agent panic on first run).
+        // Without this, the in-pane crash class - the very class the cascade
+        // exists to surface - would silently report `StartOutcome::Restarted`.
+        // The dead pane is left in tmux; the next user-initiated restart
+        // goes through `restart_with_size_opts` -> `kill_clean` and self-heals.
+        // Tier-2 settle probe. On Err (same rare condition as Tier-1),
+        // tear down the Tier-2 poller spawned by the second
+        // start_with_size_opts before propagating.
+        let probe = match self.probe_settle(RESUME_PROBE_MAX, RESUME_PROBE_POLL) {
+            Ok(p) => p,
+            Err(e) => {
+                self.stop_poller();
+                self.session_id_poller = None;
+                return Err(e);
+            }
+        };
+        if matches!(probe, ProbeResult::Dead) {
+            // Symmetric teardown with the Tier-1->Tier-2 transition above:
+            // the Tier-2 spawn already started a fresh poller via
+            // `finalize_launch`, and bailing without stopping it leaves an
+            // orphan thread polling a dead pane. The pane stays in tmux
+            // (intentional, for `tmux attach` diagnostic on the crash),
+            // but the poller handle must be torn down so callers see a
+            // consistent post-error state.
+            self.stop_poller();
+            self.session_id_poller = None;
+            anyhow::bail!(
+                "fresh restart after resume fallback crashed within probe for {} \
+                 (stale sid {} was cleared; underlying issue persists)",
+                self.id,
+                stale_sid,
+            );
+        }
+
+        Ok(StartOutcome::Restarted { stale_sid })
     }
 
     /// Smart-send precondition: bring this session's tmux pane to a state
@@ -1518,6 +2366,14 @@ impl Instance {
     /// agent's startup splash. Best-effort: returns after the timeout even if
     /// the pane is still settling.
     ///
+    /// Latency: `AlreadyAlive` is ~tmux RTT. The `Respawned` path routes
+    /// through `restart_with_size` -> `start_with_resume_fallback`, which
+    /// on a dead resume-eligible pane can block for the full Tier-1 +
+    /// Tier-2 cascade window (~6-7s; see `start_with_resume_fallback` for
+    /// the breakdown) plus up to 3s of `wait_for_pane_ready` polling.
+    /// Smart-send, TUI Enter, and `aoe send` callers should size timeouts
+    /// and spinner copy accordingly.
+    ///
     /// Note: callers that mutate a clone (e.g. inside `spawn_blocking`) must
     /// sync the post-start state (`status`, `agent_session_id`,
     /// `last_start_time`, `last_error`) back onto the in-memory entry, since
@@ -1533,15 +2389,31 @@ impl Instance {
         }
         let session = self.tmux_session().map_err(EnsureReadyError::Tmux)?;
         if !session.exists() {
-            self.start_with_size(None).map_err(EnsureReadyError::Tmux)?;
-            self.wait_for_pane_ready(&session);
-            return Ok(EnsureReadyOutcome::Started);
-        }
-        if session.is_pane_dead() {
-            self.restart_with_size(None)
+            // Route fresh starts through the cascade so a stale sid loaded
+            // from disk that crashes the agent on launch is detected,
+            // cleared, and retried. Without this, `aoe send` after a tmux
+            // server kill or reboot resurrects the same bad sid the
+            // restart paths exist to recover from.
+            let outcome = self
+                .start_with_resume_fallback(None, false)
                 .map_err(EnsureReadyError::Tmux)?;
             self.wait_for_pane_ready(&session);
-            return Ok(EnsureReadyOutcome::Respawned);
+            let stale_sid = match outcome {
+                StartOutcome::Restarted { stale_sid } => Some(stale_sid),
+                StartOutcome::Resumed | StartOutcome::Fresh => None,
+            };
+            return Ok(EnsureReadyOutcome::Started { stale_sid });
+        }
+        if session.is_pane_dead() {
+            let outcome = self
+                .restart_with_size(None)
+                .map_err(EnsureReadyError::Tmux)?;
+            self.wait_for_pane_ready(&session);
+            let stale_sid = match outcome {
+                StartOutcome::Restarted { stale_sid } => Some(stale_sid),
+                StartOutcome::Resumed | StartOutcome::Fresh => None,
+            };
+            return Ok(EnsureReadyOutcome::Respawned { stale_sid });
         }
         Ok(EnsureReadyOutcome::AlreadyAlive)
     }
@@ -1669,7 +2541,7 @@ impl Instance {
         let session = match self.tmux_session() {
             Ok(s) => s,
             Err(_) => {
-                tracing::trace!(
+                tracing::trace!(target: "session.store",
                     "status '{}': tmux_session() failed, setting Error",
                     self.title
                 );
@@ -1685,7 +2557,7 @@ impl Instance {
         };
 
         if !session.exists() {
-            tracing::trace!(
+            tracing::trace!(target: "session.store",
                 "status '{}': session.exists()=false (tmux name={}), setting Error",
                 self.title,
                 tmux::Session::generate_name(&self.id, &self.title)
@@ -1712,7 +2584,7 @@ impl Instance {
                 tmux::utils::pane_current_command(&name)
             });
 
-        tracing::trace!(
+        tracing::trace!(target: "session.store",
             "status '{}': exists=true, is_dead={}, pane_cmd={:?}, tool={}, cmd_override={}",
             self.title,
             is_dead,
@@ -1721,8 +2593,14 @@ impl Instance {
             self.has_command_override()
         );
 
+        let detection_tool = if self.detect_as.is_empty() {
+            &self.tool
+        } else {
+            &self.detect_as
+        };
+
         if let Some(hook_status) = crate::hooks::read_hook_status(&self.id) {
-            tracing::trace!(
+            tracing::trace!(target: "session.store",
                 "status '{}': hook detected {:?}, is_dead={}",
                 self.title,
                 hook_status,
@@ -1735,20 +2613,31 @@ impl Instance {
                     self.last_error = Some(summarize_error_from_pane(&pane_content));
                 }
             } else {
-                self.status = hook_status;
+                self.status = if detection_tool == "codex" && hook_status == Status::Running {
+                    match session.capture_pane(50) {
+                        Ok(pane_content) => {
+                            tmux::reconcile_codex_hook_status(hook_status, &pane_content)
+                        }
+                        Err(e) => {
+                            tracing::trace!(
+                                "status '{}': codex hook fallback pane capture failed: {}",
+                                self.title,
+                                e
+                            );
+                            hook_status
+                        }
+                    }
+                } else {
+                    hook_status
+                };
                 self.last_error = None;
             }
             return;
         }
 
         let pane_content = session.capture_pane(50).unwrap_or_default();
-        let detection_tool = if self.detect_as.is_empty() {
-            &self.tool
-        } else {
-            &self.detect_as
-        };
         let detected = tmux::detect_status_from_content(&pane_content, detection_tool);
-        tracing::trace!(
+        tracing::trace!(target: "session.store",
             "status '{}': detected={:?}, cmd_override={}, custom_cmd={}",
             self.title,
             detected,
@@ -1764,7 +2653,7 @@ impl Instance {
                 .and_then(|m| m.pane_current_command.as_deref())
                 .map(tmux::utils::is_shell_command)
                 .unwrap_or_else(|| session.is_pane_running_shell());
-            tracing::trace!(
+            tracing::trace!(target: "session.store",
                 "status '{}': is_shell_stale check: expects_shell={}, shell_check={}",
                 self.title,
                 expects,
@@ -1772,42 +2661,22 @@ impl Instance {
             );
             shell_check
         };
-        self.status = match detected {
-            Status::Idle if self.has_command_override() => {
-                // Custom commands run agents through wrapper scripts that appear
-                // as shell processes to tmux. Only declare Error when the pane is
-                // actually dead; don't use is_shell_stale() since the shell IS
-                // the expected wrapper process.
-                if is_dead {
-                    Status::Error
-                } else {
-                    Status::Unknown
-                }
-            }
-            Status::Idle if is_dead => Status::Error,
-            Status::Idle if is_shell_stale() => {
-                // A shell is the foreground process but the pane is alive.
-                // Check captured pane content: if it contains the agent's
-                // UI the agent is still alive; only declare Error when the
-                // content looks like a bare shell prompt.
-                if pane_has_agent_content(&pane_content, &self.tool) {
-                    tracing::trace!(
-                        "status '{}': shell stale but pane has agent content, staying Idle",
-                        self.title,
-                    );
-                    Status::Idle
-                } else {
-                    tracing::trace!(
-                        "status '{}': shell stale, no agent content, setting Error",
-                        self.title,
-                    );
-                    Status::Error
-                }
-            }
-            other => other,
+        let has_command_override = self.has_command_override();
+        let shell_stale = if detected == Status::Idle && !has_command_override && !is_dead {
+            is_shell_stale()
+        } else {
+            false
         };
+        self.status = resolve_detected_status(
+            detected,
+            is_dead,
+            shell_stale,
+            has_command_override,
+            &pane_content,
+            &self.tool,
+        );
 
-        tracing::trace!("status '{}': final={:?}", self.title, self.status);
+        tracing::trace!(target: "session.store", "status '{}': final={:?}", self.title, self.status);
 
         if self.status == Status::Error {
             if self.last_error.is_none() {
@@ -1907,6 +2776,25 @@ fn format_env_var_prefix(key: &str, value: &str, cmd: &str) -> String {
     format!("{}={} {}", key, escaped, cmd)
 }
 
+/// Prepend agent-specific environment overrides to a launch command.
+///
+/// Some terminal agents inherit the parent tmux env, which can carry
+/// `NO_COLOR=1` and silently disable their terminal palettes even though the
+/// web renderer handles ANSI fine. Unsetting `NO_COLOR` and forcing
+/// `TERM=xterm-256color`, `FORCE_COLOR=1`, and
+/// `COLORTERM=truecolor` at launch keeps color on without leaking the override
+/// to other agents.
+fn apply_agent_launch_env(cmd: &mut String, agent: Option<&'static crate::agents::AgentDef>) {
+    if !matches!(agent.map(|a| a.name), Some("antigravity" | "codex")) {
+        return;
+    }
+
+    *cmd = format!(
+        "env -u NO_COLOR TERM=xterm-256color FORCE_COLOR=1 COLORTERM=truecolor {}",
+        cmd
+    );
+}
+
 /// Wrap a command to disable Ctrl-Z (SIGTSTP) suspension.
 ///
 /// When running agents directly as tmux session commands (without a parent shell),
@@ -1955,6 +2843,51 @@ fn prepend_exports(exports: &[String], wrapped: String) -> String {
     }
 }
 
+fn resolve_detected_status(
+    detected: Status,
+    is_dead: bool,
+    is_shell_stale: bool,
+    has_command_override: bool,
+    pane_content: &str,
+    tool: &str,
+) -> Status {
+    match detected {
+        Status::Idle if has_command_override => {
+            // Custom commands run agents through wrapper scripts that appear
+            // as shell processes to tmux. Only declare Error when the pane is
+            // actually dead; don't use shell-stale since the shell IS the
+            // expected wrapper process.
+            if is_dead {
+                Status::Error
+            } else {
+                Status::Unknown
+            }
+        }
+        Status::Idle if is_dead => Status::Error,
+        Status::Idle if is_shell_stale => resolve_shell_stale_status(pane_content, tool),
+        other => other,
+    }
+}
+
+fn resolve_shell_stale_status(pane_content: &str, tool: &str) -> Status {
+    if pane_has_agent_content(pane_content, tool) {
+        Status::Idle
+    } else if pane_looks_like_bare_shell_prompt(pane_content) {
+        Status::Error
+    } else {
+        Status::Unknown
+    }
+}
+
+fn pane_looks_like_bare_shell_prompt(raw_content: &str) -> bool {
+    let clean = crate::tmux::utils::strip_ansi(raw_content);
+    let Some(last) = clean.lines().rev().find(|l| !l.trim().is_empty()) else {
+        return false;
+    };
+    let last = last.trim();
+    last.ends_with('$') || last.ends_with('#') || last.ends_with('%') || last.ends_with('\u{276f}')
+}
+
 /// Check whether captured pane content indicates a living agent rather than
 /// a bare shell prompt. Used to prevent `is_shell_stale()` from producing
 /// false `Error` status when the agent binary is a shell wrapper or spawns
@@ -1967,15 +2900,10 @@ fn pane_has_agent_content(raw_content: &str, tool: &str) -> bool {
         return false;
     }
 
-    // If the last visible line looks like a shell prompt, the agent
-    // likely exited and the shell took over. This catches servers with
-    // verbose MOTD that would otherwise exceed the line-count threshold.
-    let last = non_empty.last().unwrap().trim();
-    if last.ends_with('$')
-        || last.ends_with('#')
-        || last.ends_with('%')
-        || last.ends_with('\u{276f}')
-    {
+    // If the last visible line looks like a shell prompt, the agent likely
+    // exited and the shell took over. This catches servers with verbose MOTD
+    // that would otherwise exceed the line-count threshold.
+    if pane_looks_like_bare_shell_prompt(raw_content) {
         return false;
     }
 
@@ -1988,11 +2916,17 @@ fn pane_has_agent_content(raw_content: &str, tool: &str) -> bool {
 
     // Use word-boundary matching so short names like "pi" don't produce
     // false positives inside words like "api" or "pipeline".
-    let tool_lower = tool.to_lowercase();
+    let mut tool_names = vec![tool.to_lowercase()];
+    if let Some(agent) = crate::agents::get_agent(tool) {
+        let binary = agent.binary.to_lowercase();
+        if !tool_names.contains(&binary) {
+            tool_names.push(binary);
+        }
+    }
     let lower = clean.to_lowercase();
     if lower
         .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
-        .any(|word| word == tool_lower)
+        .any(|word| tool_names.iter().any(|name| word == name))
     {
         return true;
     }
@@ -2004,6 +2938,23 @@ fn pane_has_agent_content(raw_content: &str, tool: &str) -> bool {
 mod tests {
     use super::*;
 
+    struct CodexHomeGuard(Option<String>);
+    impl CodexHomeGuard {
+        fn unset() -> Self {
+            let prev = std::env::var("CODEX_HOME").ok();
+            std::env::remove_var("CODEX_HOME");
+            Self(prev)
+        }
+    }
+    impl Drop for CodexHomeGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("CODEX_HOME", v),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+        }
+    }
+
     #[test]
     fn test_new_instance() {
         let inst = Instance::new("test", "/tmp/test");
@@ -2014,12 +2965,641 @@ mod tests {
     }
 
     #[test]
+    fn test_codex_gets_status_hook_env_prefix() {
+        let agent = crate::agents::get_agent("codex");
+        assert_eq!(
+            status_hook_env_prefix("abc123", "codex", agent),
+            "AOE_INSTANCE_ID=abc123 "
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_custom_codex_detected_agent_uses_codex_hook_installer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _codex_home_guard = CodexHomeGuard::unset();
+        std::env::set_var("HOME", tmp.path());
+        #[cfg(target_os = "linux")]
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+
+        let mut inst = Instance::new("wrapped", "/tmp/test");
+        inst.tool = "my-codex-wrapper".to_string();
+        inst.detect_as = "codex".to_string();
+        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
+
+        let config_path = tmp.path().join(".codex").join("config.toml");
+        let config = std::fs::read_to_string(config_path).unwrap();
+        assert!(config.contains("[[hooks.PreToolUse]]"));
+        assert!(config.contains("aoe-hooks"));
+        assert!(!tmp.path().join(".codex").join("hooks.json").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_codex_hook_installer_uses_profile_codex_home() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _codex_home_guard = CodexHomeGuard::unset();
+        std::env::set_var("HOME", tmp.path());
+        #[cfg(target_os = "linux")]
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+
+        let codex_home = tmp.path().join("profile-codex-home");
+        let profile_dir = crate::session::get_profile_dir("codex-profile").unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            format!("environment = [\"CODEX_HOME={}\"]\n", codex_home.display()),
+        )
+        .unwrap();
+
+        let mut inst = Instance::new("codex", "/tmp/test");
+        inst.tool = "codex".to_string();
+        inst.detect_as = "codex".to_string();
+        inst.source_profile = "codex-profile".to_string();
+        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
+
+        let config_path = codex_home.join("config.toml");
+        let config = std::fs::read_to_string(config_path).unwrap();
+        assert!(config.contains("[[hooks.PreToolUse]]"));
+        assert!(config.contains("aoe-hooks"));
+        assert!(!tmp.path().join(".codex").join("config.toml").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_codex_hook_installer_respects_profile_hooks_disabled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _codex_home_guard = CodexHomeGuard::unset();
+        std::env::set_var("HOME", tmp.path());
+        #[cfg(target_os = "linux")]
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+
+        let profile_dir = crate::session::get_profile_dir("hooks-disabled").unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            "[session]\nagent_status_hooks = false\n",
+        )
+        .unwrap();
+
+        let mut inst = Instance::new("codex", "/tmp/test");
+        inst.tool = "codex".to_string();
+        inst.detect_as = "codex".to_string();
+        inst.source_profile = "hooks-disabled".to_string();
+        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
+
+        assert!(!tmp.path().join(".codex").join("config.toml").exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_codex_hook_installer_respects_profile_hooks_enabled() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _codex_home_guard = CodexHomeGuard::unset();
+        std::env::set_var("HOME", tmp.path());
+        #[cfg(target_os = "linux")]
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+
+        let mut global = crate::session::config::Config::default();
+        global.session.agent_status_hooks = false;
+        crate::session::config::save_config(&global).unwrap();
+
+        let profile_dir = crate::session::get_profile_dir("hooks-enabled").unwrap();
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            "[session]\nagent_status_hooks = true\n",
+        )
+        .unwrap();
+
+        let mut inst = Instance::new("codex", "/tmp/test");
+        inst.tool = "codex".to_string();
+        inst.detect_as = "codex".to_string();
+        inst.source_profile = "hooks-enabled".to_string();
+        inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
+
+        let config_path = tmp.path().join(".codex").join("config.toml");
+        let config = std::fs::read_to_string(config_path).unwrap();
+        assert!(config.contains("[[hooks.PreToolUse]]"));
+        assert!(config.contains("aoe-hooks"));
+    }
+
+    #[test]
     fn test_is_sub_session() {
         let mut inst = Instance::new("test", "/tmp/test");
         assert!(!inst.is_sub_session());
 
         inst.parent_session_id = Some("parent123".to_string());
         assert!(inst.is_sub_session());
+    }
+
+    /// `touch_last_accessed` is what `aoe send` and the TUI dispatch path
+    /// call when the user interacts with a session. It must auto-wake
+    /// archived and snoozed rows so sending a message to a sunk session
+    /// brings it back, while preserving the favorite flag (favorite is a
+    /// positive "care more" signal, not a sink state).
+    #[test]
+    fn test_touch_last_accessed_clears_archived() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.archive();
+        assert!(inst.is_archived());
+        inst.touch_last_accessed();
+        assert!(!inst.is_archived());
+        assert!(inst.last_accessed_at.is_some());
+    }
+
+    #[test]
+    fn test_touch_last_accessed_clears_snooze() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.snooze(30);
+        assert!(inst.is_snoozed());
+        inst.touch_last_accessed();
+        assert!(!inst.is_snoozed());
+    }
+
+    #[test]
+    fn test_touch_last_accessed_preserves_favorite() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.favorite();
+        assert!(inst.is_favorited());
+        inst.touch_last_accessed();
+        // Favorite is orthogonal to sink states; user interaction must not
+        // clear it.
+        assert!(inst.is_favorited());
+    }
+
+    #[test]
+    fn test_merge_post_start_preserves_peer_field_writes() {
+        let mut stored = Instance::new("session", "/tmp/test");
+        stored.archive();
+        stored.agent_session_id = Some("daemon-sid".to_string());
+
+        let mut working = Instance::new("session", "/tmp/test");
+        working.id = stored.id.clone();
+        working.status = Status::Starting;
+
+        stored.merge_post_start(&working);
+
+        assert_eq!(stored.status, Status::Starting);
+        assert!(stored.is_archived(), "peer archive must survive merge");
+        assert_eq!(
+            stored.agent_session_id.as_deref(),
+            Some("daemon-sid"),
+            "peer-written sid must survive merge"
+        );
+    }
+
+    #[test]
+    fn test_merge_post_restart_no_fallback_preserves_sid() {
+        let mut stored = Instance::new("session", "/tmp/test");
+        stored.agent_session_id = Some("peer-fresh-sid".to_string());
+        stored.snooze(15);
+
+        let mut working = Instance::new("session", "/tmp/test");
+        working.id = stored.id.clone();
+        working.status = Status::Idle;
+        working.agent_session_id = Some("phase1-stale-sid".to_string());
+
+        stored.merge_post_restart(&working, None);
+
+        assert_eq!(stored.status, Status::Idle);
+        assert_eq!(
+            stored.agent_session_id.as_deref(),
+            Some("peer-fresh-sid"),
+            "no-fallback restart must not clobber peer sid write"
+        );
+        assert!(stored.is_snoozed(), "peer snooze must survive merge");
+    }
+
+    #[test]
+    fn test_merge_post_restart_fallback_clears_matching_sid() {
+        let mut stored = Instance::new("session", "/tmp/test");
+        stored.agent_session_id = Some("phase1-stale-sid".to_string());
+
+        let mut working = Instance::new("session", "/tmp/test");
+        working.id = stored.id.clone();
+        working.status = Status::Starting;
+        working.agent_session_id = None;
+
+        stored.merge_post_restart(&working, Some("phase1-stale-sid"));
+
+        assert!(
+            stored.agent_session_id.is_none(),
+            "stored sid still equals stale; cascade invalidation propagates"
+        );
+    }
+
+    #[test]
+    fn test_merge_post_restart_preserves_poller_sid_landed_during_phase_2() {
+        let mut stored = Instance::new("session", "/tmp/test");
+        stored.agent_session_id = Some("poller-fresh-sid".to_string());
+
+        let mut working = Instance::new("session", "/tmp/test");
+        working.id = stored.id.clone();
+        working.status = Status::Starting;
+        working.agent_session_id = None;
+
+        stored.merge_post_restart(&working, Some("phase1-stale-sid"));
+
+        assert_eq!(
+            stored.agent_session_id.as_deref(),
+            Some("poller-fresh-sid"),
+            "poller wrote a fresh sid between phase 2 and phase 3; CAS preserves it"
+        );
+    }
+
+    #[test]
+    fn test_merge_diff_peer_archive_loses_to_tui_favorite() {
+        let pre = Instance::new("s", "/tmp/x");
+        let mut post = pre.clone();
+        post.favorite();
+
+        let mut disk = pre.clone();
+        disk.archive();
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(disk.favorited_at.is_some(), "TUI favorite landed");
+        assert!(
+            disk.archived_at.is_none(),
+            "favorite() invariant must clear concurrent peer archive"
+        );
+    }
+
+    #[test]
+    fn test_merge_diff_peer_favorite_loses_to_tui_archive() {
+        let pre = Instance::new("s", "/tmp/x");
+        let mut post = pre.clone();
+        post.archive();
+
+        let mut disk = pre.clone();
+        disk.favorite();
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(disk.archived_at.is_some(), "TUI archive landed");
+        assert!(
+            disk.favorited_at.is_none(),
+            "archive() invariant must clear concurrent peer favorite"
+        );
+    }
+
+    #[test]
+    fn test_merge_diff_peer_archive_loses_to_tui_touch() {
+        let pre = Instance::new("s", "/tmp/x");
+        let mut post = pre.clone();
+        post.touch_last_accessed();
+
+        let mut disk = pre.clone();
+        disk.archive();
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(
+            disk.archived_at.is_none(),
+            "touch_last_accessed() invariant must clear concurrent peer archive"
+        );
+    }
+
+    #[test]
+    fn test_merge_diff_peer_touch_clears_tui_archive() {
+        let mut pre = Instance::new("s", "/tmp/x");
+        pre.last_accessed_at = Some(Utc::now() - chrono::Duration::seconds(60));
+
+        let mut post = pre.clone();
+        post.archive();
+
+        let mut disk = pre.clone();
+        disk.touch_last_accessed();
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(
+            disk.archived_at.is_none(),
+            "peer touch (newer last_accessed_at) must dethrone TUI archive per messaging-unarchives rule"
+        );
+    }
+
+    #[test]
+    fn test_merge_diff_peer_archive_clears_concurrent_tui_snooze() {
+        // The web/TUI/CLI contract treats pinned/archived/snoozed as
+        // mutually exclusive (the sidebar tier comparator assumes a
+        // single active triage state, see #1581). When a TUI snooze
+        // races a peer archive, archive wins: snooze is a temporary
+        // sink and archive is the indefinite one, so leaving both set
+        // would surface contradictory triage state on the next render.
+        let pre = Instance::new("s", "/tmp/x");
+        let mut post = pre.clone();
+        post.snooze(15);
+
+        let mut disk = pre.clone();
+        disk.archive();
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(disk.archived_at.is_some(), "peer archive survives");
+        assert!(
+            disk.snoozed_until.is_none(),
+            "archive() invariant must clear a concurrent TUI snooze"
+        );
+    }
+
+    #[test]
+    fn test_archive_clears_snooze() {
+        // Direct mutator test (no merge): the data-layer contract is
+        // that archive is mutually exclusive with every other triage
+        // flag. The sidebar tier comparator in `sidebarSort.ts`
+        // assumes the server enforces exactly one active state, so a
+        // snooze-then-archive transition must leave only archive
+        // behind. See #1581.
+        let mut inst = Instance::new("s", "/tmp/x");
+        inst.snooze(15);
+        assert!(inst.is_snoozed());
+        inst.archive();
+        assert!(inst.is_archived());
+        assert!(!inst.is_snoozed());
+    }
+
+    #[test]
+    fn test_merge_diff_tui_unfavorite_does_not_resurrect_peer_archive() {
+        let mut pre = Instance::new("s", "/tmp/x");
+        pre.favorite();
+
+        let mut post = pre.clone();
+        post.unfavorite();
+
+        let mut disk = pre.clone();
+        disk.archive();
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(disk.favorited_at.is_none(), "TUI unfavorite landed");
+        assert!(
+            disk.archived_at.is_some(),
+            "post.favorited_at == None; favorite-invariant rule must NOT fire"
+        );
+    }
+
+    #[test]
+    fn test_merge_diff_uses_self_not_post_for_touch_detection() {
+        let mut pre = Instance::new("s", "/tmp/x");
+        pre.last_accessed_at = Some(Utc::now() - chrono::Duration::seconds(60));
+        pre.archived_at = Some(Utc::now() - chrono::Duration::seconds(120));
+
+        let mut post = pre.clone();
+        post.title = "renamed".into();
+
+        let mut disk = pre.clone();
+        disk.touch_last_accessed();
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert_eq!(disk.title, "renamed");
+        assert!(disk.archived_at.is_none());
+    }
+
+    #[test]
+    fn test_pin_clears_archive_and_snooze() {
+        let mut inst = Instance::new("s", "/tmp/x");
+        inst.archive();
+        assert!(inst.is_archived());
+        inst.pin();
+        assert!(inst.is_pinned());
+        assert!(!inst.is_archived());
+        assert!(!inst.is_snoozed());
+
+        inst.snooze(15);
+        assert!(inst.is_snoozed());
+        inst.pin();
+        assert!(inst.is_pinned());
+        assert!(!inst.is_snoozed());
+    }
+
+    #[test]
+    fn test_archive_clears_pin() {
+        let mut inst = Instance::new("s", "/tmp/x");
+        inst.pin();
+        assert!(inst.is_pinned());
+        inst.archive();
+        assert!(inst.is_archived());
+        assert!(!inst.is_pinned());
+    }
+
+    #[test]
+    fn test_snooze_clears_pin() {
+        let mut inst = Instance::new("s", "/tmp/x");
+        inst.pin();
+        assert!(inst.is_pinned());
+        inst.snooze(30);
+        assert!(inst.is_snoozed());
+        assert!(!inst.is_pinned());
+    }
+
+    #[test]
+    fn test_touch_last_accessed_preserves_pin() {
+        let mut inst = Instance::new("s", "/tmp/x");
+        inst.pin();
+        assert!(inst.is_pinned());
+        inst.touch_last_accessed();
+        // Pin is an explicit user surfacing signal, not a sink state.
+        // User interaction (send, attach) must NOT clear it.
+        assert!(inst.is_pinned());
+    }
+
+    #[test]
+    fn test_pin_and_favorite_coexist() {
+        let mut inst = Instance::new("s", "/tmp/x");
+        inst.favorite();
+        assert!(inst.is_favorited());
+        inst.pin();
+        // Pin and favorite drive different surfaces (TUI Attention vs web
+        // sidebar). They must coexist; pinning does NOT clear favorite.
+        assert!(inst.is_pinned());
+        assert!(inst.is_favorited());
+
+        let mut inst2 = Instance::new("s2", "/tmp/x");
+        inst2.pin();
+        inst2.favorite();
+        // Same in reverse: favoriting does NOT clear pin.
+        assert!(inst2.is_pinned());
+        assert!(inst2.is_favorited());
+    }
+
+    #[test]
+    fn test_merge_diff_peer_archive_loses_to_tui_pin() {
+        let pre = Instance::new("s", "/tmp/x");
+        let mut post = pre.clone();
+        post.pin();
+
+        let mut disk = pre.clone();
+        disk.archive();
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(disk.pinned_at.is_some(), "TUI pin landed");
+        assert!(
+            disk.archived_at.is_none(),
+            "pin() invariant must clear concurrent peer archive"
+        );
+    }
+
+    #[test]
+    fn test_merge_diff_peer_pin_loses_to_tui_archive() {
+        let pre = Instance::new("s", "/tmp/x");
+        let mut post = pre.clone();
+        post.archive();
+
+        let mut disk = pre.clone();
+        disk.pin();
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(disk.archived_at.is_some(), "TUI archive landed");
+        assert!(
+            disk.pinned_at.is_none(),
+            "archive() invariant must clear concurrent peer pin"
+        );
+    }
+
+    #[test]
+    fn test_merge_diff_peer_pin_loses_to_tui_snooze() {
+        let pre = Instance::new("s", "/tmp/x");
+        let mut post = pre.clone();
+        post.snooze(30);
+
+        let mut disk = pre.clone();
+        disk.pin();
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(disk.snoozed_until.is_some(), "TUI snooze landed");
+        assert!(
+            disk.pinned_at.is_none(),
+            "snooze() invariant must clear concurrent peer pin"
+        );
+    }
+
+    #[test]
+    fn test_merge_diff_peer_touch_preserves_pin() {
+        let mut pre = Instance::new("s", "/tmp/x");
+        pre.last_accessed_at = Some(Utc::now() - chrono::Duration::seconds(60));
+
+        let mut post = pre.clone();
+        post.pin();
+
+        let mut disk = pre.clone();
+        disk.touch_last_accessed();
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        // Touch dethrones archive/snooze but NOT pin: pin is an explicit
+        // surfacing signal that the user's interaction does not contradict.
+        assert!(
+            disk.pinned_at.is_some(),
+            "peer touch must NOT clear concurrent TUI pin"
+        );
+    }
+
+    #[test]
+    fn test_merge_from_tui_copies_status_pipeline() {
+        let mut stored = Instance::new("session", "/tmp/test");
+        stored.status = Status::Idle;
+
+        let mut src = Instance::new("session", "/tmp/test");
+        src.id = stored.id.clone();
+        src.status = Status::Running;
+        src.idle_entered_at = Some(Utc::now());
+
+        stored.merge_from_tui(&src);
+
+        assert_eq!(stored.status, Status::Running);
+        assert_eq!(stored.idle_entered_at, src.idle_entered_at);
+    }
+
+    #[test]
+    fn test_merge_from_tui_takes_max_last_accessed() {
+        let earlier = Utc::now() - chrono::Duration::minutes(5);
+        let later = Utc::now();
+
+        let mut stored = Instance::new("a", "/tmp/a");
+        stored.last_accessed_at = Some(later);
+        let mut src = Instance::new("a", "/tmp/a");
+        src.id = stored.id.clone();
+        src.last_accessed_at = Some(earlier);
+        stored.merge_from_tui(&src);
+        assert_eq!(
+            stored.last_accessed_at,
+            Some(later),
+            "peer's freshest activity timestamp must survive a stale TUI src"
+        );
+
+        let mut stored = Instance::new("b", "/tmp/b");
+        stored.last_accessed_at = Some(earlier);
+        let mut src = Instance::new("b", "/tmp/b");
+        src.id = stored.id.clone();
+        src.last_accessed_at = Some(later);
+        stored.merge_from_tui(&src);
+        assert_eq!(stored.last_accessed_at, Some(later));
+    }
+
+    #[test]
+    fn test_merge_from_tui_does_not_touch_user_action_fields() {
+        let peer_archived = Some(Utc::now());
+        let peer_favorited = Some(Utc::now() - chrono::Duration::minutes(2));
+        let peer_snoozed = Some(Utc::now() + chrono::Duration::minutes(30));
+        let peer_pinned = Some(Utc::now() - chrono::Duration::minutes(1));
+
+        let mut stored = Instance::new("session", "/tmp/test");
+        stored.archived_at = peer_archived;
+        stored.favorited_at = peer_favorited;
+        stored.snoozed_until = peer_snoozed;
+        stored.pinned_at = peer_pinned;
+        stored.title = "peer-renamed".to_string();
+        stored.group_path = "peer/group".to_string();
+        stored.agent_session_id = Some("daemon-sid".to_string());
+        stored.notify_on_waiting = Some(true);
+        stored.base_branch_override = Some("upstream/main".to_string());
+
+        let mut src = Instance::new("session", "/tmp/test");
+        src.id = stored.id.clone();
+        src.archived_at = None;
+        src.favorited_at = None;
+        src.snoozed_until = None;
+        src.pinned_at = None;
+        src.title = "tui-stale".to_string();
+        src.group_path = "tui/stale".to_string();
+        src.agent_session_id = Some("tui-stale-sid".to_string());
+        src.notify_on_waiting = Some(false);
+        src.base_branch_override = None;
+
+        stored.merge_from_tui(&src);
+
+        assert_eq!(stored.archived_at, peer_archived);
+        assert_eq!(stored.favorited_at, peer_favorited);
+        assert_eq!(stored.snoozed_until, peer_snoozed);
+        assert_eq!(stored.pinned_at, peer_pinned);
+        assert_eq!(stored.title, "peer-renamed");
+        assert_eq!(stored.group_path, "peer/group");
+        assert_eq!(stored.agent_session_id.as_deref(), Some("daemon-sid"));
+        assert_eq!(stored.notify_on_waiting, Some(true));
+        assert_eq!(
+            stored.base_branch_override.as_deref(),
+            Some("upstream/main")
+        );
+    }
+
+    #[test]
+    fn test_merge_from_tui_preserves_immutable_identity() {
+        let mut stored = Instance::new("session", "/tmp/test");
+        let immutable_id = stored.id.clone();
+        let immutable_path = stored.project_path.clone();
+        let immutable_created = stored.created_at;
+
+        let mut src = Instance::new("renamed", "/tmp/different");
+        src.id = "different-id".to_string();
+
+        stored.merge_from_tui(&src);
+
+        assert_eq!(stored.id, immutable_id);
+        assert_eq!(stored.project_path, immutable_path);
+        assert_eq!(stored.created_at, immutable_created);
     }
 
     #[test]
@@ -2974,10 +4554,129 @@ mod tests {
     }
 
     #[test]
+    fn test_build_host_command_antigravity_forces_color() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "antigravity".to_string();
+        let cmd = inst.build_host_command(crate::agents::get_agent("antigravity"), &None);
+        let cmd_str = cmd.unwrap();
+
+        assert!(cmd_str.contains("env -u NO_COLOR"));
+        assert!(cmd_str.contains("TERM=xterm-256color"));
+        assert!(cmd_str.contains("FORCE_COLOR=1"));
+        assert!(cmd_str.contains("COLORTERM=truecolor"));
+        assert!(cmd_str.contains("agy"));
+    }
+
+    #[test]
+    fn test_build_host_custom_command_antigravity_forces_color() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "antigravity".to_string();
+        inst.command = "agy --some-flag".to_string();
+        let cmd = inst.build_host_command(crate::agents::get_agent("antigravity"), &None);
+        let cmd_str = cmd.unwrap();
+
+        assert!(cmd_str.contains("env -u NO_COLOR"));
+        assert!(cmd_str.contains("TERM=xterm-256color"));
+        assert!(cmd_str.contains("FORCE_COLOR=1"));
+        assert!(cmd_str.contains("COLORTERM=truecolor"));
+        assert!(cmd_str.contains("agy --some-flag"));
+    }
+
+    #[test]
+    fn test_build_host_command_codex_forces_color() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "codex".to_string();
+        let cmd = inst.build_host_command(crate::agents::get_agent("codex"), &None);
+        let cmd_str = cmd.unwrap();
+
+        assert!(cmd_str.contains("env -u NO_COLOR"));
+        assert!(cmd_str.contains("TERM=xterm-256color"));
+        assert!(cmd_str.contains("FORCE_COLOR=1"));
+        assert!(cmd_str.contains("COLORTERM=truecolor"));
+        assert!(cmd_str.contains("codex"));
+    }
+
+    #[test]
+    fn test_build_host_command_color_env_is_limited_to_color_sensitive_agents() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "cursor".to_string();
+        let cmd = inst.build_host_command(crate::agents::get_agent("cursor"), &None);
+        let cmd_str = cmd.unwrap();
+
+        assert!(!cmd_str.contains("env -u NO_COLOR"));
+        assert!(!cmd_str.contains("TERM=xterm-256color"));
+        assert!(!cmd_str.contains("FORCE_COLOR=1"));
+        assert!(!cmd_str.contains("COLORTERM=truecolor"));
+    }
+
+    #[test]
     fn test_pane_has_agent_content_bare_shell() {
         assert!(!pane_has_agent_content("$ ", "opencode"));
         assert!(!pane_has_agent_content("user@host:~$ ", "opencode"));
         assert!(!pane_has_agent_content("\n\n$ \n", "opencode"));
+    }
+
+    #[test]
+    fn test_resolve_detected_status_shell_stale_agent_content_stays_idle() {
+        let content = "ctrl+p commands \u{2022} OpenCode 1.3.13+650d0db";
+        assert_eq!(
+            resolve_detected_status(Status::Idle, false, true, false, content, "opencode"),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_resolve_detected_status_shell_stale_bare_prompt_is_error() {
+        assert_eq!(
+            resolve_detected_status(
+                Status::Idle,
+                false,
+                true,
+                false,
+                "Welcome\nuser@host:~$ ",
+                "opencode",
+            ),
+            Status::Error
+        );
+    }
+
+    #[test]
+    fn test_resolve_detected_status_shell_stale_unclear_is_unknown() {
+        assert_eq!(
+            resolve_detected_status(
+                Status::Idle,
+                false,
+                true,
+                false,
+                "Restoring previous session...",
+                "opencode",
+            ),
+            Status::Unknown
+        );
+        assert_eq!(
+            resolve_detected_status(Status::Idle, false, true, false, "", "opencode"),
+            Status::Unknown
+        );
+    }
+
+    #[test]
+    fn test_resolve_detected_status_keeps_hard_failures_as_error() {
+        assert_eq!(
+            resolve_detected_status(Status::Idle, true, false, false, "", "opencode"),
+            Status::Error
+        );
+        assert_eq!(
+            resolve_detected_status(Status::Idle, true, true, true, "", "opencode"),
+            Status::Error
+        );
+    }
+
+    #[test]
+    fn test_resolve_detected_status_live_command_override_is_unknown() {
+        assert_eq!(
+            resolve_detected_status(Status::Idle, false, true, true, "$ ", "opencode"),
+            Status::Unknown
+        );
     }
 
     #[test]
@@ -3037,6 +4736,11 @@ mod tests {
 
         // Longer names like "opencode" should still match.
         assert!(pane_has_agent_content("OpenCode v1.0", "opencode"));
+    }
+
+    #[test]
+    fn test_pane_has_agent_content_matches_agent_binary_alias() {
+        assert!(pane_has_agent_content("agy ready", "antigravity"));
     }
 
     mod kill_terminal_if_dead {
@@ -3165,6 +4869,359 @@ mod tests {
             );
 
             cleanup(&name);
+        }
+    }
+
+    mod resume_fallback {
+        use super::super::{
+            clear_session_id_on_disk, should_attempt_resume, Instance, StartOutcome, Status,
+        };
+        use serial_test::serial;
+        use tempfile::tempdir;
+
+        #[test]
+        fn no_sid_does_not_attempt_resume() {
+            assert!(!should_attempt_resume(None, "claude"));
+            assert!(!should_attempt_resume(Some(""), "claude"));
+            assert!(!should_attempt_resume(Some("   "), "claude"));
+        }
+
+        #[test]
+        fn invalid_sid_does_not_attempt_resume() {
+            assert!(!should_attempt_resume(Some("bad id!"), "claude"));
+            assert!(!should_attempt_resume(Some("path/slash"), "claude"));
+            assert!(!should_attempt_resume(Some(&"x".repeat(257)), "claude"));
+        }
+
+        #[test]
+        fn valid_sid_for_resume_supporting_agent_attempts() {
+            assert!(should_attempt_resume(
+                Some("11111111-1111-1111-1111-111111111111"),
+                "claude"
+            ));
+            assert!(should_attempt_resume(Some("session_abc.123"), "opencode"));
+            assert!(should_attempt_resume(Some("uuid-abc-123"), "codex"));
+            assert!(should_attempt_resume(Some("uuid-abc-123"), "gemini"));
+        }
+
+        #[test]
+        fn unsupported_agent_does_not_attempt_resume() {
+            assert!(!should_attempt_resume(
+                Some("11111111-1111-1111-1111-111111111111"),
+                "cursor"
+            ));
+            assert!(!should_attempt_resume(
+                Some("11111111-1111-1111-1111-111111111111"),
+                "copilot"
+            ));
+        }
+
+        #[test]
+        fn unknown_tool_does_not_attempt_resume() {
+            assert!(!should_attempt_resume(Some("uuid-abc-123"), "nonexistent"));
+        }
+
+        #[test]
+        #[serial]
+        fn clear_session_id_on_disk_is_idempotent_when_already_none() {
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(target_os = "linux")]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let storage =
+                crate::session::storage::Storage::new("test-profile-already-none").unwrap();
+            let inst = Instance::new("title", "/tmp/x");
+            let id = inst.id.clone();
+            assert!(inst.agent_session_id.is_none());
+            let xs = vec![inst];
+            storage
+                .update(|i, g| {
+                    *i = xs.to_vec();
+                    *g = crate::session::GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+
+            clear_session_id_on_disk("test-profile-already-none", &id);
+
+            let loaded = storage.load().unwrap();
+            assert_eq!(loaded.len(), 1);
+            assert_eq!(loaded[0].agent_session_id, None);
+            assert_eq!(loaded[0].id, id);
+        }
+
+        #[test]
+        #[serial]
+        fn clear_session_id_on_disk_clears_persisted_value() {
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(target_os = "linux")]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let storage = crate::session::storage::Storage::new("clear-test").unwrap();
+            let mut inst = Instance::new("title", "/tmp/x");
+            inst.agent_session_id = Some("stale-uuid-1234".to_string());
+            let id = inst.id.clone();
+            let xs = vec![inst];
+            storage
+                .update(|i, g| {
+                    *i = xs.to_vec();
+                    *g = crate::session::GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+
+            clear_session_id_on_disk("clear-test", &id);
+
+            let loaded = storage.load().unwrap();
+            assert_eq!(loaded.len(), 1);
+            assert_eq!(loaded[0].agent_session_id, None);
+        }
+
+        #[cfg(feature = "serve")]
+        #[test]
+        #[serial]
+        fn restart_outcome_for_cockpit_session_is_fresh() {
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(target_os = "linux")]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let mut inst = Instance::new("cockpit_test", "/tmp/x");
+            inst.cockpit_mode = true;
+            inst.agent_session_id = Some("11111111-1111-1111-1111-111111111111".to_string());
+            inst.tool = "claude".to_string();
+
+            let outcome = inst.start_with_resume_fallback(None, true).unwrap();
+            assert_eq!(outcome, StartOutcome::Fresh);
+        }
+
+        #[test]
+        #[serial]
+        fn fallback_clears_sid_in_memory_and_on_disk_when_pane_dies() {
+            if std::process::Command::new("tmux")
+                .arg("-V")
+                .output()
+                .is_err()
+            {
+                eprintln!("tmux not available; skipping");
+                return;
+            }
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(target_os = "linux")]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let storage = crate::session::storage::Storage::new("fb-test").unwrap();
+
+            let stale_sid = "11111111-1111-1111-1111-111111111111".to_string();
+            let mut inst = Instance::new("fallback_dies_test", "/tmp/x");
+            inst.tool = "claude".to_string();
+            inst.source_profile = "fb-test".to_string();
+            inst.command = "/bin/false".to_string();
+            inst.agent_session_id = Some(stale_sid.clone());
+            inst.status = Status::Idle;
+            let id = inst.id.clone();
+
+            let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &tmux_name])
+                .output();
+
+            let xs = vec![inst.clone()];
+            storage
+                .update(|i, g| {
+                    *i = xs.to_vec();
+                    *g = crate::session::GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+
+            let outcome = inst.start_with_resume_fallback(None, true);
+
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &tmux_name])
+                .output();
+
+            let err = outcome
+                .expect_err("Tier-2 with /bin/false must crash within probe and propagate Err");
+            let chain = format!("{:#}", err);
+            assert!(
+                chain.contains("crashed within probe") && chain.contains(&stale_sid),
+                "Tier-2 probe failure must surface the stale sid in its error chain, got: {chain}",
+            );
+
+            assert!(
+                inst.retroactive_capture_excludes.contains(&stale_sid),
+                "stale sid must be in exclusion set even when Tier-2 ultimately fails: \
+                 the cleanup happens before the Tier-2 attempt and must survive the bail",
+            );
+            assert_ne!(
+                inst.agent_session_id.as_deref(),
+                Some(stale_sid.as_str()),
+                "stale sid must not survive in memory after fallback, even on Tier-2 failure",
+            );
+            let loaded = storage.load().unwrap();
+            let row = loaded.iter().find(|i| i.id == id).expect("instance");
+            assert_ne!(
+                row.agent_session_id.as_deref(),
+                Some(stale_sid.as_str()),
+                "stale sid must not survive on disk after fallback, even on Tier-2 failure",
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn fallback_returns_restarted_when_tier2_pane_lives() {
+            if std::process::Command::new("tmux")
+                .arg("-V")
+                .output()
+                .is_err()
+            {
+                eprintln!("tmux not available; skipping");
+                return;
+            }
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(target_os = "linux")]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let _storage = crate::session::storage::Storage::new("fb-test-live").unwrap();
+
+            let stale_sid = "22222222-2222-2222-2222-222222222222".to_string();
+            let mut inst = Instance::new("fallback_lives_test", "/tmp/x");
+            inst.tool = "claude".to_string();
+            inst.source_profile = "fb-test-live".to_string();
+            // Claude regenerates a fresh UUID on Tier-2 (acquire_session_id
+            // emits `--session-id <new_uuid>`), so we cannot just count argv.
+            // Match the *stale* sid specifically: Tier-1 appends `--resume
+            // <stale_sid>` and the script exits, firing the cascade. Tier-2
+            // appends `--session-id <new_uuid>` (different value), so the
+            // pattern does not match and `sleep 30` keeps the pane alive
+            // past RESUME_PROBE_MAX (3s).
+            //
+            // Pinned: this discriminator relies on
+            // `ResumeStrategy::FlagPair` appending the sid to argv (see
+            // `src/agents.rs`). If a future variant ever passes the sid
+            // out of band (env var, stdin, file), update the wrapper to
+            // observe the new channel instead of `$*`.
+            inst.command = format!(
+                "/bin/sh -c 'case \"$*\" in *{stale}*) exit 1 ;; esac; exec sleep 30' --",
+                stale = stale_sid,
+            );
+            inst.agent_session_id = Some(stale_sid.clone());
+            inst.status = Status::Idle;
+
+            let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &tmux_name])
+                .output();
+
+            let outcome = inst.start_with_resume_fallback(None, true);
+
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &tmux_name])
+                .output();
+
+            match outcome {
+                Ok(StartOutcome::Restarted { stale_sid: cleared }) => {
+                    assert_eq!(cleared, stale_sid);
+                }
+                Ok(other) => panic!(
+                    "Tier-2 success path must return Restarted, got {other:?}; \
+                     a different variant indicates the probe misfires"
+                ),
+                Err(e) => panic!(
+                    "Tier-2 with a live binary must succeed: {e:#}; \
+                     check probe_settle behavior on long-running shells"
+                ),
+            }
+            assert!(inst.retroactive_capture_excludes.contains(&stale_sid));
+            assert!(inst.agent_session_id.as_deref() != Some(stale_sid.as_str()));
+        }
+
+        #[test]
+        #[serial]
+        fn cascade_fires_when_pane_dies_inside_post_shell_grace_window() {
+            if std::process::Command::new("tmux")
+                .arg("-V")
+                .output()
+                .is_err()
+            {
+                eprintln!("tmux not available; skipping");
+                return;
+            }
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(target_os = "linux")]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let _storage = crate::session::storage::Storage::new("fb-test-grace").unwrap();
+
+            let stale_sid = "33333333-3333-3333-3333-333333333333".to_string();
+            let mut inst = Instance::new("fallback_grace_test", "/tmp/x");
+            inst.tool = "claude".to_string();
+            inst.source_profile = "fb-test-grace".to_string();
+            // Regression guard for RESUME_PROBE_POST_SHELL_GRACE.
+            //
+            // The Tier-1 wrapper exits its boot shell immediately via `exec
+            // sleep N`, then the replacement process exits; tmux observes
+            // pane_dead at roughly t = N seconds. We pick N inside the
+            // window (current grace 2000ms, sleep 1.2s) so:
+            //   * with grace = 500ms, probe_settle returns Alive at t=500ms
+            //     before the death at t=1200ms; cascade misses it; the test
+            //     observes Resumed; assertion FAILS (regression caught).
+            //   * with grace >= ~1300ms, the grace timer is still open when
+            //     pane_dead fires; probe_settle returns Dead; cascade fires;
+            //     the test observes Restarted; assertion PASSES.
+            //
+            // This pins the LOWER bound of grace; the upper bound is
+            // implicitly RESUME_PROBE_MAX (3000ms) since deadline charity
+            // would otherwise mask future regressions.
+            //
+            // Tier-2 reuses the same wrapper but its sid differs from the
+            // stale one (cascade clears agent_session_id; Claude's FlagPair
+            // strategy regenerates a fresh UUID), so the case match misses
+            // and `exec sleep 30` keeps the pane alive past the second
+            // probe window.
+            inst.command = format!(
+                "/bin/sh -c 'case \"$*\" in *{stale}*) exec sleep 1.2 ;; esac; exec sleep 30' --",
+                stale = stale_sid,
+            );
+            inst.agent_session_id = Some(stale_sid.clone());
+            inst.status = Status::Idle;
+
+            let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &tmux_name])
+                .output();
+
+            let outcome = inst.start_with_resume_fallback(None, true);
+
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &tmux_name])
+                .output();
+
+            match outcome {
+                Ok(StartOutcome::Restarted { stale_sid: cleared }) => {
+                    assert_eq!(cleared, stale_sid);
+                }
+                Ok(StartOutcome::Resumed) => panic!(
+                    "Tier-1 grace shortcut returned Alive before the t=1200ms pane_dead: \
+                     RESUME_PROBE_POST_SHELL_GRACE is too short. \
+                     Real opencode crashes at ~1000ms; raise the grace constant."
+                ),
+                Ok(other) => panic!(
+                    "Expected Restarted or Resumed; got {other:?} (probe path is taking an unexpected branch)"
+                ),
+                Err(e) => panic!(
+                    "Tier-2 must succeed because its wrapper does not match the stale sid: {e:#}; \
+                     either the cascade is misrouting the sid or Tier-2 spawn is failing"
+                ),
+            }
+            assert!(inst.retroactive_capture_excludes.contains(&stale_sid));
+            assert!(inst.agent_session_id.as_deref() != Some(stale_sid.as_str()));
         }
     }
 }

@@ -10,6 +10,7 @@ use super::open_repo_at;
 /// The destination must not already exist. If `shallow` is true, only the
 /// latest commit is fetched (`--depth 1`). The clone is killed after 5
 /// minutes to prevent indefinite hangs (unresponsive remotes, SSH prompts).
+#[tracing::instrument(target = "git.fetch", skip_all, fields(url = %redact_url(url), shallow))]
 pub fn clone_repo(url: &str, destination: &Path, shallow: bool) -> Result<()> {
     if destination.exists() {
         return Err(GitError::CloneFailed(format!(
@@ -148,24 +149,26 @@ mod tests {
     #[test]
     fn test_parse_owner_ssh_shorthand() {
         assert_eq!(
-            parse_owner_from_remote_url("git@github.com:njbrake/agent-of-empires.git"),
-            Some("njbrake".to_string()),
+            parse_owner_from_remote_url("git@github.com:agent-of-empires/agent-of-empires.git"),
+            Some("agent-of-empires".to_string()),
         );
     }
 
     #[test]
     fn test_parse_owner_https() {
         assert_eq!(
-            parse_owner_from_remote_url("https://github.com/njbrake/agent-of-empires.git"),
-            Some("njbrake".to_string()),
+            parse_owner_from_remote_url("https://github.com/agent-of-empires/agent-of-empires.git"),
+            Some("agent-of-empires".to_string()),
         );
     }
 
     #[test]
     fn test_parse_owner_ssh_url() {
         assert_eq!(
-            parse_owner_from_remote_url("ssh://git@github.com/njbrake/agent-of-empires.git"),
-            Some("njbrake".to_string()),
+            parse_owner_from_remote_url(
+                "ssh://git@github.com/agent-of-empires/agent-of-empires.git"
+            ),
+            Some("agent-of-empires".to_string()),
         );
     }
 
@@ -180,8 +183,8 @@ mod tests {
     #[test]
     fn test_parse_owner_no_dotgit_suffix() {
         assert_eq!(
-            parse_owner_from_remote_url("https://github.com/njbrake/agent-of-empires"),
-            Some("njbrake".to_string()),
+            parse_owner_from_remote_url("https://github.com/agent-of-empires/agent-of-empires"),
+            Some("agent-of-empires".to_string()),
         );
     }
 

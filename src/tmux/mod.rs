@@ -5,12 +5,17 @@ mod session;
 pub mod status_bar;
 pub(crate) mod status_detection;
 mod terminal_session;
+#[cfg(test)]
+mod test_helpers;
+mod tool_session;
 pub(crate) mod utils;
 
 pub use session::Session;
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};
 pub use status_detection::detect_status_from_content;
+pub(crate) use status_detection::reconcile_codex_hook_status;
 pub use terminal_session::{ContainerTerminalSession, TerminalSession};
+pub use tool_session::{kill_all_tool_sessions_for_id, ToolSession};
 pub use utils::tmux_prefix_display;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -45,6 +50,11 @@ pub const CONTAINER_TERMINAL_PREFIX: &str = if cfg!(debug_assertions) {
 } else {
     "aoe_cterm_"
 };
+pub const TOOL_PREFIX: &str = if cfg!(debug_assertions) {
+    "aoe_dev_tool_"
+} else {
+    "aoe_tool_"
+};
 
 /// Pre-fetched pane metadata from a single `tmux list-panes -a` call.
 #[derive(Debug, Clone)]
@@ -72,6 +82,7 @@ struct SessionCache {
 const FIELD_SEP: char = '|';
 
 pub fn refresh_session_cache() {
+    let start = Instant::now();
     let output = Command::new("tmux")
         .args(["list-sessions", "-F", "#{session_name}|#{session_activity}"])
         .output();
@@ -88,8 +99,30 @@ pub fn refresh_session_cache() {
             }
             Some(map)
         }
-        _ => None,
+        Ok(out) => {
+            tracing::warn!(
+                target: "tmux.cache",
+                status = ?out.status,
+                stderr_bytes = out.stderr.len(),
+                "list-sessions returned non-zero; cache cleared",
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(target: "tmux.cache", error = %e, "list-sessions spawn failed; cache cleared");
+            None
+        }
     };
+
+    // Trace, not debug: the TUI status poller calls this every ~2s, so
+    // at debug it dominates the idle log. Errors above still log at warn.
+    let sessions = new_data.as_ref().map(|m| m.len()).unwrap_or(0);
+    tracing::trace!(
+        target: "tmux.cache",
+        sessions,
+        duration_ms = start.elapsed().as_millis() as u64,
+        "session cache refreshed",
+    );
 
     if let Ok(mut cache) = SESSION_CACHE.write() {
         cache.data = new_data;
@@ -99,7 +132,15 @@ pub fn refresh_session_cache() {
 
 /// Batch-fetch pane metadata for all aoe sessions in a single tmux subprocess call.
 /// Returns a map from session name to metadata for the first window's first pane.
-pub fn batch_pane_metadata() -> HashMap<String, PaneMetadata> {
+///
+/// Returns `Err` when the underlying `tmux list-panes` call fails to spawn or
+/// exits non-zero. Callers MUST distinguish this from `Ok(map)` where a missing
+/// key means the session is genuinely absent: `Err` means we don't know.
+/// Startup recovery treats `Err` as "skip this pass" to avoid killing a
+/// possibly-live pane on a transient tmux glitch; status pollers treat it as
+/// `unwrap_or_default()` because their semantics are unchanged by an empty map.
+pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
+    let start = Instant::now();
     let output = Command::new("tmux")
         .args([
             "list-panes",
@@ -109,13 +150,39 @@ pub fn batch_pane_metadata() -> HashMap<String, PaneMetadata> {
         ])
         .output();
 
-    match output {
+    let result: anyhow::Result<HashMap<String, PaneMetadata>> = match output {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            parse_pane_metadata(&stdout)
+            Ok(parse_pane_metadata(&stdout))
         }
-        _ => HashMap::new(),
-    }
+        Ok(out) => {
+            tracing::warn!(
+                target: "tmux.pane",
+                status = ?out.status,
+                stderr_bytes = out.stderr.len(),
+                "list-panes returned non-zero",
+            );
+            Err(anyhow::anyhow!(
+                "tmux list-panes returned non-zero status: {:?}",
+                out.status
+            ))
+        }
+        Err(e) => {
+            tracing::warn!(target: "tmux.pane", error = %e, "list-panes spawn failed");
+            Err(anyhow::anyhow!("tmux list-panes spawn failed: {}", e))
+        }
+    };
+
+    // Trace, not debug: paired with refresh_session_cache in the TUI
+    // status poll loop (~every 2s). Debug-level here would dominate the
+    // idle log.
+    tracing::trace!(
+        target: "tmux.pane",
+        sessions = result.as_ref().map(|m| m.len()).unwrap_or(0),
+        duration_ms = start.elapsed().as_millis() as u64,
+        "batch pane metadata fetched",
+    );
+    result
 }
 
 /// Parse the output of `tmux list-panes -a` into a map of session name to pane metadata.
@@ -159,6 +226,22 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
     }
 
     map
+}
+
+/// Test-only: inject a synthetic session name into the cache so
+/// callers of `session_exists_from_cache` see it as present. Used
+/// by live-send tests that install a fake `LiveSendState` without a
+/// real tmux pane; without this the per-keystroke drift check
+/// (which calls `session_exists_from_cache`) trips in CI runs that
+/// have already populated the cache via the e2e suite, causing the
+/// drift detector to flag the fake session as gone.
+#[cfg(test)]
+pub fn test_inject_session_into_cache(name: &str) {
+    if let Ok(mut cache) = SESSION_CACHE.write() {
+        let map = cache.data.get_or_insert_with(HashMap::new);
+        map.insert(name.to_string(), 0);
+        cache.time = Some(Instant::now());
+    }
 }
 
 pub fn session_exists_from_cache(name: &str) -> Option<bool> {
@@ -284,6 +367,7 @@ impl AvailableTools {
 
 #[cfg(test)]
 mod tests {
+    use super::test_helpers::TmuxTestSession;
     use super::*;
 
     // Session names embed `SESSION_PREFIX`, which differs between release
@@ -407,7 +491,8 @@ mod tests {
 
         // Ensure the tmux server is already running so the test session's
         // command string doesn't end up in the server process's argv.
-        let dummy = format!("aoe_test_compound_dummy_{}", std::process::id());
+        let dummy_guard = TmuxTestSession::new("aoe_test_compound_dummy");
+        let dummy = dummy_guard.name().to_string();
         let _ = Command::new("tmux")
             .args([
                 "new-session",
@@ -423,7 +508,8 @@ mod tests {
             .output();
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let session_name = format!("aoe_test_compound_{}", std::process::id());
+        let session_guard = TmuxTestSession::new("aoe_test_compound");
+        let session_name = session_guard.name().to_string();
         let marker = format!("AOE_COMPOUND_TEST_{}", std::process::id());
         let secret_value = "s3cret_val!@#";
 
@@ -502,14 +588,6 @@ mod tests {
             is_dead,
             "Pane should be dead after exec'd command exits (lifecycle preserved)"
         );
-
-        // Clean up
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &dummy])
-            .output();
     }
 
     /// Verify that after `exec` replaces the outer shell, the secret
@@ -530,7 +608,8 @@ mod tests {
 
         // Ensure the tmux server is already running so our test session's
         // command string doesn't end up in the server process's argv.
-        let dummy = format!("aoe_test_ps_dummy_{}", std::process::id());
+        let dummy_guard = TmuxTestSession::new("aoe_test_ps_dummy");
+        let dummy = dummy_guard.name().to_string();
         let _ = Command::new("tmux")
             .args([
                 "new-session",
@@ -546,7 +625,8 @@ mod tests {
             .output();
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        let session_name = format!("aoe_test_ps_{}", std::process::id());
+        let session_guard = TmuxTestSession::new("aoe_test_ps");
+        let session_name = session_guard.name().to_string();
         let secret_value = format!("UNIQUE_SECRET_{}_xyzzy", std::process::id());
 
         // Simulate: export SECRET='val'; exec sleep 30
@@ -590,13 +670,5 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-
-        // Clean up
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &dummy])
-            .output();
     }
 }

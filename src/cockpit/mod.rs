@@ -13,16 +13,22 @@
 //!   `state::apply_event`.
 
 pub mod acp_client;
+#[cfg(feature = "serve")]
+pub mod agent_compat;
+pub mod agent_profiles;
 pub mod agent_registry;
 pub mod approvals;
 pub mod client;
 pub mod context_primer;
 pub mod event_store;
 pub mod fs_handler;
+pub mod install_hints;
 pub mod node;
 pub mod permissions;
 pub mod protocol;
 pub mod runner;
+#[cfg(feature = "serve")]
+pub mod sandbox;
 pub mod state;
 pub mod supervisor;
 pub mod terminal_handler;

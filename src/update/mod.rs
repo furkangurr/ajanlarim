@@ -22,14 +22,14 @@ fn github_api_base() -> String {
 
 fn github_api_latest_url() -> String {
     format!(
-        "{}/repos/njbrake/agent-of-empires/releases/latest",
+        "{}/repos/agent-of-empires/agent-of-empires/releases/latest",
         github_api_base()
     )
 }
 
 fn github_api_releases_url() -> String {
     format!(
-        "{}/repos/njbrake/agent-of-empires/releases?per_page=20",
+        "{}/repos/agent-of-empires/agent-of-empires/releases?per_page=20",
         github_api_base()
     )
 }
@@ -44,7 +44,7 @@ pub fn release_page_url(version: &str) -> String {
         format!("v{}", version)
     };
     format!(
-        "https://github.com/njbrake/agent-of-empires/releases/tag/{}",
+        "https://github.com/agent-of-empires/agent-of-empires/releases/tag/{}",
         tag
     )
 }
@@ -96,8 +96,19 @@ fn save_cache(cache: &UpdateCache) -> Result<()> {
     Ok(())
 }
 
+#[tracing::instrument(target = "update.fetch", skip_all, fields(current = %current_version, force))]
 pub async fn check_for_update(current_version: &str, force: bool) -> Result<UpdateInfo> {
     let settings = get_update_settings();
+
+    // Mode=off skips network entirely; return a "no update" stub so callers
+    // can keep their unconditional shape without branching on the mode.
+    if !settings.update_check_mode.is_enabled() {
+        return Ok(UpdateInfo {
+            available: false,
+            current_version: current_version.to_string(),
+            latest_version: String::new(),
+        });
+    }
 
     if !force {
         if let Some(cache) = load_cache() {
@@ -140,7 +151,7 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
     let releases = match fetch_releases(&client).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::debug!("Failed to fetch releases: {e}");
+            tracing::debug!(target: "update.fetch", "Failed to fetch releases: {e}");
             Vec::new()
         }
     };
@@ -206,6 +217,7 @@ pub async fn check_for_update(current_version: &str, force: bool) -> Result<Upda
     })
 }
 
+#[tracing::instrument(target = "update.fetch", skip_all)]
 async fn fetch_releases(client: &reqwest::Client) -> Result<Vec<ReleaseInfo>> {
     let url = github_api_releases_url();
     tracing::debug!(target: "update.fetch", %url, "GET releases");
@@ -279,7 +291,9 @@ pub(crate) fn is_newer_version(latest: &str, current: &str) -> bool {
 
 pub async fn print_update_notice() {
     let settings = get_update_settings();
-    if !settings.check_enabled || !settings.notify_in_cli {
+    // CLI nag fires only when both the global mode allows notifications
+    // and the user has not opted out of CLI nags specifically.
+    if !settings.update_check_mode.notifies() || !settings.notify_in_cli {
         return;
     }
 

@@ -1,8 +1,10 @@
-# Claude artifacts (allow .claude/skills/ for cross-agent skills)
-.claude/*
-!.claude/skills/
+# Claude artifacts
+.claude/
 # Rust build artifacts
 /target/
+# JS / Python tooling artifacts (per-subproject installs in web/, website/, etc.)
+node_modules/
+.venv/
 # Documentation build output
 /book/
 
@@ -39,6 +41,7 @@ Thumbs.db
 
 # AI coding tools
 .opencode/
+.omo/
 .sisyphus/
 
 # Per-repo config (created by `aoe init`, should be committed per-repo by users)
@@ -69,3 +72,8 @@ website/src/pages/docs/development/*.md
 # Demo recording intermediate files
 *.cast
 /test-results
+
+# Coverage output (Vitest + Playwright + merged)
+web/coverage/
+web/playwright-report/
+web/playwright-live-report/

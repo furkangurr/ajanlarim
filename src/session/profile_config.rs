@@ -17,6 +17,12 @@ use super::get_profile_dir;
 /// Profile-specific settings. All fields are Option<T> - None means "inherit from global"
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProfileConfig {
+    /// Short, human-readable description of what this profile does.
+    /// Surfaced as helper text in the new-session profile picker (TUI + web).
+    /// Profile-only: there is no global counterpart to inherit from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<ThemeConfigOverride>,
 
@@ -40,6 +46,9 @@ pub struct ProfileConfig {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sound: Option<crate::sound::SoundConfigOverride>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_hooks: Option<crate::status_hooks::StatusHookConfigOverride>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cockpit: Option<CockpitConfigOverride>,
@@ -83,6 +92,10 @@ pub struct CockpitConfigOverride {
     pub max_concurrent_resumes: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force_end_turn_threshold_secs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub silent_orphan_grace_secs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub silent_orphan_fast_grace_secs: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -98,7 +111,7 @@ pub struct ThemeConfigOverride {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UpdatesConfigOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub check_enabled: Option<bool>,
+    pub update_check_mode: Option<crate::session::config::UpdateCheckMode>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_interval_hours: Option<u64>,
@@ -232,6 +245,27 @@ pub struct SessionConfigOverride {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict_hotkeys: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snooze_duration_minutes: Option<u32>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_wake_message: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_tag: Option<super::config::RowTagMode>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_send_exit_chord: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_session_attach_mode: Option<super::config::NewSessionAttachMode>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_attach_mode: Option<super::config::NewSessionAttachMode>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub click_action: Option<super::config::ClickAction>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -259,8 +293,13 @@ pub struct HooksConfigOverride {
 }
 
 /// Load profile-specific config. Returns empty config if file doesn't exist.
+///
+/// Pure read: never creates the profile directory. Goes through the
+/// non-creating path resolver so a GET /api/settings?profile=<unknown>
+/// (which the dashboard fires on mount before profiles resolve) does
+/// not pollute `profiles/` with a stub directory.
 pub fn load_profile_config(profile: &str) -> Result<ProfileConfig> {
-    let path = get_profile_config_path(profile)?;
+    let path = super::get_profile_dir_path(profile)?.join("config.toml");
     if !path.exists() {
         return Ok(ProfileConfig::default());
     }
@@ -276,18 +315,22 @@ pub fn load_profile_config(profile: &str) -> Result<ProfileConfig> {
 pub fn save_profile_config(profile: &str, config: &ProfileConfig) -> Result<()> {
     let path = get_profile_config_path(profile)?;
     let content = toml::to_string_pretty(config)?;
-    fs::write(&path, content)?;
+    super::atomic_write(&path, content.as_bytes())?;
     Ok(())
 }
 
-/// Get the path to a profile's config file
+/// Get the path to a profile's config file. This goes through the
+/// creating [`get_profile_dir`] because the only remaining caller is
+/// [`save_profile_config`], which needs the directory to exist before
+/// the atomic write.
 pub fn get_profile_config_path(profile: &str) -> Result<std::path::PathBuf> {
     Ok(get_profile_dir(profile)?.join("config.toml"))
 }
 
 /// Check if a profile has any overrides set
 pub fn profile_has_overrides(config: &ProfileConfig) -> bool {
-    config.theme.is_some()
+    config.description.is_some()
+        || config.theme.is_some()
         || config.updates.is_some()
         || config.worktree.is_some()
         || config.sandbox.is_some()
@@ -295,6 +338,7 @@ pub fn profile_has_overrides(config: &ProfileConfig) -> bool {
         || config.session.is_some()
         || config.hooks.is_some()
         || config.sound.is_some()
+        || config.status_hooks.is_some()
         || config.cockpit.is_some()
         || config.environment.is_some()
 }
@@ -312,7 +356,7 @@ pub fn resolve_config_or_warn(profile: &str) -> Config {
     match resolve_config(profile) {
         Ok(config) => config,
         Err(e) => {
-            tracing::warn!(
+            tracing::warn!(target: "session.profile",
                 "Failed to load config for profile '{}', using defaults: {e}",
                 profile
             );
@@ -443,6 +487,27 @@ pub fn apply_session_overrides(
     if let Some(strict_hotkeys) = source.strict_hotkeys {
         target.strict_hotkeys = strict_hotkeys;
     }
+    if let Some(snooze_duration_minutes) = source.snooze_duration_minutes {
+        target.snooze_duration_minutes = snooze_duration_minutes;
+    }
+    if let Some(ref restart_wake_message) = source.restart_wake_message {
+        target.restart_wake_message = restart_wake_message.clone();
+    }
+    if let Some(row_tag) = source.row_tag {
+        target.row_tag = row_tag;
+    }
+    if let Some(ref live_send_exit_chord) = source.live_send_exit_chord {
+        target.live_send_exit_chord = live_send_exit_chord.clone();
+    }
+    if let Some(new_session_attach_mode) = source.new_session_attach_mode {
+        target.new_session_attach_mode = new_session_attach_mode;
+    }
+    if let Some(default_attach_mode) = source.default_attach_mode {
+        target.default_attach_mode = default_attach_mode;
+    }
+    if let Some(click_action) = source.click_action {
+        target.click_action = click_action;
+    }
 }
 
 /// Apply tmux config overrides to a target config.
@@ -473,8 +538,8 @@ pub fn merge_configs(mut global: Config, profile: &ProfileConfig) -> Config {
     }
 
     if let Some(ref updates_override) = profile.updates {
-        if let Some(check_enabled) = updates_override.check_enabled {
-            global.updates.check_enabled = check_enabled;
+        if let Some(update_check_mode) = updates_override.update_check_mode {
+            global.updates.update_check_mode = update_check_mode;
         }
         if let Some(check_interval_hours) = updates_override.check_interval_hours {
             global.updates.check_interval_hours = check_interval_hours;
@@ -509,6 +574,13 @@ pub fn merge_configs(mut global: Config, profile: &ProfileConfig) -> Config {
 
     if let Some(ref sound_override) = profile.sound {
         crate::sound::apply_sound_overrides(&mut global.sound, sound_override);
+    }
+
+    if let Some(ref status_hook_override) = profile.status_hooks {
+        crate::status_hooks::apply_status_hook_overrides(
+            &mut global.status_hooks,
+            status_hook_override,
+        );
     }
 
     if let Some(ref environment) = profile.environment {
@@ -549,6 +621,12 @@ pub fn merge_configs(mut global: Config, profile: &ProfileConfig) -> Config {
         }
         if let Some(v) = cockpit_override.force_end_turn_threshold_secs {
             global.cockpit.force_end_turn_threshold_secs = v;
+        }
+        if let Some(v) = cockpit_override.silent_orphan_grace_secs {
+            global.cockpit.silent_orphan_grace_secs = v;
+        }
+        if let Some(v) = cockpit_override.silent_orphan_fast_grace_secs {
+            global.cockpit.silent_orphan_fast_grace_secs = v;
         }
     }
 
@@ -620,9 +698,10 @@ mod tests {
 
     #[test]
     fn test_profile_config_serialization_partial() {
+        use crate::session::config::UpdateCheckMode;
         let config = ProfileConfig {
             updates: Some(UpdatesConfigOverride {
-                check_enabled: Some(false),
+                update_check_mode: Some(UpdateCheckMode::Off),
                 ..Default::default()
             }),
             ..Default::default()
@@ -630,14 +709,15 @@ mod tests {
 
         let serialized = toml::to_string_pretty(&config).unwrap();
         assert!(serialized.contains("[updates]"));
-        assert!(serialized.contains("check_enabled = false"));
+        assert!(serialized.contains("update_check_mode = \"off\""));
     }
 
     #[test]
     fn test_profile_config_deserialization() {
+        use crate::session::config::UpdateCheckMode;
         let toml = r#"
             [updates]
-            check_enabled = false
+            update_check_mode = "off"
             check_interval_hours = 48
 
             [sandbox]
@@ -647,7 +727,7 @@ mod tests {
         let config: ProfileConfig = toml::from_str(toml).unwrap();
         assert!(config.updates.is_some());
         let updates = config.updates.unwrap();
-        assert_eq!(updates.check_enabled, Some(false));
+        assert_eq!(updates.update_check_mode, Some(UpdateCheckMode::Off));
         assert_eq!(updates.check_interval_hours, Some(48));
 
         assert!(config.sandbox.is_some());
@@ -661,16 +741,20 @@ mod tests {
         let profile = ProfileConfig::default();
         let merged = merge_configs(global.clone(), &profile);
 
-        assert_eq!(merged.updates.check_enabled, global.updates.check_enabled);
+        assert_eq!(
+            merged.updates.update_check_mode,
+            global.updates.update_check_mode
+        );
         assert_eq!(merged.worktree.enabled, global.worktree.enabled);
     }
 
     #[test]
     fn test_merge_configs_with_overrides() {
+        use crate::session::config::UpdateCheckMode;
         let global = Config::default();
         let profile = ProfileConfig {
             updates: Some(UpdatesConfigOverride {
-                check_enabled: Some(false),
+                update_check_mode: Some(UpdateCheckMode::Off),
                 check_interval_hours: Some(48),
                 ..Default::default()
             }),
@@ -683,11 +767,37 @@ mod tests {
 
         let merged = merge_configs(global, &profile);
 
-        assert!(!merged.updates.check_enabled);
+        assert_eq!(merged.updates.update_check_mode, UpdateCheckMode::Off);
         assert_eq!(merged.updates.check_interval_hours, 48);
         // notify_in_cli should retain global default since not overridden
         assert!(merged.updates.notify_in_cli);
         assert!(merged.worktree.enabled);
+    }
+
+    #[test]
+    fn test_merge_configs_with_status_hook_overrides() {
+        let mut global = Config::default();
+        global.status_hooks.enabled = false;
+        global.status_hooks.on_waiting = Some("global-waiting".to_string());
+        global.status_hooks.debounce_ms = 100;
+
+        let profile = ProfileConfig {
+            status_hooks: Some(crate::status_hooks::StatusHookConfigOverride {
+                enabled: Some(true),
+                debounce_ms: Some(500),
+                on_waiting: Some("profile-waiting".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let merged = merge_configs(global, &profile);
+        assert!(merged.status_hooks.enabled);
+        assert_eq!(
+            merged.status_hooks.on_waiting.as_deref(),
+            Some("profile-waiting")
+        );
+        assert_eq!(merged.status_hooks.debounce_ms, 500);
     }
 
     #[test]
@@ -1007,6 +1117,37 @@ mod tests {
         let merged = merge_configs(global, &profile);
         // Profile env replaces (matches sandbox.environment semantics).
         assert_eq!(merged.environment, vec!["FROM_PROFILE=2".to_string()]);
+    }
+
+    #[test]
+    fn test_description_round_trips() {
+        let toml_in = r#"description = "Read-only review profile""#;
+        let config: ProfileConfig = toml::from_str(toml_in).unwrap();
+        assert_eq!(
+            config.description.as_deref(),
+            Some("Read-only review profile"),
+        );
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(serialized.contains("Read-only review profile"));
+    }
+
+    #[test]
+    fn test_description_default_is_none() {
+        let config = ProfileConfig::default();
+        assert!(config.description.is_none());
+        // Default empty config must still serialize empty so untouched profiles
+        // don't grow a description line on first save.
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.trim().is_empty());
+    }
+
+    #[test]
+    fn test_description_promotes_profile_has_overrides() {
+        let mut profile = ProfileConfig::default();
+        assert!(!profile_has_overrides(&profile));
+        profile.description = Some("My profile".to_string());
+        assert!(profile_has_overrides(&profile));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 import { isServerDown } from "./connectionState";
+import { getOrCreateDeviceBindingSecret } from "./deviceBinding";
 import { reportError } from "./toastBus";
 import { clearToken, getToken, saveToken } from "./token";
 
@@ -10,6 +11,12 @@ export const TOKEN_EXPIRED_EVENT = "aoe:token-expired";
  *  session is missing or expired. App.tsx listens to show the LoginPage
  *  instead of the TokenEntryPage, so a valid token isn't wrongly cleared. */
 export const LOGIN_REQUIRED_EVENT = "aoe:login-required";
+
+/** Dispatched on `window` when an authenticated request hits a sensitive
+ *  route whose login session is not currently elevated (the server
+ *  returns `403 elevation_required`). Cockpit/terminal hooks listen for
+ *  this to pop an inline passphrase prompt. See #1131. */
+export const ELEVATION_REQUIRED_EVENT = "aoe:elevation-required";
 
 /** Classify a 401 body as `login_required` or `unauthorized`. Clones the
  *  response so downstream readers (fetchJson, etc.) can still parse the
@@ -25,6 +32,19 @@ export async function classifyAuthError(
     // Body wasn't JSON or already consumed; fall through to unauthorized.
   }
   return "unauthorized";
+}
+
+/** Login attempt endpoints surface their own errors via LoginPage /
+ *  ElevationPrompt local state. A 401 `unauthorized` from these paths
+ *  means the passphrase the user just typed was wrong, not that the
+ *  bearer token went stale. Firing the global `TOKEN_EXPIRED_EVENT`
+ *  here would replace LoginPage with TokenEntryPage, leaving the user
+ *  stuck on a token-entry screen in `--auth=passphrase` mode where no
+ *  token URL exists. `login_required` from /api/login/elevate (session
+ *  missing or expired during elevation) is *not* exempt: it still
+ *  needs to surface as the global LoginPage swap. */
+export function isLoginAttemptPath(path: string): boolean {
+  return path === "/api/login" || path === "/api/login/elevate";
 }
 
 /**
@@ -64,7 +84,26 @@ export function installFetchErrorToasts(): void {
     const isApi = path.startsWith("/api/");
     const sameOrigin = isSameOrigin(rawUrl);
 
-    const patchedInit = attachAuthHeader(sameOrigin, init);
+    // Generate a per-request id and inject as X-Request-Id so the backend
+    // `http.request` middleware echoes the same id on its span. With it,
+    // a network entry seen in devtools can be grep-correlated against the
+    // backend log via `request_id=...`.
+    let patchedInit = attachAuthHeader(sameOrigin, init);
+    if (sameOrigin && isApi) {
+      try {
+        const requestId =
+          typeof crypto !== "undefined" && "randomUUID" in crypto
+            ? crypto.randomUUID()
+            : Math.random().toString(36).slice(2);
+        const h = new Headers(patchedInit?.headers ?? init?.headers);
+        if (!h.has("X-Request-Id")) {
+          h.set("X-Request-Id", requestId);
+        }
+        patchedInit = { ...(patchedInit ?? init ?? {}), headers: h };
+      } catch {
+        // Fall through without a request id; the middleware generates one.
+      }
+    }
 
     try {
       const res = await original(input, patchedInit);
@@ -75,9 +114,27 @@ export function installFetchErrorToasts(): void {
       if (res.status === 401 && isApi) {
         const authError = await classifyAuthError(res);
         if (authError === "login_required") {
+          // Session missing or expired (including mid-elevation):
+          // always pop LoginPage. The token is still valid.
           handleLoginRequired();
-        } else {
+        } else if (authError === "unauthorized" && !isLoginAttemptPath(path)) {
+          // Generic 401 on a non-login path means the token is dead.
+          // Login attempt paths surface their own wrong-passphrase error
+          // through LoginPage / ElevationPrompt local state.
           handleTokenAuthFailure();
+        }
+      }
+      if (res.status === 403 && isApi) {
+        // `elevation_required` signals a sensitive route called without
+        // a current 15-min passphrase confirmation. The cockpit/terminal
+        // surfaces listen for this and pop the inline prompt.
+        try {
+          const data = (await res.clone().json()) as { error?: unknown };
+          if (data && data.error === "elevation_required") {
+            window.dispatchEvent(new CustomEvent(ELEVATION_REQUIRED_EVENT));
+          }
+        } catch {
+          // body not JSON; ignore.
         }
       }
       if (isApi && res.status >= 500 && !isServerDown()) {
@@ -104,9 +161,15 @@ export function installFetchErrorToasts(): void {
   };
 }
 
-// 401 with no `login_required` body: token is dead, missing, or revoked.
-// Clear localStorage (idempotent if no token) and show the token entry
-// page. Dedupe so a burst of concurrent 401s produces one event.
+// 401 with no `login_required` body: this is the true
+// unauthenticated state. A bound device authenticates purely via
+// its `aoe_session` cookie + device binding; the server does not
+// consult the token on regular requests. This branch fires only
+// when the session is gone (server restart, 30-day idle, explicit
+// logout, or a fresh browser profile). Clear any cached token
+// (the SPA may have a stale one in localStorage) and route the
+// user back through the bootstrap flow. Dedupe so a burst of
+// concurrent 401s produces one event. See #1167.
 let tokenExpiredDispatched = false;
 function handleTokenAuthFailure(): void {
   clearToken();
@@ -133,19 +196,31 @@ export function resetTokenExpired(): void {
   loginRequiredDispatched = false;
 }
 
-// Inject Authorization header without clobbering anything the caller set.
-// Skips cross-origin URLs so we never leak the token off-site.
+// Inject Authorization + device-binding headers without clobbering
+// anything the caller set. Skips cross-origin URLs so we never leak
+// either credential off-site.
 function attachAuthHeader(
   sameOrigin: boolean,
   init: RequestInit | undefined,
 ): RequestInit | undefined {
   if (!sameOrigin) return init;
   const token = getToken();
-  if (!token) return init;
+  let bindingSecret: string | null = null;
+  try {
+    bindingSecret = getOrCreateDeviceBindingSecret();
+  } catch {
+    // Storage / crypto unavailable; login page will surface the error.
+    // Leave the header off so the server's bad-request branch fires
+    // instead of a silently broken auth state.
+  }
+  if (!token && !bindingSecret) return init;
 
   const headers = new Headers(init?.headers);
-  if (!headers.has("Authorization")) {
+  if (token && !headers.has("Authorization")) {
     headers.set("Authorization", `Bearer ${token}`);
+  }
+  if (bindingSecret && !headers.has("X-Aoe-Device-Binding")) {
+    headers.set("X-Aoe-Device-Binding", bindingSecret);
   }
   return { ...(init ?? {}), headers };
 }

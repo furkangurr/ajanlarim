@@ -11,14 +11,110 @@
 //! design rather than threading a handle through application state.
 //! `Mutex<Option<Arc<_>>>` (over `OnceLock`) so tests can reset.
 
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use fs2::FileExt;
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Registry;
+
+use crate::session::config::{LoggingConfig, RotationKind};
+
+/// Which context the running process is in. Drives whether `[logging].output`
+/// is honored or coerced to `File`. Contexts where the stdout sink would
+/// corrupt the UI (TUI alt-screen) or get discarded (daemon child's
+/// detached stdio, cockpit runner) force the file sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessContext {
+    Tui,
+    ServeDaemonChild,
+    ServeForeground,
+    Runner,
+    OneShotCli,
+}
+
+/// Output of `resolve_sink`. The `warning` is deferred until after subscriber
+/// init so it can be emitted through tracing rather than dropped silently.
+pub struct SinkResolution {
+    pub target: SubscriberTarget,
+    pub warning: Option<String>,
+}
+
+/// Resolve the configured log file path. Relative `file_path` values join
+/// onto `app_dir`; absolute paths are used verbatim. Used by every site
+/// that names the log file (main, runner, aoe logs, TUI serve dialog).
+pub fn resolve_log_path(cfg: &LoggingConfig, app_dir: &Path) -> PathBuf {
+    let p = Path::new(&cfg.file_path);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        app_dir.join(p)
+    }
+}
+
+/// Pick the subscriber sink for this process. `output = "stdout"` is
+/// honored only when the context can safely write to stdout; otherwise
+/// the resolution carries a `warning` describing the coercion so the
+/// caller can emit it through the now-live subscriber.
+pub fn resolve_sink(cfg: &LoggingConfig, app_dir: &Path, ctx: ProcessContext) -> SinkResolution {
+    use crate::session::config::SinkKind;
+
+    let force_file = matches!(
+        ctx,
+        ProcessContext::Tui | ProcessContext::ServeDaemonChild | ProcessContext::Runner
+    );
+    let want_stdout = matches!(cfg.output, SinkKind::Stdout);
+
+    if want_stdout && !force_file {
+        SinkResolution {
+            target: SubscriberTarget::Stdout,
+            warning: None,
+        }
+    } else {
+        let warning = if want_stdout && force_file {
+            Some(format!(
+                "[logging].output = \"stdout\" ignored for {:?} (file required to avoid output corruption)",
+                ctx
+            ))
+        } else {
+            None
+        };
+        SinkResolution {
+            target: SubscriberTarget::File(
+                resolve_log_path(cfg, app_dir),
+                RotationPolicy::from(cfg),
+            ),
+            warning,
+        }
+    }
+}
+
+/// Rotation thresholds resolved from `[logging]`. Built once at subscriber
+/// init and held by the `SizeRotatingWriter`; not hot-swappable (sink and
+/// rotation knobs require restart, see `apply_persisted_config`).
+#[derive(Debug, Clone, Copy)]
+pub struct RotationPolicy {
+    pub kind: RotationKind,
+    pub max_size_bytes: u64,
+    pub keep_count: u8,
+}
+
+impl From<&LoggingConfig> for RotationPolicy {
+    fn from(cfg: &LoggingConfig) -> Self {
+        // Defensive clamp: a hand-edited keep_count = 0 would otherwise yield
+        // a rotation that deletes the only copy. UI fields enforce >= 1; this
+        // makes the invariant hold for any path into the writer.
+        Self {
+            kind: cfg.rotation,
+            max_size_bytes: cfg.max_size_mib.saturating_mul(1024 * 1024),
+            keep_count: cfg.keep_count.max(1),
+        }
+    }
+}
 
 /// Top-level tracing target roots. The default filter expands a
 /// single level (e.g. "debug") to one directive per root so user-defined
@@ -39,14 +135,34 @@ pub const DEFAULT_TARGET_ROOTS: &[&str] = &[
     // (`log.runtime`). Without this, `log.runtime` would be dropped
     // under any expanded-level filter that has no global default.
     "log",
+    // User-facing surfaces that previously fell under `agent_of_empires`
+    // and were therefore indistinguishable from generic library code.
+    // Each is a separate ownership boundary the user can dial up/down.
+    "cli",
+    "tui",
+    "session",
+    "tmux",
+    "http",
+    "serve",
+    "hooks",
+    "sound",
 ];
 
 /// Sub-targets users can tune individually from the settings UI.
 /// Order is the UI ordering. Anything not in this list still works
 /// in the runtime endpoint as a raw filter, but won't have a dropdown.
+///
+/// Kept intentionally short. The list is for the UI dropdown only;
+/// callers can always set arbitrary EnvFilter directives via the
+/// settings TUI's raw field or `PATCH /api/log-level`. Adding an
+/// entry here is only worth it when we have evidence we'll want to
+/// dial that area in isolation. Sub-targets emitted by code (e.g.
+/// `http.request`, `cli.serve`, `tui.home`) work fine even when not
+/// listed; they just won't have a one-click row in the settings UI.
 pub const KNOWN_SUB_TARGETS: &[&str] = &[
     "cockpit.acp",
     "cockpit.acp.stderr",
+    "cockpit.acp.tool_dispatch",
     "cockpit.supervisor",
     "cockpit.event_store",
     "cockpit.runner",
@@ -78,6 +194,13 @@ pub const KNOWN_SUB_TARGETS: &[&str] = &[
 /// Both the TUI save path and the web `PATCH /api/settings` path call
 /// this after `save_config`, so settings changes take effect live
 /// without a daemon restart.
+///
+/// Only the filter (default_level plus per-target overrides) hot-swaps.
+/// Sink-shape knobs (output, file_path, rotation, max_size_mib, keep_count)
+/// require a process restart: the tracing subscriber is a global singleton
+/// installed once at startup, and the rotating writer holds its policy
+/// and file handle for the life of the process. The settings UI surfaces
+/// a restart hint when those fields change.
 pub fn apply_persisted_config(
     default_level: &str,
     targets: &std::collections::BTreeMap<String, String>,
@@ -254,7 +377,7 @@ impl LogConfig {
 }
 
 pub enum SubscriberTarget {
-    File(PathBuf),
+    File(PathBuf, RotationPolicy),
     Stdout,
 }
 
@@ -341,6 +464,51 @@ impl std::fmt::Display for LogFilterError {
 impl std::error::Error for LogFilterError {}
 
 pub fn init_subscriber(target: SubscriberTarget, filter: String) -> InitResult {
+    init_subscriber_with_options(target, filter, false)
+}
+
+/// Event formatter that mirrors the default Full output (RFC3339-ish
+/// timestamp, level, target, fields, message) but omits the span chain
+/// prefix. Used when `[logging].show_spans = false`, the project
+/// default, so that idle polling requests do not flood the log with
+/// `http_request{request_id=... method=GET path=...}` prefixes on every
+/// downstream event. The full default formatter is still available when
+/// the user opts in via the settings toggle.
+struct NoSpanFormat;
+
+impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for NoSpanFormat
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> tracing_subscriber::fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        let meta = event.metadata();
+        write!(
+            writer,
+            "{}  {} {}: ",
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            meta.level(),
+            meta.target(),
+        )?;
+        ctx.field_format().format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
+    }
+}
+
+/// Initialize tracing with explicit formatter options. `show_spans = true`
+/// prefixes every event with the span chain (e.g. `http_request{request_id=...}`),
+/// which enables grep-correlation across async boundaries but adds noise on
+/// idle polling endpoints. `false` (the default) drops the prefix.
+pub fn init_subscriber_with_options(
+    target: SubscriberTarget,
+    filter: String,
+    show_spans: bool,
+) -> InitResult {
     let parsed = match EnvFilter::builder().with_regex(false).parse(&filter) {
         Ok(f) => f,
         Err(e) => {
@@ -352,28 +520,68 @@ pub fn init_subscriber(target: SubscriberTarget, filter: String) -> InitResult {
     };
     let (reload_layer, handle) = reload::Layer::new(parsed);
 
+    // tracing-subscriber's default Full formatter hard-codes the span
+    // chain prefix into the event line, and the `with_current_span` /
+    // `with_span_list` toggles only exist on the JSON formatter (not on
+    // `fmt::Layer` or `format::Format<Full, _>` for non-JSON output).
+    // When `show_spans` is false we therefore install a small custom
+    // FormatEvent that emits the same timestamp / level / target /
+    // message but skips the span list. When true we install the default
+    // Full formatter.
     let install_result = match target {
-        SubscriberTarget::File(path) => match open_log_file(&path) {
-            Ok(file) => {
-                let writer = std::sync::Mutex::new(file);
+        SubscriberTarget::File(path, policy) => match SizeRotatingWriter::new(path.clone(), policy)
+        {
+            Ok(mut writer) => {
+                // Raw marker is written before tracing takes ownership so it
+                // appears in the file even when the user's filter would drop
+                // an info-level event. Forensic boundary; not load-bearing
+                // for the TUI dialog (which uses captured offset).
+                write_raw_startup_marker(&mut writer);
+                let mw = std::sync::Mutex::new(writer);
+                if show_spans {
+                    let fmt_layer = tracing_subscriber::fmt::layer()
+                        .with_writer(mw)
+                        .with_ansi(false);
+                    Registry::default()
+                        .with(reload_layer)
+                        .with(fmt_layer)
+                        .try_init()
+                        .map_err(|e| e.to_string())
+                } else {
+                    let fmt_layer = tracing_subscriber::fmt::layer()
+                        .with_writer(mw)
+                        .with_ansi(false)
+                        .event_format(NoSpanFormat);
+                    Registry::default()
+                        .with(reload_layer)
+                        .with(fmt_layer)
+                        .try_init()
+                        .map_err(|e| e.to_string())
+                }
+            }
+            Err(e) => Err(format!("open log file {}: {e}", path.display())),
+        },
+        SubscriberTarget::Stdout => {
+            // Marker on stdout too so a piped foreground serve preserves the
+            // boundary in tools that grep the captured output.
+            write_raw_startup_marker(&mut std::io::stdout());
+            if show_spans {
+                let fmt_layer = tracing_subscriber::fmt::layer().with_ansi(false);
+                Registry::default()
+                    .with(reload_layer)
+                    .with(fmt_layer)
+                    .try_init()
+                    .map_err(|e| e.to_string())
+            } else {
                 let fmt_layer = tracing_subscriber::fmt::layer()
-                    .with_writer(writer)
-                    .with_ansi(false);
+                    .with_ansi(false)
+                    .event_format(NoSpanFormat);
                 Registry::default()
                     .with(reload_layer)
                     .with(fmt_layer)
                     .try_init()
                     .map_err(|e| e.to_string())
             }
-            Err(e) => Err(format!("open log file {}: {e}", path.display())),
-        },
-        SubscriberTarget::Stdout => {
-            let fmt_layer = tracing_subscriber::fmt::layer().with_ansi(false);
-            Registry::default()
-                .with(reload_layer)
-                .with(fmt_layer)
-                .try_init()
-                .map_err(|e| e.to_string())
         }
     };
 
@@ -383,6 +591,14 @@ pub fn init_subscriber(target: SubscriberTarget, filter: String) -> InitResult {
                 inner: handle,
                 current: Mutex::new(filter),
             });
+            // Best-effort tracing marker (respects user filter). Cheap to
+            // emit and useful for grep when filter allows info.
+            tracing::info!(
+                target: "log.runtime",
+                version = env!("CARGO_PKG_VERSION"),
+                pid = std::process::id(),
+                "aoe started"
+            );
             InitResult {
                 controller: Some(controller),
                 warning: None,
@@ -395,20 +611,249 @@ pub fn init_subscriber(target: SubscriberTarget, filter: String) -> InitResult {
     }
 }
 
-fn open_log_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
+/// Append a one-line marker directly through the writer before the tracing
+/// subscriber takes it over. Filter-immune so it survives any user level
+/// setting and gives forensic readers a boundary between process runs.
+fn write_raw_startup_marker(writer: &mut dyn Write) {
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let line = format!(
+        "{} INFO log.runtime [AOE_START_MARKER] version={} pid={} exe={}\n",
+        chrono::Utc::now().to_rfc3339(),
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+        exe,
+    );
+    let _ = writer.write_all(line.as_bytes());
+    let _ = writer.flush();
+}
+
+/// Multi-process safe size-based rotating file writer.
+///
+/// - Buffers bytes until `\n` so a rotation never splits one tracing event
+///   across `debug.log` and `debug.log.1`. A pathological 8 KiB without a
+///   newline still flushes to bound memory.
+/// - On every stat-on-tick (16 KiB written or any line >= 16 KiB), checks
+///   whether another process rotated the file out from under us via inode
+///   comparison, and reopens the current path if so.
+/// - When this process needs to rotate (file size >= threshold), takes a
+///   `fs2` advisory lock on `{path}.lock` and rotates under the lock. The
+///   OS releases the lock on process exit, so a crashed rotater never
+///   wedges future rotations. The lockfile is intentionally left on disk
+///   between rotations.
+pub struct SizeRotatingWriter {
+    path: PathBuf,
+    file: std::fs::File,
+    policy: RotationPolicy,
+    fd_inode: u64,
+    bytes_since_stat: u64,
+    line_buf: Vec<u8>,
+}
+
+const STAT_TICK_BYTES: u64 = 16 * 1024;
+const MAX_BUFFERED_LINE: usize = 8 * 1024;
+
+impl SizeRotatingWriter {
+    pub fn new(path: PathBuf, policy: RotationPolicy) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let (file, fd_inode) = Self::open_and_stat(&path)?;
+        let mut writer = Self {
+            path,
+            file,
+            policy,
+            fd_inode,
+            bytes_since_stat: 0,
+            line_buf: Vec::with_capacity(1024),
+        };
+        // Pre-existing oversized file gets rotated at startup so the first
+        // event of a fresh run isn't appended to a stale 50 MiB file.
+        let _ = writer.check_rotation();
+        Ok(writer)
     }
-    let f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+
+    fn open_and_stat(path: &Path) -> std::io::Result<(std::fs::File, u64)> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        let meta = file.metadata()?;
+        Ok((file, file_inode(&meta)))
     }
-    Ok(f)
+
+    fn emit_line(&mut self, line: &[u8]) -> std::io::Result<()> {
+        if line.is_empty() {
+            return Ok(());
+        }
+        self.bytes_since_stat = self.bytes_since_stat.saturating_add(line.len() as u64);
+        // Stat every STAT_TICK_BYTES OR when accumulated bytes start
+        // approaching the threshold (so a small max_size_bytes doesn't get
+        // overshot N× before the stat tick fires).
+        let tick = STAT_TICK_BYTES.min(self.policy.max_size_bytes / 4).max(1);
+        if self.bytes_since_stat >= tick || line.len() as u64 >= tick {
+            let _ = self.check_rotation();
+            self.bytes_since_stat = 0;
+        }
+        self.file.write_all(line)
+    }
+
+    fn check_rotation(&mut self) -> std::io::Result<()> {
+        if matches!(self.policy.kind, RotationKind::Never) {
+            return Ok(());
+        }
+        match std::fs::metadata(&self.path) {
+            Ok(meta) => {
+                let path_inode = file_inode(&meta);
+                if path_inode != self.fd_inode {
+                    // Another process rotated debug.log → debug.log.1 while we
+                    // had it open. Reopen the new current; our fd would
+                    // otherwise keep writing to the now-archived inode.
+                    let (file, ino) = Self::open_and_stat(&self.path)?;
+                    self.file = file;
+                    self.fd_inode = ino;
+                    return Ok(());
+                }
+                if meta.len() >= self.policy.max_size_bytes {
+                    self.try_rotate()?;
+                }
+            }
+            Err(_) => {
+                // Path missing (deleted out from under us). Reopen.
+                let (file, ino) = Self::open_and_stat(&self.path)?;
+                self.file = file;
+                self.fd_inode = ino;
+            }
+        }
+        Ok(())
+    }
+
+    fn try_rotate(&mut self) -> std::io::Result<()> {
+        let lock_path = path_with_suffix(&self.path, ".lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        match lock_file.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Another process is rotating; let them. Bounded loss: our fd
+                // still references the file that the winner is about to
+                // rename, so events written before the next stat tick land in
+                // `.1` rather than fresh `debug.log`. The next `check_rotation`
+                // detects the inode mismatch and reopens.
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
+
+        // Re-stat under lock to avoid double-rotation when two processes race
+        // through `check_rotation` simultaneously.
+        let size = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        if size >= self.policy.max_size_bytes {
+            let _ = self.file.sync_all();
+            let keep = self.policy.keep_count.max(1);
+            for i in (1..keep).rev() {
+                let src = path_with_suffix(&self.path, &format!(".{i}"));
+                let dst = path_with_suffix(&self.path, &format!(".{}", i + 1));
+                let _ = std::fs::rename(&src, &dst);
+            }
+            let dst = path_with_suffix(&self.path, ".1");
+            let _ = std::fs::rename(&self.path, &dst);
+            // Sweep orphan files above the current keep_count: if the user
+            // lowered the threshold between runs, the in-place rename chain
+            // doesn't touch indices > keep. Walk upward until two consecutive
+            // misses to keep the cost bounded.
+            let mut misses = 0;
+            let mut i = u32::from(keep) + 1;
+            while misses < 2 {
+                let p = path_with_suffix(&self.path, &format!(".{i}"));
+                if p.exists() {
+                    let _ = std::fs::remove_file(&p);
+                    misses = 0;
+                } else {
+                    misses += 1;
+                }
+                i += 1;
+            }
+            let (file, ino) = Self::open_and_stat(&self.path)?;
+            self.file = file;
+            self.fd_inode = ino;
+        }
+        // fs2 releases the lock when `lock_file` drops. We deliberately
+        // leave the lockfile on disk; removing it races with another
+        // process about to open and lock it.
+        Ok(())
+    }
+}
+
+impl Write for SizeRotatingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut consumed = 0;
+        while consumed < buf.len() {
+            let rest = &buf[consumed..];
+            match rest.iter().position(|&b| b == b'\n') {
+                Some(idx) => {
+                    self.line_buf.extend_from_slice(&rest[..=idx]);
+                    consumed += idx + 1;
+                    let line = std::mem::take(&mut self.line_buf);
+                    self.emit_line(&line)?;
+                }
+                None => {
+                    self.line_buf.extend_from_slice(rest);
+                    consumed = buf.len();
+                    if self.line_buf.len() >= MAX_BUFFERED_LINE {
+                        let line = std::mem::take(&mut self.line_buf);
+                        self.emit_line(&line)?;
+                    }
+                }
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if !self.line_buf.is_empty() {
+            let line = std::mem::take(&mut self.line_buf);
+            self.emit_line(&line)?;
+        }
+        self.file.flush()
+    }
+}
+
+impl Drop for SizeRotatingWriter {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+#[cfg(unix)]
+fn file_inode(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.ino()
+}
+#[cfg(windows)]
+fn file_inode(meta: &std::fs::Metadata) -> u64 {
+    use std::os::windows::fs::MetadataExt;
+    meta.file_index().unwrap_or(0)
+}
+#[cfg(not(any(unix, windows)))]
+fn file_inode(_meta: &std::fs::Metadata) -> u64 {
+    0
 }
 
 static CONTROLLER: Mutex<Option<Arc<FilterController>>> = Mutex::new(None);
@@ -691,5 +1136,215 @@ mod tests {
                 LogFilterError::Invalid(_)
             ));
         });
+    }
+
+    fn make_cfg(rotation: RotationKind, max_mib: u64, keep: u8) -> LoggingConfig {
+        LoggingConfig {
+            default_level: "info".into(),
+            targets: Default::default(),
+            output: crate::session::config::SinkKind::File,
+            file_path: "debug.log".into(),
+            rotation,
+            max_size_mib: max_mib,
+            keep_count: keep,
+            show_spans: false,
+        }
+    }
+
+    #[test]
+    fn resolve_log_path_relative_joins_app_dir() {
+        let cfg = make_cfg(RotationKind::Size, 50, 5);
+        let dir = std::path::PathBuf::from("/tmp/aoe-test");
+        assert_eq!(resolve_log_path(&cfg, &dir), dir.join("debug.log"));
+    }
+
+    #[test]
+    fn resolve_log_path_absolute_used_verbatim() {
+        let mut cfg = make_cfg(RotationKind::Size, 50, 5);
+        cfg.file_path = "/var/log/aoe.log".into();
+        let dir = std::path::PathBuf::from("/tmp/aoe-test");
+        assert_eq!(
+            resolve_log_path(&cfg, &dir),
+            std::path::PathBuf::from("/var/log/aoe.log")
+        );
+    }
+
+    #[test]
+    fn resolve_sink_tui_with_stdout_coerces_to_file_with_warning() {
+        let mut cfg = make_cfg(RotationKind::Size, 50, 5);
+        cfg.output = crate::session::config::SinkKind::Stdout;
+        let dir = std::path::PathBuf::from("/tmp/aoe-test");
+        let r = resolve_sink(&cfg, &dir, ProcessContext::Tui);
+        assert!(matches!(r.target, SubscriberTarget::File(_, _)));
+        assert!(r.warning.is_some(), "coercion should surface a warning");
+    }
+
+    #[test]
+    fn resolve_sink_serve_foreground_honors_stdout() {
+        let mut cfg = make_cfg(RotationKind::Size, 50, 5);
+        cfg.output = crate::session::config::SinkKind::Stdout;
+        let dir = std::path::PathBuf::from("/tmp/aoe-test");
+        let r = resolve_sink(&cfg, &dir, ProcessContext::ServeForeground);
+        assert!(matches!(r.target, SubscriberTarget::Stdout));
+        assert!(r.warning.is_none());
+    }
+
+    #[test]
+    fn rotation_writer_rotates_at_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("debug.log");
+        // 4 KiB threshold so the test runs fast.
+        let policy = RotationPolicy {
+            kind: RotationKind::Size,
+            max_size_bytes: 4 * 1024,
+            keep_count: 3,
+        };
+        let mut w = SizeRotatingWriter::new(path.clone(), policy).unwrap();
+        // Write 5 KiB worth of one-line events; each line forces stat-on-tick
+        // when crossing 16 KiB but actual size check uses metadata so the
+        // 4 KiB threshold triggers on the first oversized stat.
+        for i in 0..200 {
+            writeln!(&mut w, "line {i:050}").unwrap();
+        }
+        w.flush().unwrap();
+        drop(w);
+        let rotated = path.with_extension("log.1");
+        assert!(rotated.exists(), "expected rotated file at {:?}", rotated);
+    }
+
+    #[test]
+    fn rotation_writer_keeps_at_most_keep_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("debug.log");
+        // Seed pre-existing rotated files to simulate prior rotations.
+        std::fs::write(path.with_extension("log.1"), b"old 1").unwrap();
+        std::fs::write(path.with_extension("log.2"), b"old 2").unwrap();
+        std::fs::write(path.with_extension("log.3"), b"old 3").unwrap();
+        // Threshold low enough to rotate on first emit.
+        let policy = RotationPolicy {
+            kind: RotationKind::Size,
+            max_size_bytes: 64,
+            keep_count: 3,
+        };
+        std::fs::write(&path, vec![b'x'; 200]).unwrap();
+        let mut w = SizeRotatingWriter::new(path.clone(), policy).unwrap();
+        writeln!(&mut w, "trigger rotation now padded out to be large enough").unwrap();
+        w.flush().unwrap();
+        drop(w);
+        // .1, .2, .3 should exist; .4 should NOT.
+        assert!(
+            !path.with_extension("log.4").exists(),
+            "keep_count=3 must drop .4"
+        );
+    }
+
+    #[test]
+    fn rotation_writer_never_keeps_file_alone_when_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("debug.log");
+        let policy = RotationPolicy {
+            kind: RotationKind::Never,
+            max_size_bytes: 64,
+            keep_count: 3,
+        };
+        let mut w = SizeRotatingWriter::new(path.clone(), policy).unwrap();
+        for _ in 0..100 {
+            writeln!(&mut w, "filler line that pushes well past 64 bytes here").unwrap();
+        }
+        w.flush().unwrap();
+        drop(w);
+        assert!(
+            !path.with_extension("log.1").exists(),
+            "rotation=never must not produce .1"
+        );
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size > 64, "file should have grown past threshold");
+    }
+
+    #[test]
+    fn rotation_writer_line_buffers_across_partial_writes() {
+        // Simulate the multi-write pattern from `tracing-subscriber::fmt`:
+        // two write() calls for the same logical event. Ensure both halves
+        // land in the same line (no rotation can split mid-line).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("debug.log");
+        let policy = RotationPolicy {
+            kind: RotationKind::Size,
+            max_size_bytes: 1024 * 1024,
+            keep_count: 3,
+        };
+        let mut w = SizeRotatingWriter::new(path.clone(), policy).unwrap();
+        w.write_all(b"first half ").unwrap();
+        w.write_all(b"second half\n").unwrap();
+        w.flush().unwrap();
+        drop(w);
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.contains("first half second half\n"),
+            "split write should re-coalesce in one line, got: {:?}",
+            contents
+        );
+    }
+
+    #[test]
+    fn rotation_writer_startup_rotates_oversize_existing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("debug.log");
+        // Pre-seed oversized file.
+        std::fs::write(&path, vec![b'x'; 200]).unwrap();
+        let policy = RotationPolicy {
+            kind: RotationKind::Size,
+            max_size_bytes: 64,
+            keep_count: 3,
+        };
+        let _w = SizeRotatingWriter::new(path.clone(), policy).unwrap();
+        // .1 should now exist (startup rotation triggered in new()).
+        assert!(path.with_extension("log.1").exists());
+    }
+
+    #[test]
+    fn rotation_writer_sweeps_orphans_when_keep_count_reduced() {
+        // User lowered keep_count from 5 to 2 between runs. The rename chain
+        // only touches indices 1..=keep, so .3, .4, .5 would orphan forever
+        // without the sweep.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("debug.log");
+        std::fs::write(path.with_extension("log.1"), b"old 1").unwrap();
+        std::fs::write(path.with_extension("log.2"), b"old 2").unwrap();
+        std::fs::write(path.with_extension("log.3"), b"old 3").unwrap();
+        std::fs::write(path.with_extension("log.4"), b"old 4").unwrap();
+        std::fs::write(path.with_extension("log.5"), b"old 5").unwrap();
+        let policy = RotationPolicy {
+            kind: RotationKind::Size,
+            max_size_bytes: 64,
+            keep_count: 2,
+        };
+        std::fs::write(&path, vec![b'x'; 200]).unwrap();
+        let _w = SizeRotatingWriter::new(path.clone(), policy).unwrap();
+        // After startup rotation: .1 (was current), .2 (was .1) survive.
+        assert!(path.with_extension("log.1").exists(), ".1 must exist");
+        assert!(path.with_extension("log.2").exists(), ".2 must exist");
+        assert!(
+            !path.with_extension("log.3").exists(),
+            ".3 must be swept by orphan sweep"
+        );
+        assert!(
+            !path.with_extension("log.4").exists(),
+            ".4 must be swept by orphan sweep"
+        );
+        assert!(
+            !path.with_extension("log.5").exists(),
+            ".5 must be swept by orphan sweep"
+        );
+    }
+
+    #[test]
+    fn rotation_policy_clamps_keep_count_zero_to_one() {
+        // Defense-in-depth: a hand-edited config with keep_count = 0 would
+        // otherwise yield a writer that deletes the only copy on rotation.
+        let mut cfg = make_cfg(RotationKind::Size, 50, 0);
+        cfg.keep_count = 0;
+        let policy = RotationPolicy::from(&cfg);
+        assert_eq!(policy.keep_count, 1, "keep_count=0 must clamp to 1");
     }
 }
